@@ -1,11 +1,11 @@
-import os, time, requests
+import os, time, requests, ssl, certifi
 from datetime import datetime, timedelta, timezone
 from dateutil import parser
 from cassandra.cluster import Cluster
 from cassandra.auth import PlainTextAuthProvider
 from dotenv import load_dotenv
-load_dotenv()
 
+load_dotenv()
 
 ASTRA_HOST = os.getenv("ASTRA_HOST")
 ASTRA_PORT = int(os.getenv("ASTRA_PORT", "29042"))
@@ -16,28 +16,24 @@ ASSETS = [a.strip() for a in os.getenv("ASSETS", "btc-bitcoin,eth-ethereum").spl
 DAILY_START = os.getenv("DAILY_START", "2017-01-01")
 
 for k in ["ASTRA_HOST","ASTRA_PORT","ASTRA_CLIENT_ID","ASTRA_CLIENT_SECRET","ASTRA_KEYSPACE"]:
-    v = os.getenv(k)
-    if not v:
+    if not os.getenv(k):
         raise SystemExit(f"Missing env var {k}. Check your .env or GitHub Secrets.")
-if "://" in os.getenv("ASTRA_HOST",""):
+if "://" in ASTRA_HOST:
     raise SystemExit("ASTRA_HOST must be a hostname only (no https://). Use the CQL API host.")
 
-
-auth = PlainTextAuthProvider(username=ASTRA_CLIENT_ID, password=ASTRA_CLIENT_SECRET)
-
-# TLS with certifi CA bundle
+# --- TLS for Astra proxyless ---
 ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 ssl_context.load_verify_locations(cafile=certifi.where())
 ssl_context.check_hostname = True
 ssl_context.verify_mode = ssl.CERT_REQUIRED
 
-print(f"Connecting to {ASTRA_HOST}:{ASTRA_PORT} with TLS …")
+auth = PlainTextAuthProvider(username=ASTRA_CLIENT_ID, password=ASTRA_CLIENT_SECRET)
 cluster = Cluster(
     [ASTRA_HOST],
     port=ASTRA_PORT,
-    auth_provider=auth_provider,
+    auth_provider=auth,
     ssl_context=ssl_context,
-    protocol_version=4
+    protocol_version=4,
 )
 session = cluster.connect(KEYSPACE)
 
