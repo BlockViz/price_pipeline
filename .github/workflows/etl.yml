@@ -15,6 +15,7 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install cassandra-driver requests python-dateutil
+      - run: pip install cassandra-driver requests python-dateutil python-dotenv
       - name: Run ETL
         env:
           ASTRA_HOST: ${{ secrets.ASTRA_HOST }}
