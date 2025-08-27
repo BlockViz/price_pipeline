@@ -1,0 +1,52 @@
+name: prices-live-15m
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # every 15 minutes (UTC)
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: prices-live-15m
+  cancel-in-progress: true
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install cassandra-driver requests python-dotenv tzdata
+
+      - name: Write Astra secure connect bundle
+        run: echo "${{ secrets.ASTRA_BUNDLE_BASE64 }}" | base64 -d > secure-connect.zip
+
+      - name: Refresh prices_live (robust tmp-swap)
+        env:
+          ASTRA_BUNDLE_PATH: secure-connect.zip
+          ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
+          ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
+          TOP_N: ${{ secrets.TOP_N }}
+          MIN_EXPECTED: "80"
+          RETRIES: "3"
+          BACKOFF_MIN: "5"
+        run: python price_pipeline/load_prices_live.py
+
+      - name: Append 15m (skip if <10 min newer)
+        env:
+          ASTRA_BUNDLE_PATH: secure-connect.zip
+          ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
+          ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
+        run: python price_pipeline/append_15m_from_live.py
