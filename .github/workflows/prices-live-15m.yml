@@ -15,7 +15,6 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -33,6 +32,14 @@ jobs:
       - name: Write Astra secure connect bundle
         run: echo "${{ secrets.ASTRA_BUNDLE_BASE64 }}" | base64 -d > secure-connect.zip
 
+      # optional: see files to avoid path confusion
+      - name: Show workspace tree
+        run: |
+          pwd
+          ls -la
+          echo "---- .github ----"
+          ls -la .github || true
+
       - name: Refresh prices_live (robust tmp-swap)
         env:
           ASTRA_BUNDLE_PATH: secure-connect.zip
@@ -42,11 +49,11 @@ jobs:
           MIN_EXPECTED: "80"
           RETRIES: "3"
           BACKOFF_MIN: "5"
-        run: python price_pipeline/load_prices_live.py
+        run: python load_prices_live.py
 
       - name: Append 15m (skip if <10 min newer)
         env:
           ASTRA_BUNDLE_PATH: secure-connect.zip
           ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
           ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
-        run: python price_pipeline/append_15m_from_live.py
+        run: python append_15m_from_live.py
