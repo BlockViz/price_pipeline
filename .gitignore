@@ -7,3 +7,6 @@ venv/
 
 # Ignore local secrets
 .env
+
+# Ignore One Time and Config Files
+onetime_and_config/
