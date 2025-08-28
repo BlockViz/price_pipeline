@@ -1,0 +1,40 @@
+name: dq-repair
+
+on:
+  schedule:
+    - cron: "20 3 * * *"   # 03:20 UTC daily
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dq-repair
+  cancel-in-progress: true
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: |
+          python -m pip install --upgrade pip
+          pip install cassandra-driver requests python-dotenv
+      - name: Write Astra secure connect bundle
+        run: echo "${{ secrets.ASTRA_BUNDLE_BASE64 }}" | base64 -d > secure-connect.zip
+      - name: Data Quality & Repair
+        env:
+          ASTRA_BUNDLE_PATH: secure-connect.zip
+          ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
+          ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
+          TOP_N_DQ: "110"
+          DQ_MAX_COINS: "110"
+          DQ_WINDOW_15M_DAYS: "7"
+          DQ_WINDOW_DAILY_DAYS: "365"
+          DQ_RETRIES: "3"
+          DQ_BACKOFF_SEC: "4"
+          DQ_PAUSE_PER_COIN: "0.5"
+        run: python dq_repair_timeseries.py
