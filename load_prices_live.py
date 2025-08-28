@@ -4,6 +4,8 @@ from cassandra.cluster import Cluster
 from cassandra.auth import PlainTextAuthProvider
 from cassandra.query import BatchStatement, SimpleStatement, ConsistencyLevel
 from dotenv import load_dotenv
+from cassandra import OperationTimedOut, ReadTimeout, Unavailable
+
 
 load_dotenv()
 
@@ -15,6 +17,8 @@ KEYSPACE = os.getenv("ASTRA_KEYSPACE", "default_keyspace")
 TOP_N = int(os.getenv("TOP_N", "100"))
 RETRIES = int(os.getenv("RETRIES", "3"))
 BACKOFF_MIN = int(os.getenv("BACKOFF_MIN", "5"))
+REQUEST_TIMEOUT_SEC = int(os.getenv("REQUEST_TIMEOUT_SEC", "60"))  # was ~10–20 default
+TRUNCATE_ATTEMPTS    = int(os.getenv("TRUNCATE_ATTEMPTS", "5"))
 
 # Swap safety: require at least this many rows before touching live
 MIN_EXPECTED = int(os.getenv("MIN_EXPECTED", max(50, TOP_N // 2)))
@@ -26,6 +30,13 @@ if not BUNDLE or not ASTRA_TOKEN or not KEYSPACE:
 auth = PlainTextAuthProvider(username="token", password=ASTRA_TOKEN)
 cluster = Cluster(cloud={"secure_connect_bundle": BUNDLE}, auth_provider=auth)
 session = cluster.connect(KEYSPACE)
+
+# warm-up: touch a tiny query to “wake” the cluster
+try:
+    session.execute("SELECT release_version FROM system.local", timeout=REQUEST_TIMEOUT_SEC)
+except Exception as e:
+    print(f"[warmup] non-fatal: {e}")
+
 
 # Prepared inserts (tmp & live have identical columns)
 INS_COLS = """
@@ -45,6 +56,18 @@ INS_COLS = """
 
 ins_tmp = session.prepare(f"INSERT INTO prices_live_tmp ({INS_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
 ins_live = session.prepare(f"INSERT INTO prices_live ({INS_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+
+def exec_with_retry(stmt, params=None, timeout=REQUEST_TIMEOUT_SEC, attempts=TRUNCATE_ATTEMPTS, label=""):
+    last = None
+    for i in range(1, attempts + 1):
+        try:
+            return session.execute(stmt, params or [], timeout=timeout)
+        except (OperationTimedOut, ReadTimeout, Unavailable) as e:
+            last = e
+            wait = min(2 ** i, 20)  # 2s,4s,8s,16s,20s...
+            print(f"[{label or 'CQL'}] attempt {i}/{attempts} failed: {e}. Retrying in {wait}s...")
+            time.sleep(wait)
+    raise last
 
 def f(x):
     return float(x) if x is not None else None
@@ -144,7 +167,7 @@ def main():
         print("Warning: duplicate CoinPaprika IDs in fetched set (unexpected).")
 
     # 2) Write to TMP
-    session.execute("TRUNCATE prices_live_tmp")
+    exec_with_retry("TRUNCATE prices_live_tmp", label="TRUNCATE tmp")
     wrote = write_rows(rows, ins_tmp)
 
     # 3) Verify TMP rowcount (COUNT(*) is OK at ~100 rows)
@@ -154,7 +177,8 @@ def main():
         raise SystemExit(f"Aborting swap: tmp has only {tmp_count} rows (MIN_EXPECTED={MIN_EXPECTED}). Live table left untouched.")
 
     # 4) Swap into LIVE
-    session.execute("TRUNCATE prices_live")
+    exec_with_retry("TRUNCATE prices_live", label="TRUNCATE live")
+    
     # Read back from tmp and copy to live
     tmp_rows = session.execute(SimpleStatement("SELECT " + INS_COLS + " FROM prices_live_tmp", fetch_size=500))
     batch = BatchStatement(consistency_level=ConsistencyLevel.QUORUM)

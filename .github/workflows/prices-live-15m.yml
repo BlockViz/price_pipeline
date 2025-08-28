@@ -49,6 +49,8 @@ jobs:
           MIN_EXPECTED: "80"
           RETRIES: "3"
           BACKOFF_MIN: "5"
+          REQUEST_TIMEOUT_SEC: "60"
+          TRUNCATE_ATTEMPTS: "5"
         run: python load_prices_live.py
 
       - name: Append 15m (skip if <10 min newer)
