@@ -1,17 +1,29 @@
 import os
-from datetime import datetime, timezone
+from datetime import datetime
 from zoneinfo import ZoneInfo
-from cassandra.cluster import Cluster
-from cassandra.auth import PlainTextAuthProvider
-from cassandra.query import SimpleStatement
 from dotenv import load_dotenv
 
 load_dotenv()
 
+# ---- Time gate BEFORE any imports that connect to Astra ----
+GRACE_HOURS = os.getenv("GRACE_HOURS", "15,16")  # Berlin hours allowed to run
+ALLOWED = {int(h.strip()) for h in GRACE_HOURS.split(",") if h.strip().isdigit()}
+
+berlin = ZoneInfo("Europe/Berlin")
+now_berlin = datetime.now(berlin)
+
+if now_berlin.hour not in ALLOWED:
+    print(f"Daily append skipped early: it's {now_berlin.isoformat()} (allowed hours Berlin: {sorted(ALLOWED)}).")
+    raise SystemExit(0)
+
+# ---- Only now import Cassandra and connect ----
+from cassandra.cluster import Cluster
+from cassandra.auth import PlainTextAuthProvider
+from cassandra.query import SimpleStatement
+
 BUNDLE = os.getenv("ASTRA_BUNDLE_PATH", "secure-connect.zip")
 ASTRA_TOKEN = os.getenv("ASTRA_TOKEN")
 KEYSPACE = os.getenv("ASTRA_KEYSPACE", "default_keyspace")
-
 if not ASTRA_TOKEN:
     raise SystemExit("Missing ASTRA_TOKEN")
 
@@ -19,21 +31,13 @@ auth = PlainTextAuthProvider("token", ASTRA_TOKEN)
 cluster = Cluster(cloud={"secure_connect_bundle": BUNDLE}, auth_provider=auth)
 session = cluster.connect(KEYSPACE)
 
-# We’ll check existence with a SELECT by (id, date) and only INSERT if missing.
-SEL_EXISTS = session.prepare("SELECT id FROM prices_daily WHERE id = ? AND date = ? LIMIT 1")
+SEL_EXISTS = session.prepare("SELECT id FROM prices_daily WHERE id=? AND date=? LIMIT 1")
 INS = session.prepare("""
   INSERT INTO prices_daily (id, date, symbol, name, rank, price_usd, market_cap, volume_24h, last_updated)
   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 """)
 
 def main():
-    berlin = ZoneInfo("Europe/Berlin")
-    now_berlin = datetime.now(berlin)
-    if now_berlin.hour != 15:
-        print(f"Daily append skipped: it is {now_berlin.isoformat()} (run only at 15:00 Europe/Berlin).")
-        return
-
-    # Use the 'date' for Berlin’s local date at 15:00
     target_date = now_berlin.date()
 
     rows = session.execute(SimpleStatement(
@@ -41,11 +45,9 @@ def main():
         fetch_size=500
     ))
 
-    inserted = 0; skipped = 0
+    inserted = skipped = 0
     for r in rows:
-        # check if already present
-        exists = session.execute(SEL_EXISTS, [r.id, target_date]).one()
-        if exists:
+        if session.execute(SEL_EXISTS, [r.id, target_date]).one():
             skipped += 1
             continue
         session.execute(INS, (
@@ -57,7 +59,7 @@ def main():
         ))
         inserted += 1
 
-    print(f"Daily append (15:00 Europe/Berlin): inserted={inserted}, skipped={skipped}, date={target_date}")
+    print(f"Daily append ({now_berlin.strftime('%Y-%m-%d %H:%M %Z')}): inserted={inserted}, skipped={skipped}, date={target_date}")
 
 if __name__ == "__main__":
     try:
