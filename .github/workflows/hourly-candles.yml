@@ -1,0 +1,61 @@
+name: hourly-candles
+
+on:
+  # Run shortly after the top of each hour so 15m writes have landed
+  schedule:
+    - cron: "5 * * * *"   # every hour at :05 UTC
+  # Manual run with optional overrides
+  workflow_dispatch:
+    inputs:
+      TOP_N:
+        description: "Top N coins to process"
+        required: false
+        default: "110"
+      REQUEST_TIMEOUT_SEC:
+        description: "Per-query timeout (seconds)"
+        required: false
+        default: "30"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hourly-candles
+  cancel-in-progress: true
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install cassandra-driver python-dotenv tzdata
+
+      - name: Write Astra secure connect bundle
+        run: echo "${{ secrets.ASTRA_BUNDLE_BASE64 }}" | base64 -d > secure-connect.zip
+
+      # optional: quick tree for debugging paths
+      - name: Show workspace tree
+        run: |
+          pwd
+          ls -la
+          echo "---- scripts ----"
+          ls -la *.py || true
+
+      - name: Append hourly candles (prev hour from 15m)
+        env:
+          ASTRA_BUNDLE_PATH: secure-connect.zip
+          ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
+          ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
+          TOP_N: ${{ github.event.inputs.TOP_N || '110' }}
+          REQUEST_TIMEOUT_SEC: ${{ github.event.inputs.REQUEST_TIMEOUT_SEC || '30' }}
+        run: python append_hourly_from_15m.py

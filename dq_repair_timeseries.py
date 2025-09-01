@@ -43,32 +43,46 @@ auth    = PlainTextAuthProvider("token", ASTRA_TOKEN)
 cluster = Cluster(cloud={"secure_connect_bundle": BUNDLE}, auth_provider=auth)
 session = cluster.connect(KEYSPACE)
 
-# Inserts
+# Inserts/Updates (OHLC-aware)
+# Seed a synthetic 15m point from daily (if needed)
 INS_15M = session.prepare("""
   INSERT INTO prices_15m_7d (id, ts, symbol, name, rank, price_usd, market_cap, volume_24h, last_updated)
   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 """)
-INS_DAY = session.prepare("""
-  INSERT INTO prices_daily (id, date, symbol, name, rank, price_usd, market_cap, volume_24h, last_updated)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+
+# Upsert daily with OHLC + candle_source; price_usd aligned to close
+UPD_DAY = session.prepare("""
+  UPDATE prices_daily SET
+    symbol = ?, name = ?, rank = ?,
+    price_usd = ?, market_cap = ?, volume_24h = ?, last_updated = ?,
+    open = ?, high = ?, low = ?, close = ?, candle_source = ?
+  WHERE id = ? AND date = ?
 """)
 
 # Reads
-SEL_15M_RANGE = session.prepare("""
+# Fetch ALL 15m points for a day so we can compute true OHLC
+SEL_15M_RANGE_FULL = session.prepare("""
+  SELECT ts, price_usd, market_cap, volume_24h
+  FROM prices_15m_7d
+  WHERE id = ? AND ts >= ? AND ts < ?
+""")
+
+# Daily row (to seed 15m or to see if present)
+SEL_DAILY_ONE = session.prepare("""
+  SELECT date, price_usd, market_cap, volume_24h, last_updated, open, high, low, close, candle_source
+  FROM prices_daily
+  WHERE id = ? AND date = ? LIMIT 1
+""")
+
+# For windows
+SEL_15M_RANGE_DAYS = session.prepare("""
   SELECT ts FROM prices_15m_7d
   WHERE id = ? AND ts >= ? AND ts < ?
 """)
-SEL_15M_DAY_LAST = session.prepare("""
-  SELECT ts, price_usd, market_cap, volume_24h FROM prices_15m_7d
-  WHERE id=? AND ts>=? AND ts<? LIMIT 1
-""")
+
 SEL_DAILY_RANGE = session.prepare("""
   SELECT date FROM prices_daily
   WHERE id = ? AND date >= ? AND date <= ?
-""")
-SEL_DAILY_ONE = session.prepare("""
-  SELECT date, price_usd, market_cap, volume_24h, last_updated FROM prices_daily
-  WHERE id=? AND date=? LIMIT 1
 """)
 
 # ---------- Helpers ----------
@@ -82,6 +96,7 @@ def round_up_to_next_day_utc(d: dt.datetime) -> dt.datetime:
     return dt.datetime(next_day.year, next_day.month, next_day.day, tzinfo=dt.timezone.utc)
 
 def date_seq(end_date: dt.date, days: int):
+    # returns [end_date - days + 1, ..., end_date] inclusive
     return [end_date - dt.timedelta(days=i) for i in range(days)][::-1]
 
 def paprika_get(url, params=None):
@@ -121,7 +136,7 @@ def top_assets(limit: int):
 def existing_days_15m(coin_id: str, start_dt: dt.datetime, end_dt: dt.datetime):
     t0 = time.perf_counter()
     have = set()
-    rs = session.execute(SEL_15M_RANGE, [coin_id, start_dt, end_dt])
+    rs = session.execute(SEL_15M_RANGE_DAYS, [coin_id, start_dt, end_dt])
     for row in rs:
         have.add(row.ts.date())
     if VERBOSE:
@@ -140,6 +155,10 @@ def existing_days_daily(coin_id: str, start_date: dt.date, end_date: dt.date):
 
 # ---------- Local repair first ----------
 def repair_daily_from_15m(coin, missing_days: set[dt.date]) -> int:
+    """
+    For each missing day, compute OHLC from all 15m points of that UTC day and upsert the daily row.
+    Sets candle_source='15m_derived' and price_usd=close.
+    """
     if not missing_days: return 0
     t0 = time.perf_counter()
     cnt = 0
@@ -147,20 +166,39 @@ def repair_daily_from_15m(coin, missing_days: set[dt.date]) -> int:
     for day in sorted(missing_days):
         day_start = dt.datetime(day.year, day.month, day.day, tzinfo=dt.timezone.utc)
         day_end   = day_start + dt.timedelta(days=1)
-        last = session.execute(SEL_15M_DAY_LAST, [coin.id, day_start, day_end]).one()
-        if not last:
-            continue
-        ts, price, mcap, vol = last.ts, float(last.price_usd or 0.0), float(last.market_cap or 0.0), float(last.volume_24h or 0.0)
-        batch.add(INS_DAY, (coin.id, day, coin.symbol, coin.name, int(coin.rank), price, mcap, vol, ts))
+        pts = session.execute(SEL_15M_RANGE_FULL, [coin.id, day_start, day_end])
+        prices, mcaps, vols, last_ts = [], [], [], None
+        for p in pts:
+            last_ts = p.ts
+            if p.price_usd is not None: prices.append(float(p.price_usd))
+            if p.market_cap is not None: mcaps.append(float(p.market_cap))
+            if p.volume_24h is not None: vols.append(float(p.volume_24h))
+        if not prices:
+            continue  # nothing to build from
+        o = prices[0]; h = max(prices); l = min(prices); c = prices[-1]
+        mcap = mcaps[-1] if mcaps else None
+        vol  = vols[-1] if vols else None
+        last_upd = last_ts or day_end - dt.timedelta(seconds=1)
+        # Upsert daily OHLC
+        batch.add(UPD_DAY, (
+            coin.symbol, coin.name, int(coin.rank),
+            c, mcap, vol, last_upd,
+            o, h, l, c, "15m_derived",
+            coin.id, day
+        ))
         cnt += 1
         if cnt % 40 == 0:
             session.execute(batch); batch.clear()
     if len(batch) > 0: session.execute(batch)
     if cnt and VERBOSE:
-        print(f"  · local daily from 15m: +{cnt} rows ({tdur(t0)})")
+        print(f"  · local daily OHLC from 15m: +{cnt} rows ({tdur(t0)})")
     return cnt
 
 def repair_15m_from_daily(coin, missing_days: set[dt.date]) -> int:
+    """
+    For each missing 15m day, seed a single synthetic 15m row at 23:59:59Z using the daily close.
+    This improves continuity and lets future daily builders work even if intraday was missing.
+    """
     if not missing_days: return 0
     t0 = time.perf_counter()
     cnt = 0
@@ -169,22 +207,33 @@ def repair_15m_from_daily(coin, missing_days: set[dt.date]) -> int:
         row = session.execute(SEL_DAILY_ONE, [coin.id, day]).one()
         if not row:
             continue
+        # Prefer 'close' if present; else price_usd; default 0.0
+        close = None
+        if row.close is not None:
+            close = float(row.close)
+        elif row.price_usd is not None:
+            close = float(row.price_usd)
+        else:
+            close = 0.0
         ts = dt.datetime(day.year, day.month, day.day, 23, 59, 59, tzinfo=dt.timezone.utc)
-        price = float(row.price_usd or 0.0)
         mcap  = float(row.market_cap or 0.0)
         vol   = float(row.volume_24h or 0.0)
         last_updated = row.last_updated or ts
-        batch.add(INS_15M, (coin.id, ts, coin.symbol, coin.name, int(coin.rank), price, mcap, vol, last_updated))
+        batch.add(INS_15M, (coin.id, ts, coin.symbol, coin.name, int(coin.rank), close, mcap, vol, last_updated))
         cnt += 1
         if cnt % 40 == 0:
             session.execute(batch); batch.clear()
     if len(batch) > 0: session.execute(batch)
     if cnt and VERBOSE:
-        print(f"  · local 15m from daily: +{cnt} rows ({tdur(t0)})")
+        print(f"  · local 15m seeded from daily close: +{cnt} rows ({tdur(t0)})")
     return cnt
 
-# ---------- API repair ----------
+# ---------- API repair (prev-close candles) ----------
 def backfill_from_api(coin, need_15m: set[dt.date], need_daily: set[dt.date]) -> tuple[int,int]:
+    """
+    Fetch daily snapshots from Paprika for the union window and fill *daily* rows only,
+    using prev-close OHLC (candle_source='daily_prevclose'). 15m remains untouched here.
+    """
     if not need_15m and not need_daily:
         return 0, 0
     days_all = sorted(need_15m.union(need_daily))
@@ -206,6 +255,8 @@ def backfill_from_api(coin, need_15m: set[dt.date], need_daily: set[dt.date]) ->
         print(f"  · API backfill failed for {coin.id}: {e} ({tdur(t0)})")
         return 0, 0
 
+    # Map by day and build prev-close candles
+    data.sort(key=lambda d: d.get("timestamp") or "")
     by_day = {}
     for d in data:
         ts_dt = to_dt(d["timestamp"])
@@ -217,36 +268,40 @@ def backfill_from_api(coin, need_15m: set[dt.date], need_daily: set[dt.date]) ->
             "vol":   float(d.get("volume_24h") or 0.0),
         }
 
-    fixed_15m = fixed_daily = 0
-    if need_15m:
-        batch = BatchStatement(consistency_level=ConsistencyLevel.QUORUM)
-        cnt = 0
-        for day in sorted(need_15m):
-            v = by_day.get(day)
-            if not v: continue
-            batch.add(INS_15M, (coin.id, v["ts"], coin.symbol, coin.name, int(coin.rank),
-                                v["price"], v["mcap"], v["vol"], v["ts"]))
-            cnt += 1
-            if cnt % 40 == 0: session.execute(batch); batch.clear()
-        if len(batch) > 0: session.execute(batch)
-        fixed_15m = cnt
-
-    if need_daily:
-        batch = BatchStatement(consistency_level=ConsistencyLevel.QUORUM)
-        cnt = 0
-        for day in sorted(need_daily):
-            v = by_day.get(day)
-            if not v: continue
-            batch.add(INS_DAY, (coin.id, day, coin.symbol, coin.name, int(coin.rank),
-                                v["price"], v["mcap"], v["vol"], v["ts"]))
-            cnt += 1
-            if cnt % 40 == 0: session.execute(batch); batch.clear()
-        if len(batch) > 0: session.execute(batch)
-        fixed_daily = cnt
+    batch = BatchStatement(consistency_level=ConsistencyLevel.QUORUM)
+    cnt_daily = 0
+    prev_close = None
+    # iterate only the days we still need daily rows
+    for day in sorted(need_daily):
+        v = by_day.get(day)
+        if not v: 
+            # nothing from API for this day
+            continue
+        close = v["price"]
+        if prev_close is None:
+            o = h = l = close
+            source = "daily_flat"
+        else:
+            o = prev_close
+            h = max(o, close)
+            l = min(o, close)
+            source = "daily_prevclose"
+        # Upsert daily row with prev-close logic
+        batch.add(UPD_DAY, (
+            coin.symbol, coin.name, int(coin.rank),
+            close, v["mcap"], v["vol"], v["ts"],
+            o, h, l, close, source,
+            coin.id, day
+        ))
+        cnt_daily += 1
+        prev_close = close
+        if cnt_daily % 40 == 0:
+            session.execute(batch); batch.clear()
+    if len(batch) > 0: session.execute(batch)
 
     if VERBOSE:
-        print(f"  · API fixed 15m={fixed_15m}, daily={fixed_daily} ({tdur(t0)})")
-    return fixed_15m, fixed_daily
+        print(f"  · API fixed daily={cnt_daily} ({tdur(t0)})")
+    return 0, cnt_daily  # 15m not touched by API here
 
 # ---------- Main ----------
 def main():
@@ -280,13 +335,11 @@ def main():
         if VERBOSE:
             print(f"  · need_15m={len(need_15m)} need_daily={len(need_daily)}")
 
-        # Local repairs
+        # Local repairs (OHLC from 15m; seed 15m from daily)
         if need_daily:
             fixed = repair_daily_from_15m(coin, need_daily)
             fixedD_local += fixed
-            if fixed and VERBOSE:
-                print(f"  · after local daily fix: +{fixed}")
-            # recalc missing
+            # recalc missing daily
             have_daily = existing_days_daily(coin.id, start_daily.date(), (end_excl.date()-dt.timedelta(days=1)))
             need_daily = want_daily_days - have_daily
             if VERBOSE:
@@ -295,9 +348,7 @@ def main():
         if need_15m:
             fixed = repair_15m_from_daily(coin, need_15m)
             fixed15_local += fixed
-            if fixed and VERBOSE:
-                print(f"  · after local 15m fix: +{fixed}")
-            # recalc missing
+            # recalc missing 15m
             have_15m = existing_days_15m(coin.id, start_15m, end_excl)
             need_15m = want_15m_days - have_15m
             if VERBOSE:
@@ -316,7 +367,8 @@ def main():
     print(f"[{ts()}] Coins still missing after local repair: {len(coins_needing_api)}; "
           f"API target this run: {len(api_targets)} (cap={DQ_MAX_API_COINS_RUN})")
 
-    fixed15_api = fixedD_api = 0
+    fixed15_api = 0
+    fixedD_api  = 0
     for j, (coin, need_15m, need_daily) in enumerate(api_targets, 1):
         if VERBOSE:
             print(f"[{ts()}] API repair {j}/{len(api_targets)} → {coin.symbol} ({coin.id}) "
@@ -329,7 +381,6 @@ def main():
     print(f"[{ts()}] DONE in {tdur(t_all)} | Local fixes → 15m:{fixed15_local} daily:{fixedD_local} | "
           f"API fixes → 15m:{fixed15_api} daily:{fixedD_api} | "
           f"Remain for future API runs: {max(0, len(coins_needing_api)-len(api_targets))}")
-    
 
 if __name__ == "__main__":
     try:

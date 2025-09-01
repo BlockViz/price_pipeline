@@ -2,7 +2,7 @@ name: daily-append
 
 on:
   schedule:
-    - cron: "5 * * * *"  # every hour at :05 UTC
+    - cron: "10 * * * *"  # every hour at :10 UTC
   workflow_dispatch: {}
 
 permissions:
@@ -32,7 +32,7 @@ jobs:
       - name: Write Astra secure connect bundle
         run: echo "${{ secrets.ASTRA_BUNDLE_BASE64 }}" | base64 -d > secure-connect.zip
 
-      - name: Append daily from prices_live (only at 15:00 Europe/Berlin)
+      - name: Append daily from prices_live 
         env:
           ASTRA_BUNDLE_PATH: secure-connect.zip
           ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
