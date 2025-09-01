@@ -21,7 +21,7 @@ auth = PlainTextAuthProvider("token", ASTRA_TOKEN)
 cluster = Cluster(cloud={"secure_connect_bundle": BUNDLE}, auth_provider=auth)
 s = cluster.connect(KEYSPACE)
 
-# Top coins
+# Top coins Selection
 SEL_LIVE = SimpleStatement("""
   SELECT id, symbol, name, rank FROM prices_live
 """)
