@@ -1,0 +1,32 @@
+name: categories
+on:
+  schedule:
+    - cron: "12 3 * * *"     # daily at 03:12 UTC
+  push:
+    paths:
+      - "category_mapping.csv"
+      - ".github/workflows/categories.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  load:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: |
+          python -m pip install --upgrade pip
+          pip install cassandra-driver python-dotenv tzdata
+      - name: Write Astra SCB
+        run: echo "${{ secrets.ASTRA_BUNDLE_BASE64 }}" | base64 -d > secure-connect.zip
+      - name: Load categories
+        env:
+          ASTRA_BUNDLE_PATH: secure-connect.zip
+          ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
+          ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
+          CATEGORY_FILE: category_mapping.csv
+        run: python load_categories.py

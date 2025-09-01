@@ -5,9 +5,52 @@ from cassandra.auth import PlainTextAuthProvider
 from cassandra.query import BatchStatement, SimpleStatement, ConsistencyLevel
 from dotenv import load_dotenv
 from cassandra import OperationTimedOut, ReadTimeout, Unavailable
+import csv
 
 
 load_dotenv()
+
+# ---- Category mapping (CSV) ----
+# Resolve file relative to this script by default
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CATEGORY_FILE = os.getenv("CATEGORY_FILE", os.path.join(BASE_DIR, "category_mapping.csv"))
+
+def load_category_map(path: str) -> dict:
+    m = {}
+    try:
+        with open(path, "r", encoding="utf-8-sig", newline="") as f:
+            sample = f.read(2048)
+            f.seek(0)
+            # try common delimiters: comma, semicolon, tab, pipe
+            for delim in [",", ";", "\t", "|"]:
+                f.seek(0)
+                reader = csv.DictReader(f, delimiter=delim)
+                headers = [h.strip().lower() for h in (reader.fieldnames or [])]
+                if "symbol" in headers and "category" in headers:
+                    sym_key = reader.fieldnames[headers.index("symbol")]
+                    cat_key = reader.fieldnames[headers.index("category")]
+                    for row in reader:
+                        sym = (row.get(sym_key) or "").strip().upper()
+                        cat = (row.get(cat_key) or "").strip()
+                        if sym:
+                            m[sym] = cat or "Other"
+                    print(f"[category] loaded {len(m)} rows from {path} using delimiter {repr(delim)}")
+                    break
+            else:
+                print(f"[category] header not found in {path}. Expected columns: Symbol,Category")
+    except FileNotFoundError:
+        print(f"[category] file not found: {path} — defaulting to 'Other'")
+    except Exception as e:
+        print(f"[category] failed to read {path}: {e} — defaulting to 'Other'")
+    return m
+
+CATEGORY_MAP = load_category_map(CATEGORY_FILE)
+
+def category_for(symbol: str) -> str:
+    if not symbol:
+        return "Other"
+    return CATEGORY_MAP.get(symbol.upper(), "Other")
+
 
 # ---- Config ----
 BUNDLE = os.getenv("ASTRA_BUNDLE_PATH")
@@ -131,7 +174,7 @@ def write_rows(rows, prepared_stmt):
             c.get("symbol"),
             c.get("name"),
             int(c["rank"]) if c.get("rank") is not None else None,
-            "Other",  # TODO: map your categories here if/when available
+            category_for(c.get("symbol")),
             price_now,
             f(q.get("market_cap")),
             f(q.get("volume_24h")),

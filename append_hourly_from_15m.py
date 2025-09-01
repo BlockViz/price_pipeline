@@ -33,15 +33,15 @@ SEL_15M_HOUR = s.prepare("""
   WHERE id=? AND ts>=? AND ts<?
 """)
 
-# Idempotent insert
+# Idempotent insert (now writes symbol, name, market_cap)
 INS_IF_NOT_EXISTS = s.prepare("""
   INSERT INTO candles_hourly_30d
-    (id, ts, open, high, low, close, volume, marketcap, source)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    (id, ts, symbol, name, open, high, low, close, volume_24h, market_cap, source)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   IF NOT EXISTS
 """)
 
-def prev_hour_bounds_utc() -> tuple[datetime, datetime]:
+def prev_hour_bounds_utc():
     now = datetime.now(timezone.utc)
     this_hour = now.replace(minute=0, second=0, microsecond=0)
     start = this_hour - timedelta(hours=1)
@@ -77,10 +77,11 @@ def main():
             mcap = mcaps[-1] if mcaps else None
             vol  = vols[-1] if vols else None
 
-            res = s.execute(INS_IF_NOT_EXISTS,
-                            [c.id, start, o, h, l, cl, vol, mcap, "15m_derived"],
-                            timeout=REQUEST_TIMEOUT)
-            # LWT result: was_applied True if inserted, False if already there
+            res = s.execute(
+                INS_IF_NOT_EXISTS,
+                [c.id, start, c.symbol, c.name, o, h, l, cl, vol, mcap, "15m_derived"],
+                timeout=REQUEST_TIMEOUT
+            )
             if getattr(res.one(), "applied", False):
                 wrote += 1
             else:
