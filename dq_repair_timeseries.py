@@ -58,9 +58,18 @@ def iso_z(dt_obj: dt.datetime) -> str:
 def to_dt(iso_s: str) -> dt.datetime:
     return dt.datetime.fromisoformat(iso_s.replace("Z", "+00:00")).astimezone(timezone.utc)
 
-def date_seq(end_date: dt.date, days: int):
-    # returns [end_date - days + 1, ..., end_date] inclusive
-    return [end_date - dt.timedelta(days=i) for i in range(days)][::-1]
+def date_seq(last_inclusive: dt.date, days: int):
+    """
+    Returns a list of 'days' dates ending at last_inclusive (inclusive),
+    i.e., [last_inclusive - (days-1), ..., last_inclusive]
+    """
+    start = last_inclusive - dt.timedelta(days=days-1)
+    out = []
+    cur = start
+    for _ in range(days):
+        out.append(cur)
+        cur = cur + dt.timedelta(days=1)
+    return out
 
 def paprika_get(url, params=None):
     last = None
@@ -146,11 +155,16 @@ def top_assets(limit: int):
     print(f"[{ts()}] Loaded {len(rows)} assets from prices_live in {tdur(t0)}")
     return rows
 
+def _to_pydate(x) -> dt.date:
+    # Normalize to builtin datetime.date (guards against driver-specific date types)
+    return dt.date(x.year, x.month, x.day)
+
 def existing_days_15m(coin_id: str, start_dt: dt.datetime, end_dt: dt.datetime):
     t0 = time.perf_counter()
     have = set()
     for row in session.execute(SEL_15M_RANGE_DAYS, [coin_id, start_dt, end_dt], timeout=REQUEST_TIMEOUT):
-        have.add(row.ts.date())
+        d = row.ts.date()
+        have.add(_to_pydate(d))
     if VERBOSE:
         print(f"  · fetched 15m days={len(have)} in {tdur(t0)}")
     return have
@@ -159,7 +173,7 @@ def existing_days_daily(coin_id: str, start_date: dt.date, end_date: dt.date):
     t0 = time.perf_counter()
     have = set()
     for row in session.execute(SEL_DAILY_RANGE, [coin_id, start_date, end_date], timeout=REQUEST_TIMEOUT):
-        have.add(row.date)
+        have.add(_to_pydate(row.date))
     if VERBOSE:
         print(f"  · fetched daily days={len(have)} in {tdur(t0)}")
     return have
@@ -250,7 +264,7 @@ def backfill_daily_from_api(coin, need_daily: set[dt.date]) -> int:
     by_day = {}
     for d in data:
         ts_dt = to_dt(d["timestamp"])
-        by_day[ts_dt.date()] = {
+        by_day[ _to_pydate(ts_dt.date()) ] = {
             "ts": ts_dt,
             "price": float(d.get("price") or 0.0),
             "mcap":  float(d.get("market_cap") or 0.0),
@@ -293,13 +307,23 @@ def backfill_daily_from_api(coin, need_daily: set[dt.date]) -> int:
 # ---------- Main ----------
 def main():
     now = utcnow()
+    # end_excl = tomorrow 00:00 UTC
     end_excl = dt.datetime(now.year, now.month, now.day, tzinfo=timezone.utc) + dt.timedelta(days=1)
-    want_15m_days   = set(date_seq(end_excl.date() - dt.timedelta(days=1), DAYS_15M))
-    want_daily_days = set(date_seq(end_excl.date() - dt.timedelta(days=1), DAYS_DAILY))
+
+    # Properly aligned windows (inclusive last day = yesterday UTC)
+    last_inclusive   = end_excl.date() - dt.timedelta(days=1)
+    start_15m_date   = last_inclusive - dt.timedelta(days=DAYS_15M-1)
+    start_daily_date = last_inclusive - dt.timedelta(days=DAYS_DAILY-1)
+
+    # Build wanted sets (normalized to dt.date)
+    want_15m_days   = set(date_seq(last_inclusive, DAYS_15M))
+    want_daily_days = set(date_seq(last_inclusive, DAYS_DAILY))
 
     assets = top_assets(min(TOP_N_DQ, DQ_MAX_COINS))
-    print(f"[{ts()}] DQ windows → 15m: {(end_excl.date()-dt.timedelta(days=DAYS_15M)).isoformat()}→{(end_excl.date()-dt.timedelta(days=1)).isoformat()} | "
-          f"daily: {(end_excl.date()-dt.timedelta(days=DAYS_DAILY)).isoformat()}→{(end_excl.date()-dt.timedelta(days(1))).isoformat()}")
+    print(
+        f"[{ts()}] DQ windows → 15m: {start_15m_date.isoformat()}→{last_inclusive.isoformat()} | "
+        f"daily: {start_daily_date.isoformat()}→{last_inclusive.isoformat()}"
+    )
 
     coins_needing_api = []
     fixed15_local = fixedD_local = fixed15_seeded = 0
@@ -307,52 +331,60 @@ def main():
 
     for i, coin in enumerate(assets, 1):
         t_coin = time.perf_counter()
-        if VERBOSE:
-            print(f"[{ts()}] [{i}/{len(assets)}] {coin.rank:>3} {coin.symbol} ({coin.id})")
+        print(f"[{ts()}] → Coin {i}/{len(assets)}: {coin.symbol} ({coin.id}) rank={coin.rank}")
 
-        # What do we have?
-        have_15m   = existing_days_15m(coin.id,
-                        dt.datetime.combine((end_excl.date() - dt.timedelta(days=DAYS_15M)), dt.time.min, tzinfo=timezone.utc),
-                        end_excl)
-        have_daily = existing_days_daily(coin.id,
-                        end_excl.date() - dt.timedelta(days=DAYS_DAILY),
-                        end_excl.date() - dt.timedelta(days=1))
+        # 1) What do we have?
+        print(f"[{ts()}]    Checking existing 15m window…")
+        have_15m = existing_days_15m(
+            coin.id,
+            dt.datetime.combine(start_15m_date, dt.time.min, tzinfo=timezone.utc),
+            dt.datetime.combine(last_inclusive + dt.timedelta(days=1), dt.time.min, tzinfo=timezone.utc)
+        )
+        print(f"[{ts()}]    Found {len(have_15m)} days with 15m")
+
+        print(f"[{ts()}]    Checking existing daily window…")
+        have_daily = existing_days_daily(
+            coin.id,
+            start_daily_date,
+            last_inclusive
+        )
+        print(f"[{ts()}]    Found {len(have_daily)} days with daily")
 
         need_15m   = want_15m_days   - have_15m
         need_daily = want_daily_days - have_daily
+        print(f"[{ts()}]    Missing → 15m:{len(need_15m)} daily:{len(need_daily)}")
 
-        if VERBOSE:
-            print(f"  · need_15m={len(need_15m)} need_daily={len(need_daily)}")
-
-        # 1) Local daily from 15m where possible
+        # 2) Local daily from 15m where possible
         if need_daily:
             fixed = repair_daily_from_15m(coin, need_daily)
             fixedD_local += fixed
-            # refresh daily have-set if we wrote any
             if fixed:
-                have_daily = existing_days_daily(coin.id,
-                                end_excl.date() - dt.timedelta(days=DAYS_DAILY),
-                                end_excl.date() - dt.timedelta(days=1))
+                have_daily = existing_days_daily(coin.id, start_daily_date, last_inclusive)
                 need_daily = want_daily_days - have_daily
 
-        # 2) (Optional) seed 15m from daily close for continuity
+        # 3) (Optional) seed 15m from daily close for continuity
         if need_15m and SEED_15M_FROM_DAILY:
             fixed = seed_15m_from_daily(coin, need_15m)
             fixed15_seeded += fixed
             if fixed:
-                have_15m = existing_days_15m(coin.id,
-                                dt.datetime.combine((end_excl.date() - dt.timedelta(days=DAYS_15M)), dt.time.min, tzinfo=timezone.utc),
-                                end_excl)
+                have_15m = existing_days_15m(
+                    coin.id,
+                    dt.datetime.combine(start_15m_date, dt.time.min, tzinfo=timezone.utc),
+                    dt.datetime.combine(last_inclusive + dt.timedelta(days=1), dt.time.min, tzinfo=timezone.utc)
+                )
                 need_15m = want_15m_days - have_15m
 
-        # 3) If still missing daily, plan for API fill
+        # 4) If still missing daily, plan for API fill
         if need_daily:
             coins_needing_api.append((coin, need_daily))
 
-        if (i % LOG_EVERY == 0) and not VERBOSE:
-            print(f"[{ts()}] Progress {i}/{len(assets)} (this coin {tdur(t_coin)})")
-
         time.sleep(PAUSE_S)
+
+        # Final per-coin logs (after all work + pause)
+        elapsed_coin = time.perf_counter() - t_coin
+        print(f"[{ts()}] ← Done {coin.symbol} in {elapsed_coin:.2f}s")
+        if (i % LOG_EVERY == 0) and not VERBOSE:
+            print(f"[{ts()}] Progress {i}/{len(assets)} (last coin {elapsed_coin:.2f}s)")
 
     # API pass (limited per run)
     fixedD_api = 0
