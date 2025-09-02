@@ -25,7 +25,7 @@ CONNECT_TIMEOUT = int(os.getenv("CONNECT_TIMEOUT_SEC", "15"))
 SLOT_DELAY_SEC = int(os.getenv("SLOT_DELAY_SEC", "120"))  # 2 min guard
 SLOTS_BACKFILL = int(os.getenv("SLOTS_BACKFILL", "8"))    # last 8 slots (~2h)
 
-# fetch paging (keep small so a single page can't block forever)
+# fetch paging
 FETCH_SIZE = int(os.getenv("FETCH_SIZE", "500"))
 
 if not ASTRA_TOKEN:
@@ -39,7 +39,6 @@ print(f"[{now_str()}] Connecting to Astra (bundle='{BUNDLE}', keyspace='{KEYSPAC
 
 auth = PlainTextAuthProvider("token", ASTRA_TOKEN)
 
-# Enforce a real default request timeout via an ExecutionProfile
 exec_profile = ExecutionProfile(
     load_balancing_policy=RoundRobinPolicy(),
     request_timeout=REQUEST_TIMEOUT,
@@ -61,7 +60,6 @@ try:
       SELECT id, symbol, name, rank, price_usd, market_cap, volume_24h, last_updated
       FROM prices_live
     """)
-    # Ensure live read also pages sanely
     SEL_LIVE.fetch_size = FETCH_SIZE
 
     SEL_15M_RANGE_PS = s.prepare("""
@@ -91,12 +89,18 @@ try:
         now_ = datetime.now(timezone.utc) - timedelta(seconds=SLOT_DELAY_SEC)
         return floor_15m(now_)
 
-    def last_n_slots(n):
+    def last_n_slots_oldest_first(n):
+        """
+        Returns a list of (start,end) for the last n slots, ordered oldest → newest.
+        """
         end = slot_start_now() + timedelta(minutes=15)  # end-exclusive of most recent slot
+        slots = []
         for _ in range(n):
             start = end - timedelta(minutes=15)
-            yield (start, end)
+            slots.append((start, end))
             end = start
+        slots.reverse()  # ensure chronological order
+        return slots
 
     # --- main ---
     def main():
@@ -110,17 +114,23 @@ try:
         coins = coins[:TOP_N]
         print(f"[{now_str()}] Processing top {len(coins)} coins (TOP_N={TOP_N})")
 
-        slots = list(last_n_slots(SLOTS_BACKFILL))
-        print(f"[{now_str()}] Slots to backfill: {SLOTS_BACKFILL} → " +
-              f"{slots[0][0]}..{slots[-1][1]} (oldest first)")
+        slots = last_n_slots_oldest_first(SLOTS_BACKFILL)
+        print(f"[{now_str()}] Slots (oldest→newest): {slots[0][0]} .. {slots[-1][1]} (count={len(slots)})")
 
         wrote = skipped = empty = 0
 
         for ci, c in enumerate(coins, 1):
             print(f"[{now_str()}] → [{ci}/{len(coins)}] {c.symbol} ({c.id}) rank={c.rank}")
+
+            # We'll carry-forward within this coin’s loop to avoid flatlines and extra reads
+            last_price = None
+            last_mcap  = None
+            last_vol   = None
+
             for si, (start, end) in enumerate(slots, 1):
                 print(f"    slot {si}/{len(slots)} {start} → {end}")
-                # --- range read with strict paging & timeout ---
+
+                # 1) Read any points already in this slot
                 try:
                     bound = SEL_15M_RANGE_PS.bind([c.id, start, end])
                     bound.fetch_size = FETCH_SIZE
@@ -139,47 +149,54 @@ try:
 
                 prices, mcaps, vols = [], [], []
                 for p in pts_rows:
-                    if p.price_usd is not None:
-                        prices.append(float(p.price_usd))
-                    if p.market_cap is not None:
-                        mcaps.append(float(p.market_cap))
-                    if p.volume_24h is not None:
-                        vols.append(float(p.volume_24h))
+                    if p.price_usd is not None: prices.append(float(p.price_usd))
+                    if p.market_cap is not None: mcaps.append(float(p.market_cap))
+                    if p.volume_24h is not None: vols.append(float(p.volume_24h))
 
                 if prices:
+                    # Use the last point within the slot
                     price = prices[-1]
-                    mcap  = mcaps[-1] if mcaps else None
-                    vol   = vols[-1] if vols else None
+                    mcap  = mcaps[-1] if mcaps else last_mcap
+                    vol   = vols[-1] if vols else last_vol
+                    source = "slot-last"
                 else:
-                    # carry-forward previous
-                    try:
-                        prev_bound = SEL_PREV_POINT_PS.bind([c.id, start])
-                        prev_bound.fetch_size = 1
-                        t_prev = time.time()
-                        prev = s.execute(prev_bound, timeout=REQUEST_TIMEOUT).one()
-                        print(f"        prev-point lookup in {time.time()-t_prev:.2f}s "
-                              f"{'hit' if prev else 'miss'}")
-                    except (OperationTimedOut, ReadTimeout, ReadFailure) as e:
-                        print(f"        [TIMEOUT] prev read {c.symbol} < {start}: {e} (using live fallback)")
-                        prev = None
-                    except DriverException as e:
-                        print(f"        [ERROR] prev read {c.symbol} < {start}: {e} (using live fallback)")
-                        prev = None
-
-                    if prev and prev.price_usd is not None:
-                        price = float(prev.price_usd)
-                        mcap  = float(prev.market_cap) if prev.market_cap is not None else None
-                        vol   = float(prev.volume_24h) if prev.volume_24h is not None else None
+                    # 2) If this run already wrote a previous slot, carry-forward locally first
+                    if last_price is not None:
+                        price = last_price
+                        mcap  = last_mcap
+                        vol   = last_vol
+                        source = "carry-local"
                     else:
-                        # very first slot for this coin
-                        price = float(c.price_usd or 0.0)
-                        mcap  = float(c.market_cap or 0.0)
-                        vol   = float(c.volume_24h or 0.0)
-                        empty += 1
+                        # 3) Otherwise, try DB previous point (ts < start)
+                        try:
+                            prev = s.execute(SEL_PREV_POINT_PS, [c.id, start], timeout=REQUEST_TIMEOUT).one()
+                            print(f"        prev-point lookup {'hit' if prev else 'miss'}")
+                        except (OperationTimedOut, ReadTimeout, ReadFailure) as e:
+                            print(f"        [TIMEOUT] prev read {c.symbol} < {start}: {e} (using live fallback)")
+                            prev = None
+                        except DriverException as e:
+                            print(f"        [ERROR] prev read {c.symbol} < {start}: {e} (using live fallback)")
+                            prev = None
+
+                        if prev and prev.price_usd is not None:
+                            price = float(prev.price_usd)
+                            mcap  = float(prev.market_cap) if prev.market_cap is not None else None
+                            vol   = float(prev.volume_24h) if prev.volume_24h is not None else None
+                            source = "carry-db"
+                        else:
+                            # 4) Very first slot ever → use *current* live as seed
+                            price = float(c.price_usd or 0.0)
+                            mcap  = float(c.market_cap or 0.0)
+                            vol   = float(c.volume_24h or 0.0)
+                            source = "seed-live"
+                            empty += 1
+
+                # Remember chosen values for next slot in this run
+                last_price, last_mcap, last_vol = price, mcap, vol
 
                 last_upd = end - timedelta(seconds=1)
 
-                # --- insert with timeout ---
+                # 5) Insert idempotently
                 try:
                     t_ins = time.time()
                     applied = s.execute(
@@ -188,11 +205,10 @@ try:
                         ),
                         timeout=REQUEST_TIMEOUT
                     ).one().applied
-                    print(f"        insert {'applied' if applied else 'skipped'} in {time.time()-t_ins:.2f}s")
-                    if applied:
-                        wrote += 1
-                    else:
-                        skipped += 1
+                    print(f"        insert {'applied' if applied else 'skipped'} "
+                          f"({source}, price={price}) in {time.time()-t_ins:.2f}s")
+                    if applied: wrote += 1
+                    else:       skipped += 1
                 except (WriteTimeout, OperationTimedOut) as e:
                     print(f"        [TIMEOUT] insert {c.symbol} {start}: {e} (count as skipped)")
                     skipped += 1
