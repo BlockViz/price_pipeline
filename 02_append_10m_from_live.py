@@ -1,5 +1,4 @@
-import os
-import time
+import os, time
 from datetime import datetime, timedelta, timezone
 
 from cassandra import OperationTimedOut, ReadTimeout, ReadFailure, WriteTimeout, DriverException
@@ -11,49 +10,41 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ---- Config ----
-BUNDLE = os.getenv("ASTRA_BUNDLE_PATH", "secure-connect.zip")
-ASTRA_TOKEN = os.getenv("ASTRA_TOKEN")
-KEYSPACE = os.getenv("ASTRA_KEYSPACE", "default_keyspace")
-TOP_N = int(os.getenv("TOP_N", "110"))
+BUNDLE         = os.getenv("ASTRA_BUNDLE_PATH", "secure-connect.zip")
+ASTRA_TOKEN    = os.getenv("ASTRA_TOKEN")
+KEYSPACE       = os.getenv("ASTRA_KEYSPACE", "default_keyspace")
+TOP_N          = int(os.getenv("TOP_N", "200"))
 
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT_SEC", "30"))
 CONNECT_TIMEOUT = int(os.getenv("CONNECT_TIMEOUT_SEC", "15"))
+FETCH_SIZE      = int(os.getenv("FETCH_SIZE", "500"))
 
-SLOT_DELAY_SEC  = int(os.getenv("SLOT_DELAY_SEC", "120"))  # 2 min guard
-SLOTS_BACKFILL  = int(os.getenv("SLOTS_BACKFILL", "8"))    # last 8 slots (~2h)
+SLOT_MINUTES    = int(os.getenv("SLOT_MINUTES", "10"))
+SLOT_DELAY_SEC  = int(os.getenv("SLOT_DELAY_SEC", "120"))
+SLOTS_BACKFILL  = int(os.getenv("SLOTS_BACKFILL", "12"))       # ~2h
+ALLOW_CARRY_MAX_SLOTS = int(os.getenv("ALLOW_CARRY_MAX_SLOTS", "1"))
 
-FETCH_SIZE = int(os.getenv("FETCH_SIZE", "500"))
-
-# Prefer LIVE for a slot only if it's timely for that slot
-LIVE_STALENESS_MAX_SEC = int(os.getenv("LIVE_STALENESS_MAX_SEC", "900"))  # 15 min
+TABLE_LATEST    = os.getenv("TABLE_LATEST", "prices_live")
+TABLE_ROLLING   = os.getenv("TABLE_ROLLING", "prices_live_rolling")
+TABLE_OUT       = os.getenv("TABLE_OUT", "prices_10m_7d")
 
 if not ASTRA_TOKEN:
     raise SystemExit("Missing ASTRA_TOKEN")
 
-def now_str():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+def now_str(): return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-def sanitize_num(x, fallback=0.0):
-    try:
-        if x is None:
-            return float(fallback)
-        return float(x)
-    except Exception:
-        return float(fallback)
-
-def floor_15m(dt_utc):
-    return dt_utc.replace(minute=(dt_utc.minute // 15) * 15, second=0, microsecond=0)
+def floor_slot(dt_utc, minutes=SLOT_MINUTES):
+    return dt_utc.replace(minute=(dt_utc.minute // minutes) * minutes, second=0, microsecond=0)
 
 def slot_start_now():
     now_ = datetime.now(timezone.utc) - timedelta(seconds=SLOT_DELAY_SEC)
-    return floor_15m(now_)
+    return floor_slot(now_)
 
 def last_n_slots_oldest_first(n):
-    end = slot_start_now() + timedelta(minutes=15)  # end-exclusive of most recent slot
+    end = slot_start_now() + timedelta(minutes=SLOT_MINUTES)
     slots = []
     for _ in range(n):
-        start = end - timedelta(minutes=15)
+        start = end - timedelta(minutes=SLOT_MINUTES)
         slots.append((start, end))
         end = start
     slots.reverse()
@@ -74,43 +65,31 @@ cluster = Cluster(
 
 try:
     s = cluster.connect(KEYSPACE)
-    print(f"[{now_str()}] Connected to keyspace: {KEYSPACE}")
+    print(f"[{now_str()}] Connected.")
 
-    # --- Statements ---
-    SEL_LIVE = SimpleStatement("""
-      SELECT id, symbol, name, rank, price_usd, market_cap, volume_24h, last_updated
-      FROM prices_live
-    """); SEL_LIVE.fetch_size = FETCH_SIZE
-
-    SEL_15M_RANGE_PS = s.prepare("""
-      SELECT ts, price_usd, market_cap, volume_24h
-      FROM prices_15m_7d
-      WHERE id=? AND ts>=? AND ts<?
-    """)
-
-    SEL_PREV_POINT_PS = s.prepare("""
-      SELECT ts, price_usd, market_cap, volume_24h
-      FROM prices_15m_7d
-      WHERE id=? AND ts<? LIMIT 1
-    """)
-
-    INS_15M_IF_NOT_EXISTS_PS = s.prepare("""
-      INSERT INTO prices_15m_7d
-        (id, ts, symbol, name, rank, price_usd, market_cap, volume_24h, last_updated)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-      IF NOT EXISTS
-    """)
+    SEL_COINS = SimpleStatement(
+        f"SELECT id, symbol, name, rank FROM {TABLE_LATEST}", fetch_size=FETCH_SIZE
+    )
+    SEL_IN_SLOT_PS = s.prepare(
+        f"SELECT last_updated, price_usd, market_cap, volume_24h "
+        f"FROM {TABLE_ROLLING} WHERE id=? AND last_updated>=? AND last_updated<? LIMIT 1"
+    )
+    SEL_PREV_PS = s.prepare(
+        f"SELECT last_updated, price_usd, market_cap, volume_24h "
+        f"FROM {TABLE_ROLLING} WHERE id=? AND last_updated<? LIMIT 1"
+    )
+    INS_10M_IF_NOT_EXISTS_PS = s.prepare(
+        f"INSERT INTO {TABLE_OUT} "
+        f"(id, ts, symbol, name, rank, price_usd, market_cap, volume_24h, last_updated) "
+        f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS"
+    )
 
     def main():
-        print(f"[{now_str()}] Fetching live coins… (timeout={REQUEST_TIMEOUT}s)")
-        t0 = time.time()
-        coins_rows = list(s.execute(SEL_LIVE, timeout=REQUEST_TIMEOUT))
-        print(f"[{now_str()}] Got {len(coins_rows)} rows from prices_live in {time.time()-t0:.2f}s")
-
+        coins_rows = list(s.execute(SEL_COINS, timeout=REQUEST_TIMEOUT))
         coins = [r for r in coins_rows if isinstance(r.rank, int) and r.rank > 0]
         coins.sort(key=lambda r: r.rank)
         coins = coins[:TOP_N]
-        print(f"[{now_str()}] Processing top {len(coins)} coins (TOP_N={TOP_N})")
+        print(f"[{now_str()}] Processing top {len(coins)} coins")
 
         slots = last_n_slots_oldest_first(SLOTS_BACKFILL)
         print(f"[{now_str()}] Slots (oldest→newest): {slots[0][0]} .. {slots[-1][1]} (count={len(slots)})")
@@ -119,100 +98,63 @@ try:
 
         for ci, c in enumerate(coins, 1):
             print(f"[{now_str()}] → [{ci}/{len(coins)}] {c.symbol} ({c.id}) rank={c.rank}")
+            carry_used = 0
 
             for si, (start, end) in enumerate(slots, 1):
                 print(f"    slot {si}/{len(slots)} {start} → {end}")
 
-                # 1) Prefer FRESH LIVE for this slot
-                use_live = False
-                if getattr(c, "last_updated", None):
-                    last_upd = c.last_updated
-                    if last_upd and last_upd.tzinfo is None:
-                        last_upd = last_upd.replace(tzinfo=timezone.utc)
-                    try:
-                        age_sec = abs((end - last_upd).total_seconds())
-                        use_live = (age_sec <= LIVE_STALENESS_MAX_SEC)
-                    except Exception:
-                        use_live = False
-
-                if use_live:
-                    price = sanitize_num(c.price_usd, 0.0)
-                    mcap  = sanitize_num(c.market_cap, 0.0)
-                    vol   = sanitize_num(c.volume_24h, 0.0)
-                    source = "live-fresh"
-                else:
-                    # 2) Otherwise see if there is any point already in this slot and take the last one
-                    try:
-                        bound = SEL_15M_RANGE_PS.bind([c.id, start, end]); bound.fetch_size = FETCH_SIZE
-                        pts_rows = list(s.execute(bound, timeout=REQUEST_TIMEOUT))
-                    except (OperationTimedOut, ReadTimeout, ReadFailure) as e:
-                        print(f"        [TIMEOUT] range read {c.symbol} {start}→{end}: {e} (skipping slot)")
-                        skipped += 1
-                        continue
-                    except DriverException as e:
-                        print(f"        [ERROR] range read {c.symbol} {start}→{end}: {e} (skipping slot)")
-                        skipped += 1
-                        continue
-
-                    prices = [float(p.price_usd) for p in pts_rows if p.price_usd is not None]
-                    mcaps  = [float(p.market_cap) for p in pts_rows if p.market_cap is not None]
-                    vols   = [float(p.volume_24h) for p in pts_rows if p.volume_24h is not None]
-
-                    if prices:
-                        price = prices[-1]
-                        mcap  = mcaps[-1] if mcaps else 0.0
-                        vol   = vols[-1] if vols else 0.0
-                        source = "slot-last"
-                    else:
-                        # 3) Fall back to previous DB point < start
-                        try:
-                            prev = s.execute(SEL_PREV_POINT_PS, [c.id, start], timeout=REQUEST_TIMEOUT).one()
-                            print(f"        prev-point lookup {'hit' if prev else 'miss'}")
-                        except (OperationTimedOut, ReadTimeout, ReadFailure) as e:
-                            print(f"        [TIMEOUT] prev read {c.symbol} < {start}: {e} (skip)")
-                            prev = None
-                        except DriverException as e:
-                            print(f"        [ERROR] prev read {c.symbol} < {start}: {e} (skip)")
-                            prev = None
-
-                        if prev and prev.price_usd is not None:
-                            price = sanitize_num(prev.price_usd, 0.0)
-                            mcap  = sanitize_num(prev.market_cap, 0.0)
-                            vol   = sanitize_num(prev.volume_24h, 0.0)
-                            source = "carry-db"
-                        else:
-                            # 4) As absolute last resort, if live is stale and no DB point exists,
-                            #    avoid writing a misleading current snapshot into old history.
-                            print("        no in-slot data and no prev DB; live stale → skip slot")
-                            skipped += 1
-                            continue
-
-                # Never write NULLs
-                mcap = sanitize_num(mcap, 0.0)
-                vol  = sanitize_num(vol, 0.0)
-                last_upd = end - timedelta(seconds=1)
-
-                # 5) Insert idempotently
                 try:
-                    t_ins = time.time()
+                    in_slot = s.execute(SEL_IN_SLOT_PS, [c.id, start, end], timeout=REQUEST_TIMEOUT).one()
+                except (OperationTimedOut, ReadTimeout, ReadFailure) as e:
+                    print(f"        [TIMEOUT] in-slot read {c.symbol} {start}→{end}: {e} (skip)"); skipped += 1; continue
+                except DriverException as e:
+                    print(f"        [ERROR] in-slot read {c.symbol} {start}→{end}: {e} (skip)"); skipped += 1; continue
+
+                if in_slot and in_slot.price_usd is not None:
+                    price = float(in_slot.price_usd)
+                    mcap  = float(in_slot.market_cap) if in_slot.market_cap is not None else 0.0
+                    vol   = float(in_slot.volume_24h) if in_slot.volume_24h is not None else 0.0
+                    source = "hist-in-slot"
+                else:
+                    if carry_used >= ALLOW_CARRY_MAX_SLOTS:
+                        print("        carry cap reached → skip"); skipped += 1; continue
+                    try:
+                        prev = s.execute(SEL_PREV_PS, [c.id, start], timeout=REQUEST_TIMEOUT).one()
+                    except (OperationTimedOut, ReadTimeout, ReadFailure) as e:
+                        print(f"        [TIMEOUT] prev read {c.symbol} < {start}: {e} (skip)"); skipped += 1; continue
+                    except DriverException as e:
+                        print(f"        [ERROR] prev read {c.symbol} < {start}: {e} (skip)"); skipped += 1; continue
+
+                    if prev and prev.price_usd is not None:
+                        price = float(prev.price_usd)
+                        mcap  = float(prev.market_cap) if prev.market_cap is not None else 0.0
+                        vol   = float(prev.volume_24h) if prev.volume_24h is not None else 0.0
+                        source = "hist-carry"
+                        carry_used += 1
+                    else:
+                        print("        no history for slot (and no previous) → skip")
+                        skipped += 1
+                        continue
+
+                # clamp last_updated to slot end
+                slot_last_upd = end - timedelta(seconds=1)
+
+                try:
                     applied = s.execute(
-                        INS_15M_IF_NOT_EXISTS_PS.bind(
-                            [c.id, start, c.symbol, c.name, c.rank, price, mcap, vol, last_upd]
-                        ),
+                        INS_10M_IF_NOT_EXISTS_PS,
+                        [c.id, start, c.symbol, c.name, c.rank, price, mcap, vol, slot_last_upd],
                         timeout=REQUEST_TIMEOUT
                     ).one().applied
                     print(f"        insert {'applied' if applied else 'skipped'} "
-                          f"({source}, price={price}, mcap={mcap}, vol={vol}) in {time.time()-t_ins:.2f}s")
+                          f"({source}, price={price}, mcap={mcap}, vol={vol}, last_upd={slot_last_upd})")
                     if applied: wrote += 1
                     else:       skipped += 1
                 except (WriteTimeout, OperationTimedOut) as e:
-                    print(f"        [TIMEOUT] insert {c.symbol} {start}: {e} (count as skipped)")
-                    skipped += 1
+                    print(f"        [TIMEOUT] insert {c.symbol} {start}: {e} (skip)"); skipped += 1
                 except DriverException as e:
-                    print(f"        [ERROR] insert {c.symbol} {start}: {e} (count as skipped)")
-                    skipped += 1
+                    print(f"        [ERROR] insert {c.symbol} {start}: {e} (skip)"); skipped += 1
 
-        print(f"[{now_str()}] [15m] slots={SLOTS_BACKFILL} wrote={wrote} skipped={skipped}")
+        print(f"[{now_str()}] [10m] wrote={wrote} skipped={skipped}")
 
     if __name__ == "__main__":
         try:
