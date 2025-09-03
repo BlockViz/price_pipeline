@@ -8,11 +8,15 @@ on:
         required: false
         default: "true"
       run_02:
-        description: "Run 02_append_15m_from_live.py?"
+        description: "Run 02_append_10m_from_live.py?"
         required: false
         default: "true"
       run_03:
-        description: "Run 03_create_hourly_from_15m.py?"
+        description: "Run 03_create_hourly_from_10m.py?"
+        required: false
+        default: "true"
+      run_04:
+        description: "Run 04_create_daily_from_10m.py?"
         required: false
         default: "true"
       TOP_N:
@@ -28,13 +32,13 @@ permissions:
   contents: read
 
 concurrency:
-  group: prices-pipeline
+  group: prices-pipeline-manual
   cancel-in-progress: true
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
     env:
       TZ: UTC
       PYTHONUNBUFFERED: "1"
@@ -42,15 +46,11 @@ jobs:
       PYTHONWARNINGS: default
 
     steps:
-      # -----------------------
-      # 1. Checkout the repo
-      # -----------------------
+      # 1) Checkout
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # -----------------------
-      # 2. Setup Python
-      # -----------------------
+      # 2) Python
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -58,18 +58,14 @@ jobs:
           cache: "pip"
           cache-dependency-path: "requirements.txt"
 
-      # -----------------------
-      # 3. Install dependencies
-      # -----------------------
+      # 3) Deps
       - name: Install dependencies
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
           pip install "cassandra-driver==3.29.0" requests python-dotenv tzdata
 
-      # -----------------------
-      # 4. Setup Astra bundle
-      # -----------------------
+      # 4) Astra SCB
       - name: Write Astra secure connect bundle
         run: |
           set -euo pipefail
@@ -77,9 +73,7 @@ jobs:
           test -s secure-connect.zip || { echo "secure-connect.zip missing/empty"; exit 1; }
           ls -lh secure-connect.zip
 
-      # -----------------------
-      # 5. Load prices_live
-      # -----------------------
+      # 5) Load prices_live (rolling, 200 coins)
       - name: 01 Load prices_live
         if: ${{ github.event.inputs.run_01 == 'true' }}
         timeout-minutes: 10
@@ -87,8 +81,9 @@ jobs:
           ASTRA_BUNDLE_PATH: secure-connect.zip
           ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
           ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
-          TOP_N: ${{ github.event.inputs.TOP_N != '' && github.event.inputs.TOP_N || secrets.TOP_N || '110' }}
-          MIN_EXPECTED: "80"
+
+          TOP_N: ${{ github.event.inputs.TOP_N != '' && github.event.inputs.TOP_N || secrets.TOP_N || '200' }}
+          MIN_EXPECTED: "120"
           RETRIES: "3"
           BACKOFF_MIN: "5"
           REQUEST_TIMEOUT_SEC: "60"
@@ -103,41 +98,42 @@ jobs:
           set -euo pipefail
           python 01_load_prices_live.py
 
-      # -----------------------
-      # 6. Append 15m slots
-      # -----------------------
-      - name: 02 Append 15m from live
+      # 6) Append 10m slots from rolling/live
+      - name: 02 Append 10m from live
         if: ${{ github.event.inputs.run_02 == 'true' }}
         timeout-minutes: 8
         env:
           ASTRA_BUNDLE_PATH: secure-connect.zip
           ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
           ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
-          TOP_N: ${{ github.event.inputs.TOP_N != '' && github.event.inputs.TOP_N || secrets.TOP_N || '110' }}
+
+          TOP_N: ${{ github.event.inputs.TOP_N != '' && github.event.inputs.TOP_N || secrets.TOP_N || '200' }}
           REQUEST_TIMEOUT_SEC: "60"
           CONNECT_TIMEOUT_SEC: "15"
           FETCH_SIZE: "500"
+
+          SLOT_MINUTES: "10"
           SLOT_DELAY_SEC: "120"
-          SLOTS_BACKFILL: "2"
+          SLOTS_BACKFILL: "12"       # ~2 hours of 10m backfill
           VERBOSE_MODE: ${{ github.event.inputs.VERBOSE_MODE || '0' }}
         run: |
           set -euo pipefail
-          python 02_append_15m_from_live.py
+          python 02_append_10m_from_live.py
 
-      # -----------------------
-      # 7. Update hourly candles
-      # -----------------------
-      - name: 03 Update hourly from 15m
+      # 7) Update hourly from 10m
+      - name: 03 Update hourly from 10m
         if: ${{ github.event.inputs.run_03 == 'true' }}
         timeout-minutes: 8
         env:
           ASTRA_BUNDLE_PATH: secure-connect.zip
           ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
           ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
-          TOP_N: ${{ github.event.inputs.TOP_N != '' && github.event.inputs.TOP_N || secrets.TOP_N || '110' }}
+
+          TOP_N: ${{ github.event.inputs.TOP_N != '' && github.event.inputs.TOP_N || secrets.TOP_N || '200' }}
           REQUEST_TIMEOUT_SEC: "30"
           CONNECT_TIMEOUT_SEC: "15"
           FETCH_SIZE: "500"
+
           SLOT_DELAY_SEC: "120"
           CURRENT_ONLY: "1"
           FINALIZE_PREV: "1"
@@ -145,4 +141,26 @@ jobs:
           VERBOSE_MODE: ${{ github.event.inputs.VERBOSE_MODE || '0' }}
         run: |
           set -euo pipefail
-          python 03_create_hourly_from_15m.py
+          python 03_create_hourly_from_10m.py
+
+      # 8) Update daily from 10m (writes partial during the day, final after UTC midnight once slots are complete)
+      - name: 04 Update daily from 10m
+        if: ${{ github.event.inputs.run_04 == 'true' }}
+        timeout-minutes: 8
+        env:
+          ASTRA_BUNDLE_PATH: secure-connect.zip
+          ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
+          ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
+
+          TOP_N: ${{ github.event.inputs.TOP_N != '' && github.event.inputs.TOP_N || secrets.TOP_N || '200' }}
+          REQUEST_TIMEOUT_SEC: "30"
+          CONNECT_TIMEOUT_SEC: "15"
+          FETCH_SIZE: "500"
+
+          SLOT_DELAY_SEC: "120"
+          PROGRESS_EVERY: "15"
+          VERBOSE_MODE: ${{ github.event.inputs.VERBOSE_MODE || '0' }}
+          MIN_10M_POINTS_FOR_FINAL: "2"
+        run: |
+          set -euo pipefail
+          python 04_create_daily_from_10m.py

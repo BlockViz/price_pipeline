@@ -16,20 +16,21 @@ BUNDLE              = os.getenv("ASTRA_BUNDLE_PATH", "secure-connect.zip")
 ASTRA_TOKEN         = os.getenv("ASTRA_TOKEN")
 KEYSPACE            = os.getenv("ASTRA_KEYSPACE", "default_keyspace")
 
-TOP_N               = int(os.getenv("TOP_N", "110"))
+TOP_N               = int(os.getenv("TOP_N", "200"))
 REQUEST_TIMEOUT     = int(os.getenv("REQUEST_TIMEOUT_SEC", "30"))
 CONNECT_TIMEOUT_SEC = int(os.getenv("CONNECT_TIMEOUT_SEC", "15"))
 FETCH_SIZE          = int(os.getenv("FETCH_SIZE", "500"))
 
-# Live behavior
-SLOT_DELAY_SEC      = int(os.getenv("SLOT_DELAY_SEC", "120"))  # guard against too-fresh 15m
+# Behavior
+SLOT_DELAY_SEC      = int(os.getenv("SLOT_DELAY_SEC", "120"))  # guard against too-fresh 10m
 FINALIZE_PREV       = os.getenv("FINALIZE_PREV", "1") == "1"   # finalize previous hour once
 CURRENT_ONLY        = os.getenv("CURRENT_ONLY", "1") == "1"    # only current + prev (no older backfill)
 PROGRESS_EVERY      = int(os.getenv("PROGRESS_EVERY", "20"))
 VERBOSE_MODE        = os.getenv("VERBOSE_MODE", "0") == "1"
 
+TEN_MIN_TABLE       = os.getenv("TEN_MIN_TABLE", "prices_10m_7d")
 HOURLY_TABLE        = os.getenv("HOURLY_TABLE", "candles_hourly_30d")
-MIN_15M_POINTS_FOR_FINAL = int(os.getenv("MIN_15M_POINTS_FOR_FINAL", "2"))  # require ≥2 points to finalize
+MIN_10M_POINTS_FOR_FINAL = int(os.getenv("MIN_10M_POINTS_FOR_FINAL", "2"))  # require ≥2 points to finalize
 
 if not ASTRA_TOKEN:
     raise SystemExit("Missing ASTRA_TOKEN")
@@ -37,8 +38,8 @@ if not ASTRA_TOKEN:
 def now_str():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-def floor_15m(dt_utc: datetime) -> datetime:
-    return dt_utc.replace(minute=(dt_utc.minute // 15) * 15, second=0, microsecond=0)
+def floor_10m(dt_utc: datetime) -> datetime:
+    return dt_utc.replace(minute=(dt_utc.minute // 10) * 10, second=0, microsecond=0)
 
 def sanitize_num(x, fallback=None):
     try:
@@ -83,12 +84,12 @@ def plan_windows():
     """
     Returns a list of (start, end, is_final, label) to process:
       - Previous hour (closed) as final, if enabled
-      - Current hour (partial) up to last safe 15m boundary
+      - Current hour (partial) up to last safe 10m boundary
     """
     now_guarded = datetime.now(timezone.utc) - timedelta(seconds=SLOT_DELAY_SEC)
     curr_start = now_guarded.replace(minute=0, second=0, microsecond=0)
     curr_end   = curr_start + timedelta(hours=1)
-    last_safe  = floor_15m(now_guarded)
+    last_safe  = floor_10m(now_guarded)
     curr_eff_end = min(curr_end, last_safe)
 
     prev_start = curr_start - timedelta(hours=1)
@@ -106,9 +107,9 @@ def main():
     # Prepare statements
     print(f"[{now_str()}] Preparing statements…")
     t0 = time.time()
-    SEL_15M_RANGE = s.prepare("""
+    SEL_10M_RANGE = s.prepare(f"""
       SELECT ts, price_usd, market_cap, volume_24h
-      FROM prices_15m_7d
+      FROM {TEN_MIN_TABLE}
       WHERE id=? AND ts>=? AND ts<? ORDER BY ts ASC
     """)
     SEL_HOURLY_ONE = s.prepare(f"""
@@ -126,7 +127,7 @@ def main():
     # Plan windows
     windows = plan_windows()
     if not windows:
-        print(f"[{now_str()}] Nothing to do (no safe 15m yet).")
+        print(f"[{now_str()}] Nothing to do (no safe 10m yet).")
         return
     w_desc = ", ".join([f"[{lbl}:{'final' if fin else 'partial'} {st}→{en}]" for st,en,fin,lbl in windows])
     print(f"[{now_str()}] Windows: {w_desc}")
@@ -149,9 +150,9 @@ def main():
             print(f"[{now_str()}] → Coin {ci}/{len(coins)}: {getattr(c,'symbol','?')} ({getattr(c,'id','?')}) r={getattr(c,'rank','?')}")
 
         for (start, end, is_final, label) in windows:
-            # Fetch 15m points
+            # Fetch 10m points
             try:
-                bound = SEL_15M_RANGE.bind([c.id, start, end]); bound.fetch_size = 64
+                bound = SEL_10M_RANGE.bind([c.id, start, end]); bound.fetch_size = 64
                 t_read = time.time()
                 pts = list(s.execute(bound, timeout=REQUEST_TIMEOUT))
                 if VERBOSE_MODE:
@@ -162,24 +163,24 @@ def main():
                 skipped += 1
                 continue
 
-            # Build OHLC from 15m
+            # Build OHLC from 10m
             prices, mcaps, vols = [], [], []
             for p in pts:
                 if p.price_usd   is not None: prices.append(float(p.price_usd))
                 if p.market_cap  is not None: mcaps.append(float(p.market_cap))
                 if p.volume_24h  is not None: vols.append(float(p.volume_24h))
 
-            if is_final and len(prices) < MIN_15M_POINTS_FOR_FINAL:
+            if is_final and len(prices) < MIN_10M_POINTS_FOR_FINAL:
                 # don't finalize a closed hour if we somehow have <2 points; leave last partial until data is complete
                 if VERBOSE_MODE:
-                    print(f"[{now_str()}]    {c.symbol} {start} final: not enough 15m points ({len(prices)}) → skip finalization")
+                    print(f"[{now_str()}]    {c.symbol} {start} final: not enough 10m points ({len(prices)}) → skip finalization")
                 skipped += 1
                 continue
 
             if not prices:
                 empty += 1
                 if VERBOSE_MODE:
-                    print(f"[{now_str()}]    {c.symbol} {start} empty (no 15m) → skip")
+                    print(f"[{now_str()}]    {c.symbol} {start} empty (no 10m) → skip")
                 continue
 
             o  = prices[0]
@@ -187,7 +188,7 @@ def main():
             l  = min(prices)
             cl = prices[-1]
 
-            # Ensure mcap/vol are never NULL: use last available in hour; else previous hour's; else 0.0
+            # Use last available in hour; fallback to existing row; final fallback 0.0
             mcap = mcaps[-1] if mcaps else None
             vol  = vols[-1]  if vols  else None
 
@@ -199,16 +200,14 @@ def main():
                 if VERBOSE_MODE:
                     print(f"[{now_str()}] [EXIST-ERR] {c.symbol} {start}: {e} (treat as no row)")
 
-            # Fill missing mcap/vol with previous hourly if needed
             if (mcap is None or vol is None) and existing:
                 if mcap is None: mcap = sanitize_num(getattr(existing, "market_cap", None), 0.0)
                 if vol  is None: vol  = sanitize_num(getattr(existing, "volume_24h", None), 0.0)
-            # Final safety: never write NULL
             if mcap is None: mcap = 0.0
-            if vol  is None: vol  = 0.0
+            if vol  is None:  vol  = 0.0
 
             # Skip if already final and identical
-            if is_final and existing and getattr(existing, "source", None) == "15m_final":
+            if is_final and existing and getattr(existing, "source", None) == "10m_final":
                 same = all([
                     equalish(o, existing.open),
                     equalish(h, existing.high),
@@ -223,8 +222,8 @@ def main():
                         print(f"[{now_str()}]    {c.symbol} {start} already final & identical → skip")
                     continue
 
-            # If not final, you can also skip writing when a partial already matches (reduces churn)
-            if (not is_final) and existing and getattr(existing, "source", None) == "15m_partial":
+            # If not final, also skip writing when a partial already matches (reduces churn)
+            if (not is_final) and existing and getattr(existing, "source", None) == "10m_partial":
                 same = all([
                     equalish(o, existing.open),
                     equalish(h, existing.high),
@@ -239,7 +238,7 @@ def main():
                         print(f"[{now_str()}]    {c.symbol} {start} partial unchanged → skip")
                     continue
 
-            source = "15m_final" if is_final else "15m_partial"
+            source = "10m_final" if is_final else "10m_partial"
 
             try:
                 s.execute(
@@ -255,7 +254,7 @@ def main():
                 print(f"[{now_str()}] [WRITE-ERR] {c.symbol} {start}: {e}")
                 skipped += 1
 
-    print(f"[{now_str()}] [hourly-from-15m] wrote={wrote} skipped={skipped} empty={empty} "
+    print(f"[{now_str()}] [hourly-from-10m] wrote={wrote} skipped={skipped} empty={empty} "
           f"errors={errors} already_final_identical={finalized_skips} partial_unchanged_skips={unchanged_skips}")
 
 if __name__ == "__main__":

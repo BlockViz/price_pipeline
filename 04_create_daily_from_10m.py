@@ -16,25 +16,29 @@ BUNDLE              = os.getenv("ASTRA_BUNDLE_PATH", "secure-connect.zip")
 ASTRA_TOKEN         = os.getenv("ASTRA_TOKEN")
 KEYSPACE            = os.getenv("ASTRA_KEYSPACE", "default_keyspace")
 
-TOP_N               = int(os.getenv("TOP_N", "110"))
+TOP_N               = int(os.getenv("TOP_N", "200"))
 REQUEST_TIMEOUT     = int(os.getenv("REQUEST_TIMEOUT_SEC", "30"))
 CONNECT_TIMEOUT_SEC = int(os.getenv("CONNECT_TIMEOUT_SEC", "15"))
 FETCH_SIZE          = int(os.getenv("FETCH_SIZE", "500"))
 
-SLOT_DELAY_SEC      = int(os.getenv("SLOT_DELAY_SEC", "120"))     # guard against too-fresh 15m slot
+SLOT_DELAY_SEC      = int(os.getenv("SLOT_DELAY_SEC", "120"))     # guard against too-fresh 10m slot
 PROGRESS_EVERY      = int(os.getenv("PROGRESS_EVERY", "20"))      # coin progress interval
 VERBOSE_MODE        = os.getenv("VERBOSE_MODE", "0") == "1"       # extra per-coin logs
-MIN_15M_POINTS_FOR_FINAL = int(os.getenv("MIN_15M_POINTS_FOR_FINAL", "2"))
 
+TEN_MIN_TABLE       = os.getenv("TEN_MIN_TABLE", "prices_10m_7d")
 DAILY_TABLE         = os.getenv("DAILY_TABLE", "candles_daily_contin")
+
+# require ≥2 ten-minute points to finalize a closed day (safety)
+MIN_10M_POINTS_FOR_FINAL = int(os.getenv("MIN_10M_POINTS_FOR_FINAL", "2"))
 
 if not ASTRA_TOKEN:
     raise SystemExit("Missing ASTRA_TOKEN")
 
-def now_str(): return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+def now_str(): 
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-def floor_15m(dt_utc: datetime) -> datetime:
-    return dt_utc.replace(minute=(dt_utc.minute // 15) * 15, second=0, microsecond=0)
+def floor_10m(dt_utc: datetime) -> datetime:
+    return dt_utc.replace(minute=(dt_utc.minute // 10) * 10, second=0, microsecond=0)
 
 def sanitize_num(x, fallback=None):
     try:
@@ -81,9 +85,9 @@ def main():
     t0 = time.time()
 
     # Order ASC so we can take first/last deterministically
-    SEL_15M_DAY = s.prepare("""
+    SEL_10M_DAY = s.prepare(f"""
       SELECT ts, price_usd, market_cap, volume_24h
-      FROM prices_15m_7d
+      FROM {TEN_MIN_TABLE}
       WHERE id=? AND ts>=? AND ts<? ORDER BY ts ASC
     """)
 
@@ -107,13 +111,13 @@ def main():
 
     # Today window & safe end
     start_utc, end_excl_utc, date_utc = utc_today_bounds()
-    last_safe_15m_end = floor_15m(datetime.now(timezone.utc) - timedelta(seconds=SLOT_DELAY_SEC))
-    effective_end = min(end_excl_utc, last_safe_15m_end)
+    last_safe_10m_end = floor_10m(datetime.now(timezone.utc) - timedelta(seconds=SLOT_DELAY_SEC))
+    effective_end = min(end_excl_utc, last_safe_10m_end)
     is_partial_day = effective_end < end_excl_utc
 
     print(f"[{now_str()}] Today UTC: date={date_utc} "
           f"start={start_utc} end_excl={end_excl_utc} "
-          f"safe_15m_end={last_safe_15m_end} effective_end={effective_end} "
+          f"safe_10m_end={last_safe_10m_end} effective_end={effective_end} "
           f"{'(partial)' if is_partial_day else '(final)'}")
 
     # Load coins
@@ -134,18 +138,18 @@ def main():
             print(f"[{now_str()}] → Coin {idx}/{len(coins)}: {getattr(r,'symbol','?')} "
                   f"({getattr(r,'id','?')}) rank={getattr(r,'rank','?')}")
 
-        # Read today's 15m points up to effective_end
+        # Read today's 10m points up to effective_end
         prices, mcaps, vols = [], [], []
         last_pt_ts = None
         if effective_end > start_utc:
             try:
-                bound = SEL_15M_DAY.bind([r.id, start_utc, effective_end])
-                bound.fetch_size = 96  # ≤ 96 pts/day
+                bound = SEL_10M_DAY.bind([r.id, start_utc, effective_end])
+                bound.fetch_size = 160  # ≤144 pts/day
                 t_read = time.time()
                 pts = list(s.execute(bound, timeout=REQUEST_TIMEOUT))
                 dt_read = time.time() - t_read
                 if VERBOSE_MODE:
-                    print(f"[{now_str()}]    15m {start_utc}→{effective_end} rows={len(pts)} in {dt_read:.2f}s")
+                    print(f"[{now_str()}]    10m {start_utc}→{effective_end} rows={len(pts)} in {dt_read:.2f}s")
                 for p in pts:
                     last_pt_ts = p.ts or last_pt_ts
                     if p.price_usd   is not None: prices.append(float(p.price_usd))
@@ -153,17 +157,18 @@ def main():
                     if p.volume_24h  is not None: vols.append(float(p.volume_24h))
             except (OperationTimedOut, ReadTimeout, ReadFailure, DriverException) as e:
                 errors += 1
-                print(f"[{now_str()}] [READ-ERR] {r.symbol} today 15m: {e} (fallback)")
+                print(f"[{now_str()}] [READ-ERR] {r.symbol} today 10m: {e} (fallback)")
 
         # Compute daily candle
-        if prices and (not is_partial_day and len(prices) >= MIN_15M_POINTS_FOR_FINAL or is_partial_day):
-            # 15m-derived
+        have_enough_to_finalize = (not is_partial_day) and (len(prices) >= MIN_10M_POINTS_FOR_FINAL)
+        if prices and (is_partial_day or have_enough_to_finalize):
+            # 10m-derived
             o = prices[0]
             h = max(prices)
             l = min(prices)
             c = prices[-1]
 
-            # prefer last non-null mcap/vol from 15m
+            # prefer last non-null mcap/vol from 10m
             mcap = mcaps[-1] if mcaps else None
             vol  = vols[-1]  if vols  else None
 
@@ -178,18 +183,18 @@ def main():
             if vol  is None and existing:
                 vol  = sanitize_num(getattr(existing, "volume_24h", None), sanitize_num(r.volume_24h, 0.0))
             if mcap is None: mcap = sanitize_num(r.market_cap, 0.0)
-            if vol  is None: vol  = sanitize_num(r.volume_24h, 0.0)
+            if vol  is None:  vol  = sanitize_num(r.volume_24h, 0.0)
 
             price_usd = c
-            # last_updated → use last 15m point time if available, else live last_updated
+            # last_updated → use last 10m point time if available, else live last_updated
             last_upd = last_pt_ts or r.last_updated
             if last_upd and last_upd.tzinfo is None:
                 last_upd = last_upd.replace(tzinfo=timezone.utc)
 
-            source = "15m_partial" if is_partial_day else "15m_final"
+            source = "10m_partial" if is_partial_day else "10m_final"
 
         else:
-            # Very early UTC day (no safe 15m yet): prev-close vs live snapshot
+            # Very early UTC day (no safe 10m yet): prev-close vs live snapshot
             prev_row = None
             try:
                 prev_row = s.execute(SEL_PREV_DAY, [r.id, (date_utc - timedelta(days=1))],
@@ -213,12 +218,6 @@ def main():
             if last_upd and last_upd.tzinfo is None:
                 last_upd = last_upd.replace(tzinfo=timezone.utc)
 
-            # check if an existing partial from a prior run already matches to avoid churn
-            try:
-                existing = s.execute(SEL_PREV_DAY, [r.id, date_utc], timeout=REQUEST_TIMEOUT).one()
-            except (OperationTimedOut, ReadTimeout, DriverException):
-                existing = None
-
         # Compare with existing (skip unchanged to reduce writes/tombstones)
         try:
             existing_today = s.execute(SEL_PREV_DAY, [r.id, date_utc], timeout=REQUEST_TIMEOUT).one()
@@ -233,12 +232,12 @@ def main():
                 equalish(getattr(existing_today, "close", None), price_usd),
                 equalish(getattr(existing_today, "market_cap", None), mcap),
                 equalish(getattr(existing_today, "volume_24h", None), vol),
-                # If both are 15m_final, also skip if source same (don’t refinalize identical)
+                # If both are 10m_final, also skip if source same (don’t refinalize identical)
                 (getattr(existing_today, "candle_source", None) == source)
-                if source == "15m_final" else True
+                if source == "10m_final" else True
             ])
             if same:
-                unchanged_skips = 1 if 'unchanged_skips' not in locals() else unchanged_skips + 1
+                unchanged_skips += 1
                 if VERBOSE_MODE:
                     print(f"[{now_str()}]    {r.symbol} {date_utc} unchanged ({source}) → skip")
                 continue
@@ -254,14 +253,12 @@ def main():
             if VERBOSE_MODE:
                 print(f"[{now_str()}]    UPSERT {r.symbol} {date_utc} "
                       f"O={o} H={h} L={l} C={price_usd} M={mcap} V={vol} src={source}")
-            upserts += 1
         except (WriteTimeout, OperationTimedOut, DriverException) as e:
             errors += 1
             print(f"[{now_str()}] [WRITE-ERR] {r.symbol} {date_utc}: {e}")
 
-    print(f"[{now_str()}] [daily-from-15m] date={date_utc} upserts={upserts} "
-          f"errors={errors} unchanged_skips={unchanged_skips if 'unchanged_skips' in locals() else 0} "
-          f"{'partial' if is_partial_day else 'final'}")
+    print(f"[{now_str()}] [daily-from-10m] date={date_utc} "
+          f"errors={errors} unchanged_skips={unchanged_skips}")
 
 if __name__ == "__main__":
     try:
