@@ -14,5 +14,8 @@ venv/
 # One-off config/scripts anywhere in the tree
 **/onetime_and_config/
 
+# docs folder
+**/docs
+
 # Artifacts created by workflows or local runs
 secure-connect.zip
