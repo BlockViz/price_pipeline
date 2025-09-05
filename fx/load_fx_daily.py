@@ -245,7 +245,9 @@ def main():
                 # Non-weekend missing day (holiday or data gap): leave empty to avoid synthetic values
                 log(f"No data for {day} and not weekend; skipping synthetic fill")
         else:
-            log(f"Already up-to-date for observed business date {asof_date}")
+            # prev == asof_date. Republish to overwrite any placeholders (carry/projected)
+            log(f"Date {asof_date} already present; republishing official rates to overwrite placeholders if any")
+            publish_daily(s, asof_date, latest_rates, source="observed")
 
         # Project a placeholder for tomorrow using the latest observed rates
         tomorrow = dt.date.today() + dt.timedelta(days=1)
