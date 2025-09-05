@@ -4,7 +4,8 @@ on:
     - cron: "12 3 * * *"     # daily at 03:12 UTC
   push:
     paths:
-      - "category_mapping.csv"
+      - "prices/category_mapping.csv"          # moved file
+      - "prices/load_categories.py"            # optional: rerun when script changes
       - ".github/workflows/categories.yml"
   workflow_dispatch: {}
 
@@ -14,19 +15,37 @@ permissions:
 jobs:
   load:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TZ: UTC
+      PYTHONUNBUFFERED: "1"
+      PYTHONUTF8: "1"
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
-      - run: |
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: "prices/requirements.txt"  # adjust if you don't keep this file
+
+      - name: Install deps
+        run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
-          pip install cassandra-driver python-dotenv tzdata
+          pip install "cassandra-driver==3.29.0" python-dotenv tzdata
+          # Or, if you keep extra pins:
+          # pip install -r prices/requirements.txt
+
       - name: Write Astra SCB
         run: echo "${{ secrets.ASTRA_BUNDLE_BASE64 }}" | base64 -d > secure-connect.zip
+
       - name: Load categories
         env:
           ASTRA_BUNDLE_PATH: secure-connect.zip
           ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
           ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
-          CATEGORY_FILE: category_mapping.csv
-        run: python load_categories.py
+          CATEGORY_FILE: prices/category_mapping.csv     # new location
+          # Optional: override live table if needed
+          # TABLE_LIVE: prices_live
+        run: python prices/load_categories.py

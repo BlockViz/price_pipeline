@@ -1,7 +1,27 @@
-import os
-import time
+# prices/04_create_daily_from_10m.py
+import os, time
 from datetime import datetime, timedelta, timezone
+import sys, pathlib
 
+# ───────────────────── Repo root & helpers ─────────────────────
+# Make the backend repo root importable (two levels up from this file)
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.append(str(_REPO_ROOT))
+
+# Try to use shared helper; fall back if not present
+try:
+    from paths import rel, chdir_repo_root
+except Exception:
+    def rel(*parts: str) -> pathlib.Path:
+        return _REPO_ROOT.joinpath(*parts)
+    def chdir_repo_root() -> None:
+        os.chdir(_REPO_ROOT)
+
+# Ensure consistent CWD (so relative files like secure-connect.zip work)
+chdir_repo_root()
+
+# ───────────────────────── 3rd-party ─────────────────────────
 from cassandra import OperationTimedOut, ReadTimeout, ReadFailure, WriteTimeout, DriverException
 from cassandra.cluster import Cluster, EXEC_PROFILE_DEFAULT, ExecutionProfile
 from cassandra.auth import PlainTextAuthProvider
@@ -9,7 +29,8 @@ from cassandra.policies import RoundRobinPolicy
 from cassandra.query import SimpleStatement
 from dotenv import load_dotenv
 
-load_dotenv()
+# Load .env from repo root explicitly
+load_dotenv(dotenv_path=rel(".env"))
 
 # ---- Config ----
 BUNDLE              = os.getenv("ASTRA_BUNDLE_PATH", "secure-connect.zip")
@@ -27,6 +48,9 @@ VERBOSE_MODE        = os.getenv("VERBOSE_MODE", "0") == "1"       # extra per-co
 
 TEN_MIN_TABLE       = os.getenv("TEN_MIN_TABLE", "prices_10m_7d")
 DAILY_TABLE         = os.getenv("DAILY_TABLE", "candles_daily_contin")
+
+# allow overriding the live table (was hard-coded before)
+TABLE_LIVE          = os.getenv("TABLE_LIVE", os.getenv("TABLE_LATEST", "prices_live"))
 
 # require ≥2 ten-minute points to finalize a closed day (safety)
 MIN_10M_POINTS_FOR_FINAL = int(os.getenv("MIN_10M_POINTS_FOR_FINAL", "2"))
@@ -68,9 +92,9 @@ cluster = Cluster(
 s = cluster.connect(KEYSPACE)
 print(f"[{now_str()}] Connected.")
 
-SEL_LIVE = SimpleStatement("""
+SEL_LIVE = SimpleStatement(f"""
   SELECT id, symbol, name, rank, price_usd, market_cap, volume_24h, last_updated
-  FROM prices_live
+  FROM {TABLE_LIVE}
 """, fetch_size=FETCH_SIZE)
 
 def utc_today_bounds():
@@ -124,7 +148,7 @@ def main():
     print(f"[{now_str()}] Loading top coins (timeout={REQUEST_TIMEOUT}s)…")
     t0 = time.time()
     coins = list(s.execute(SEL_LIVE, timeout=REQUEST_TIMEOUT))
-    print(f"[{now_str()}] Loaded {len(coins)} rows from prices_live in {time.time()-t0:.2f}s")
+    print(f"[{now_str()}] Loaded {len(coins)} rows from {TABLE_LIVE} in {time.time()-t0:.2f}s")
 
     coins = [r for r in coins if isinstance(r.rank, int) and r.rank > 0]
     coins.sort(key=lambda r: r.rank)

@@ -1,12 +1,18 @@
-# Ignore Python cache
+# Python cache
 __pycache__/
 *.pyc
+**/__pycache__/
 
-# Ignore virtual environments
+# Virtual environments (support both names)
+.venv/
 venv/
 
-# Ignore local secrets
+# Local secrets and env
 .env
+.env.*   # (optional, in case you use variations)
 
-# Ignore One Time and Config Files
-onetime_and_config/
+# One-off config/scripts anywhere in the tree
+**/onetime_and_config/
+
+# Artifacts created by workflows or local runs
+secure-connect.zip

@@ -13,7 +13,7 @@ permissions:
 
 concurrency:
   group: prices-realtime-${{ github.ref }}
-  cancel-in-progress: true   # fast loop can be pre-empted
+  cancel-in-progress: true
 
 jobs:
   run:
@@ -26,17 +26,23 @@ jobs:
       PYTHONWARNINGS: default
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
-        with: { python-version: "3.11", cache: "pip", cache-dependency-path: "requirements.txt" }
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: "requirements.txt"
+
       - name: Install deps
         run: |
-          set -euo pipefail
           python -m pip install --upgrade pip
-          pip install "cassandra-driver==3.29.0" requests python-dotenv tzdata
+          pip install -r requirements.txt
+
       - name: Astra bundle
         run: |
           echo "${{ secrets.ASTRA_BUNDLE_BASE64 }}" | base64 -d > secure-connect.zip
           test -s secure-connect.zip
+
       - name: 01 Load prices_live_rolling
         if: ${{ github.event.inputs.run_01 == 'true' }}
         timeout-minutes: 8
@@ -55,7 +61,8 @@ jobs:
           RUN_FOREVER: "0"
           WAIT_STALE_SEC: "60"
           VERBOSE_MODE: ${{ github.event.inputs.VERBOSE_MODE || '0' }}
-        run: python 01_load_prices_live.py
+        run: python prices/01_load_prices_live.py
+
       - name: 02 Append 10m from live_rolling
         if: ${{ github.event.inputs.run_02 == 'true' }}
         timeout-minutes: 7
@@ -68,6 +75,6 @@ jobs:
           CONNECT_TIMEOUT_SEC: "15"
           FETCH_SIZE: "500"
           SLOT_DELAY_SEC: "120"
-          SLOTS_BACKFILL: "2"        # current + previous slot
+          SLOTS_BACKFILL: "2"
           VERBOSE_MODE: ${{ github.event.inputs.VERBOSE_MODE || '0' }}
-        run: python 02_append_10m_from_live.py
+        run: python prices/02_append_10m_from_live.py

@@ -1,7 +1,27 @@
-# 01_load_prices_live.py
+# prices/01_load_prices_live.py
 import os, time, csv, requests, random
+import sys, pathlib
 from datetime import datetime, timezone
 
+# ───────────────────── Repo root & helpers ─────────────────────
+# Make the backend repo root importable (two levels up from this file)
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.append(str(_REPO_ROOT))
+
+# Try to use shared helper; fall back if not present
+try:
+    from paths import rel, chdir_repo_root
+except Exception:
+    def rel(*parts: str) -> pathlib.Path:
+        return _REPO_ROOT.joinpath(*parts)
+    def chdir_repo_root() -> None:
+        os.chdir(_REPO_ROOT)
+
+# Ensure consistent CWD (so relative files like secure-connect.zip work)
+chdir_repo_root()
+
+# ───────────────────────── 3rd-party ─────────────────────────
 from cassandra import OperationTimedOut, ReadTimeout, Unavailable, DriverException, WriteTimeout
 from cassandra.cluster import Cluster, EXEC_PROFILE_DEFAULT, ExecutionProfile
 from cassandra.auth import PlainTextAuthProvider
@@ -9,7 +29,8 @@ from cassandra.policies import RoundRobinPolicy
 from cassandra.query import BatchStatement, SimpleStatement, ConsistencyLevel
 from dotenv import load_dotenv
 
-load_dotenv()
+# Load .env from repo root explicitly
+load_dotenv(dotenv_path=rel(".env"))
 
 # ───────────────────────── Config ─────────────────────────
 BUNDLE       = os.getenv("ASTRA_BUNDLE_PATH")
@@ -36,9 +57,9 @@ if not BUNDLE or not ASTRA_TOKEN or not KEYSPACE:
 
 def now_str(): return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-# ─────────────── Category mapping ───────────────
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CATEGORY_FILE = os.getenv("CATEGORY_FILE", os.path.join(BASE_DIR, "category_mapping.csv"))
+# ─────────────── Category mapping (repo-relative) ───────────────
+# Default to the CSV that now lives under prices/
+CATEGORY_FILE = os.getenv("CATEGORY_FILE", str(rel("prices", "category_mapping.csv")))
 
 def load_category_map(path: str) -> dict:
     m = {}
@@ -155,22 +176,16 @@ BASE_COLS = [
     "ath_date","ath_price",
     "total_supply","max_supply",
 ]
-# history columns: (id, last_updated) + the rest (no duplicates)
 HIST_COLS = ["id","last_updated"] + [c for c in BASE_COLS if c not in ("id","last_updated")]
 
 def placeholders(n): return ",".join(["?"]*n)
 
-# latest 1-row-per-coin “view”
 INS_LATEST_UPSERT = session.prepare(
     f"INSERT INTO {TABLE_LATEST} ({','.join(BASE_COLS)}) VALUES ({placeholders(len(BASE_COLS))})"
 )
-
-# exact-timestamp rolling history (conditional; DO NOT BATCH ACROSS PARTITIONS)
 INS_HIST_IF_NOT_EXISTS = session.prepare(
     f"INSERT INTO {TABLE_HIST} ({','.join(HIST_COLS)}) VALUES ({placeholders(len(HIST_COLS))}) IF NOT EXISTS"
 )
-
-# most recent history point for a coin
 SEL_LAST_UPD = session.prepare(
     f"SELECT last_updated FROM {TABLE_HIST} WHERE id=? ORDER BY last_updated DESC LIMIT 1"
 )
@@ -180,7 +195,6 @@ def run_once():
     now_ts = datetime.now(timezone.utc)
     rows = fetch_ranked(TOP_N)
 
-    # Only batch the non-conditional latest upserts
     batch_latest = BatchStatement(consistency_level=ConsistencyLevel.QUORUM)
     w_hist = w_lat = 0
 
@@ -188,9 +202,8 @@ def run_once():
         q = c.get("quotes", {}).get("USD", {}) or {}
         lu = to_utc(safe_iso_to_dt(c.get("last_updated")))
         if not lu:
-            continue  # skip asset with no timestamp
+            continue
 
-        # Only append if this coin's last_updated advanced
         prev = session.execute(SEL_LAST_UPD, [c.get("id")], timeout=REQUEST_TIMEOUT_SEC).one()
         prev_upd = to_utc(prev.last_updated) if prev and getattr(prev, "last_updated", None) else None
         if prev_upd and lu <= prev_upd:
@@ -214,8 +227,8 @@ def run_once():
             price_now,
             f(q.get("market_cap")),
             f(q.get("volume_24h")),
-            now_ts,               # when we fetched it
-            lu,                   # CoinPaprika's timestamp
+            now_ts,
+            lu,
             prior(price_now, chg_1h),   chg_1h,
             prior(price_now, chg_6h),   chg_6h,
             prior(price_now, chg_12h),  chg_12h,
@@ -229,12 +242,10 @@ def run_once():
             f(c.get("max_supply")),
         ]
 
-        # VALUES for history must follow HIST_COLS order
         col_to_val = dict(zip(BASE_COLS, base_vals))
         hist_vals = [col_to_val["id"], col_to_val["last_updated"]] + \
                     [col_to_val[col] for col in BASE_COLS if col not in ("id","last_updated")]
 
-        # 1) exact history point (conditional insert) — execute individually (NO batch)
         try:
             applied = session.execute(INS_HIST_IF_NOT_EXISTS, hist_vals, timeout=REQUEST_TIMEOUT_SEC).one().applied
             if applied:
@@ -242,14 +253,12 @@ def run_once():
         except (WriteTimeout, OperationTimedOut, DriverException) as e:
             print(f"[{now_str()}] [hist] insert failed for {c.get('symbol')}@{lu}: {e}")
 
-        # 2) latest “view” (optional) — safe to batch (no IF)
         if WRITE_LATEST:
             batch_latest.add(INS_LATEST_UPSERT, base_vals)
             w_lat += 1
             if (w_lat % BATCH_FLUSH_EVERY) == 0:
                 session.execute(batch_latest); batch_latest.clear()
 
-    # final flush
     if WRITE_LATEST and len(batch_latest):
         session.execute(batch_latest)
 

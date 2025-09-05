@@ -26,17 +26,26 @@ jobs:
       PYTHONWARNINGS: default
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
-        with: { python-version: "3.11", cache: "pip", cache-dependency-path: "requirements.txt" }
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: "prices/requirements.txt"  # <-- updated
+
       - name: Install deps
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
           pip install "cassandra-driver==3.29.0" requests python-dotenv tzdata
+          # If you keep extra pins in prices/requirements.txt, uncomment:
+          # pip install -r prices/requirements.txt
+
       - name: Astra bundle
         run: |
           echo "${{ secrets.ASTRA_BUNDLE_BASE64 }}" | base64 -d > secure-connect.zip
           test -s secure-connect.zip
+
       - name: 03 Update hourly from 10m
         if: ${{ github.event.inputs.run_03 == 'true' }}
         timeout-minutes: 12
@@ -53,7 +62,8 @@ jobs:
           FINALIZE_PREV: "1"
           PROGRESS_EVERY: "20"
           VERBOSE_MODE: ${{ github.event.inputs.VERBOSE_MODE || '0' }}
-        run: python 03_create_hourly_from_10m.py
+        run: python prices/03_create_hourly_from_10m.py   # <-- updated
+
       - name: 04 Update/close daily from 10m
         if: ${{ github.event.inputs.run_04 == 'true' }}
         timeout-minutes: 12
@@ -68,4 +78,4 @@ jobs:
           SLOT_DELAY_SEC: "120"
           PROGRESS_EVERY: "20"
           VERBOSE_MODE: ${{ github.event.inputs.VERBOSE_MODE || '0' }}
-        run: python 04_create_daily_from_10m.py
+        run: python prices/04_create_daily_from_10m.py     # <-- updated

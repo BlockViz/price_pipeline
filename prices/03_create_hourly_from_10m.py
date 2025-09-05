@@ -1,7 +1,27 @@
-import os
-import time
+# prices/03_create_hourly_from_10m.py
+import os, time
 from datetime import datetime, timedelta, timezone
+import sys, pathlib
 
+# ───────────────────── Repo root & helpers ─────────────────────
+# Make the backend repo root importable (two levels up from this file)
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.append(str(_REPO_ROOT))
+
+# Try to use shared helper; fall back if not present
+try:
+    from paths import rel, chdir_repo_root
+except Exception:
+    def rel(*parts: str) -> pathlib.Path:
+        return _REPO_ROOT.joinpath(*parts)
+    def chdir_repo_root() -> None:
+        os.chdir(_REPO_ROOT)
+
+# Ensure consistent CWD (so relative files like secure-connect.zip work)
+chdir_repo_root()
+
+# ───────────────────────── 3rd-party ─────────────────────────
 from cassandra import OperationTimedOut, ReadTimeout, ReadFailure, WriteTimeout, DriverException
 from cassandra.cluster import Cluster, EXEC_PROFILE_DEFAULT, ExecutionProfile
 from cassandra.auth import PlainTextAuthProvider
@@ -9,9 +29,10 @@ from cassandra.policies import RoundRobinPolicy
 from cassandra.query import SimpleStatement
 from dotenv import load_dotenv
 
-load_dotenv()
+# Load .env from repo root explicitly
+load_dotenv(dotenv_path=rel(".env"))
 
-# ---- Config ----
+# ───────────────────────── Config ─────────────────────────
 BUNDLE              = os.getenv("ASTRA_BUNDLE_PATH", "secure-connect.zip")
 ASTRA_TOKEN         = os.getenv("ASTRA_TOKEN")
 KEYSPACE            = os.getenv("ASTRA_KEYSPACE", "default_keyspace")
@@ -22,9 +43,9 @@ CONNECT_TIMEOUT_SEC = int(os.getenv("CONNECT_TIMEOUT_SEC", "15"))
 FETCH_SIZE          = int(os.getenv("FETCH_SIZE", "500"))
 
 # Behavior
-SLOT_DELAY_SEC      = int(os.getenv("SLOT_DELAY_SEC", "120"))  # guard against too-fresh 10m
-FINALIZE_PREV       = os.getenv("FINALIZE_PREV", "1") == "1"   # finalize previous hour once
-CURRENT_ONLY        = os.getenv("CURRENT_ONLY", "1") == "1"    # only current + prev (no older backfill)
+SLOT_DELAY_SEC      = int(os.getenv("SLOT_DELAY_SEC", "120"))     # guard against too-fresh 10m
+FINALIZE_PREV       = os.getenv("FINALIZE_PREV", "1") == "1"      # finalize previous hour once
+CURRENT_ONLY        = os.getenv("CURRENT_ONLY", "1") == "1"       # kept for compatibility (not used here)
 PROGRESS_EVERY      = int(os.getenv("PROGRESS_EVERY", "20"))
 VERBOSE_MODE        = os.getenv("VERBOSE_MODE", "0") == "1"
 
@@ -32,10 +53,13 @@ TEN_MIN_TABLE       = os.getenv("TEN_MIN_TABLE", "prices_10m_7d")
 HOURLY_TABLE        = os.getenv("HOURLY_TABLE", "candles_hourly_30d")
 MIN_10M_POINTS_FOR_FINAL = int(os.getenv("MIN_10M_POINTS_FOR_FINAL", "2"))  # require ≥2 points to finalize
 
+# Allow overriding the live table name (was hard-coded before)
+TABLE_LIVE          = os.getenv("TABLE_LIVE", os.getenv("TABLE_LATEST", "prices_live"))
+
 if not ASTRA_TOKEN:
     raise SystemExit("Missing ASTRA_TOKEN")
 
-def now_str():
+def now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 def floor_10m(dt_utc: datetime) -> datetime:
@@ -76,7 +100,7 @@ print(f"[{now_str()}] Connected.")
 
 # Live coins
 SEL_LIVE = SimpleStatement(
-    "SELECT id, symbol, name, rank FROM prices_live",
+    f"SELECT id, symbol, name, rank FROM {TABLE_LIVE}",
     fetch_size=FETCH_SIZE
 )
 

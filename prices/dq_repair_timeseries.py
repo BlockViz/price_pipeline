@@ -1,5 +1,27 @@
+# prices/dq_repair_timeseries.py
 import os, time, requests, datetime as dt
 from datetime import timedelta, timezone
+import sys, pathlib
+
+# ───────────────────── Repo root & helpers ─────────────────────
+# Make the backend repo root importable (two levels up from this file)
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.append(str(_REPO_ROOT))
+
+# Try to use shared helper; fall back if not present
+try:
+    from paths import rel, chdir_repo_root
+except Exception:
+    def rel(*parts: str) -> pathlib.Path:
+        return _REPO_ROOT.joinpath(*parts)
+    def chdir_repo_root() -> None:
+        os.chdir(_REPO_ROOT)
+
+# Ensure consistent CWD (so relative files like secure-connect.zip work)
+chdir_repo_root()
+
+# ───────────────────────── 3rd-party ─────────────────────────
 from cassandra import OperationTimedOut, ReadTimeout, WriteTimeout, DriverException, ConsistencyLevel
 from cassandra.cluster import Cluster, ExecutionProfile, EXEC_PROFILE_DEFAULT
 from cassandra.auth import PlainTextAuthProvider
@@ -7,23 +29,29 @@ from cassandra.policies import RoundRobinPolicy
 from cassandra.query import SimpleStatement, BatchStatement
 from dotenv import load_dotenv
 
-load_dotenv()
+# Load .env from repo root explicitly
+load_dotenv(dotenv_path=rel(".env"))
 
 # ---------- Config ----------
-BUNDLE      = os.getenv("ASTRA_BUNDLE_PATH", "secure-connect.zip")
-ASTRA_TOKEN = os.getenv("ASTRA_TOKEN")
-KEYSPACE    = os.getenv("ASTRA_KEYSPACE", "default_keyspace")
+BUNDLE       = os.getenv("ASTRA_BUNDLE_PATH", "secure-connect.zip")
+ASTRA_TOKEN  = os.getenv("ASTRA_TOKEN")
+KEYSPACE     = os.getenv("ASTRA_KEYSPACE", "default_keyspace")
 
-TOP_N_DQ    = int(os.getenv("TOP_N_DQ", "110"))
-DQ_MAX_COINS          = int(os.getenv("DQ_MAX_COINS", "110"))
-DQ_MAX_API_COINS_RUN  = int(os.getenv("DQ_MAX_API_COINS_PER_RUN", "20"))
+# Table names (configurable)
+TABLE_LIVE      = os.getenv("TABLE_LIVE", os.getenv("TABLE_LATEST", "prices_live"))
+TEN_MIN_TABLE   = os.getenv("TEN_MIN_TABLE", "prices_10m_7d")
+DAILY_TABLE     = os.getenv("DAILY_TABLE", "candles_daily_contin")
 
-DAYS_15M    = int(os.getenv("DQ_WINDOW_15M_DAYS", "7"))
-DAYS_DAILY  = int(os.getenv("DQ_WINDOW_DAILY_DAYS", "365"))
+TOP_N_DQ               = int(os.getenv("TOP_N_DQ", "110"))
+DQ_MAX_COINS           = int(os.getenv("DQ_MAX_COINS", "110"))
+DQ_MAX_API_COINS_RUN   = int(os.getenv("DQ_MAX_API_COINS_PER_RUN", "20"))
 
-FIX_DAILY_FROM_15M      = os.getenv("FIX_DAILY_FROM_15M", "1") == "1"
+DAYS_10M     = int(os.getenv("DQ_WINDOW_10M_DAYS", "7"))
+DAYS_DAILY   = int(os.getenv("DQ_WINDOW_DAILY_DAYS", "365"))
+
+FIX_DAILY_FROM_10M      = os.getenv("FIX_DAILY_FROM_10M", "1") == "1"
 BACKFILL_DAILY_FROM_API = os.getenv("BACKFILL_DAILY_FROM_API", "1") == "1"
-SEED_15M_FROM_DAILY     = os.getenv("SEED_15M_FROM_DAILY", "0") == "1"
+SEED_10M_FROM_DAILY     = os.getenv("SEED_10M_FROM_DAILY", "0") == "1"
 DRY_RUN                 = os.getenv("DQ_DRY_RUN", "0") == "1"
 
 REQUEST_TIMEOUT = int(os.getenv("DQ_REQUEST_TIMEOUT_SEC", "30"))
@@ -36,8 +64,6 @@ PAUSE_S         = float(os.getenv("DQ_PAUSE_PER_COIN", "0.1"))
 LOG_EVERY   = int(os.getenv("DQ_LOG_EVERY", "10"))
 VERBOSE     = os.getenv("DQ_VERBOSE", "0") == "1"
 TIME_API    = os.getenv("DQ_TIME_API", "1") == "1"
-
-DAILY_TABLE = os.getenv("DAILY_TABLE", "candles_daily_contin")
 
 if not ASTRA_TOKEN:
     raise SystemExit("Missing ASTRA_TOKEN")
@@ -104,34 +130,39 @@ print(f"[{ts()}] Connected.")
 
 # ---------- Prepared statements ----------
 SEL_LIVE = SimpleStatement(
-    "SELECT id, symbol, name, rank FROM prices_live",
+    f"SELECT id, symbol, name, rank FROM {TABLE_LIVE}",
     fetch_size=FETCH_SIZE
 )
-SEL_15M_RANGE_FULL = session.prepare("""
+
+SEL_10M_RANGE_FULL = session.prepare(f"""
   SELECT ts, price_usd, market_cap, volume_24h
-  FROM prices_15m_7d
+  FROM {TEN_MIN_TABLE}
   WHERE id = ? AND ts >= ? AND ts < ?
 """)
-SEL_15M_RANGE_DAYS = session.prepare("""
-  SELECT ts FROM prices_15m_7d
+
+SEL_10M_RANGE_DAYS = session.prepare(f"""
+  SELECT ts FROM {TEN_MIN_TABLE}
   WHERE id = ? AND ts >= ? AND ts < ?
 """)
+
 SEL_DAILY_ONE = session.prepare(f"""
   SELECT date, price_usd, market_cap, volume_24h, last_updated,
          open, high, low, close, candle_source
   FROM {DAILY_TABLE}
   WHERE id = ? AND date = ? LIMIT 1
 """)
+
 SEL_DAILY_RANGE = session.prepare(f"""
   SELECT date FROM {DAILY_TABLE}
   WHERE id = ? AND date >= ? AND date <= ?
 """)
 
-INS_15M = session.prepare("""
-  INSERT INTO prices_15m_7d
+INS_10M = session.prepare(f"""
+  INSERT INTO {TEN_MIN_TABLE}
     (id, ts, symbol, name, rank, price_usd, market_cap, volume_24h, last_updated)
   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 """)
+
 UPD_DAY = session.prepare(f"""
   UPDATE {DAILY_TABLE} SET
     symbol = ?, name = ?, rank = ?,
@@ -147,16 +178,16 @@ def top_assets(limit: int):
     rows = [r for r in rows if isinstance(r.rank, int) and r.rank > 0]
     rows.sort(key=lambda r: r.rank)
     rows = rows[:limit]
-    print(f"[{ts()}] Loaded {len(rows)} assets from prices_live in {tdur(t0)}")
+    print(f"[{ts()}] Loaded {len(rows)} assets from {TABLE_LIVE} in {tdur(t0)}")
     return rows
 
-def existing_days_15m(coin_id: str, start_dt: dt.datetime, end_dt: dt.datetime):
+def existing_days_10m(coin_id: str, start_dt: dt.datetime, end_dt: dt.datetime):
     t0 = time.perf_counter()
     have = set()
-    for row in session.execute(SEL_15M_RANGE_DAYS, [coin_id, start_dt, end_dt], timeout=REQUEST_TIMEOUT):
+    for row in session.execute(SEL_10M_RANGE_DAYS, [coin_id, start_dt, end_dt], timeout=REQUEST_TIMEOUT):
         have.add(_to_pydate(row.ts.date()))
     if VERBOSE:
-        print(f"  · fetched 15m days={len(have)} in {tdur(t0)}")
+        print(f"  · fetched 10m days={len(have)} in {tdur(t0)}")
     return have
 
 def existing_days_daily(coin_id: str, start_date: dt.date, end_date: dt.date):
@@ -180,16 +211,16 @@ def _daily_row_equal(existing, o, h, l, c, mcap, vol, source):
         (getattr(existing, "candle_source", None) == source)
     )
 
-def repair_daily_from_15m(coin, missing_days: set[dt.date]) -> int:
-    """Compute OHLC from *all* 15m points of each missing UTC day and upsert daily (skip unchanged)."""
-    if not (FIX_DAILY_FROM_15M and missing_days): return 0
+def repair_daily_from_10m(coin, missing_days: set[dt.date]) -> int:
+    """Compute OHLC from *all* 10m points of each missing UTC day and upsert daily (skip unchanged)."""
+    if not (FIX_DAILY_FROM_10M and missing_days): return 0
     t0 = time.perf_counter()
     cnt = 0
     batch = BatchStatement(consistency_level=ConsistencyLevel.QUORUM)
     for day in sorted(missing_days):
         day_start = dt.datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
         day_end   = day_start + dt.timedelta(days=1)
-        pts = session.execute(SEL_15M_RANGE_FULL, [coin.id, day_start, day_end], timeout=REQUEST_TIMEOUT)
+        pts = session.execute(SEL_10M_RANGE_FULL, [coin.id, day_start, day_end], timeout=REQUEST_TIMEOUT)
         prices, mcaps, vols, last_ts = [], [], [], None
         for p in pts:
             last_ts = p.ts
@@ -203,9 +234,9 @@ def repair_daily_from_15m(coin, missing_days: set[dt.date]) -> int:
         vol  = vols[-1]  if vols  else None
         last_upd = last_ts or (day_end - timedelta(seconds=1))
 
-        # skip unchanged
+        # skip unchanged (use the same source tag as your writer for final days)
         existing = session.execute(SEL_DAILY_ONE, [coin.id, day], timeout=REQUEST_TIMEOUT).one()
-        if _daily_row_equal(existing, o, h, l, c, mcap, vol, "15m_derived"):
+        if _daily_row_equal(existing, o, h, l, c, mcap, vol, "10m_final"):
             if VERBOSE: print(f"  · skip unchanged daily {coin.symbol} {day}")
             continue
 
@@ -213,7 +244,7 @@ def repair_daily_from_15m(coin, missing_days: set[dt.date]) -> int:
             batch.add(UPD_DAY, (
                 coin.symbol, coin.name, int(coin.rank),
                 c, mcap, vol, last_upd,
-                o, h, l, c, "15m_derived",
+                o, h, l, c, "10m_final",
                 coin.id, day
             ))
         cnt += 1
@@ -222,12 +253,12 @@ def repair_daily_from_15m(coin, missing_days: set[dt.date]) -> int:
     if (cnt % 40 != 0) and not DRY_RUN and len(batch) > 0:
         session.execute(batch)
     if cnt and VERBOSE:
-        print(f"  · daily OHLC from 15m: +{cnt} rows ({tdur(t0)})")
+        print(f"  · daily OHLC from 10m: +{cnt} rows ({tdur(t0)})")
     return cnt
 
-def seed_15m_from_daily(coin, missing_days: set[dt.date]) -> int:
-    """OPTIONAL: seed one synthetic 15m row at 23:59:59Z using daily close."""
-    if not (SEED_15M_FROM_DAILY and missing_days): return 0
+def seed_10m_from_daily(coin, missing_days: set[dt.date]) -> int:
+    """OPTIONAL: seed one synthetic 10m row at 23:59:59Z using daily close."""
+    if not (SEED_10M_FROM_DAILY and missing_days): return 0
     t0 = time.perf_counter()
     cnt = 0
     batch = BatchStatement(consistency_level=ConsistencyLevel.QUORUM)
@@ -240,14 +271,14 @@ def seed_15m_from_daily(coin, missing_days: set[dt.date]) -> int:
         vol  = float(row.volume_24h or 0.0)
         last_updated = row.last_updated or ts_
         if not DRY_RUN:
-            batch.add(INS_15M, (coin.id, ts_, coin.symbol, coin.name, int(coin.rank), close, mcap, vol, last_updated))
+            batch.add(INS_10M, (coin.id, ts_, coin.symbol, coin.name, int(coin.rank), close, mcap, vol, last_updated))
         cnt += 1
         if cnt % 40 == 0 and not DRY_RUN:
             session.execute(batch); batch.clear()
     if (cnt % 40 != 0) and not DRY_RUN and len(batch) > 0:
         session.execute(batch)
     if cnt and VERBOSE:
-        print(f"  · 15m seeded from daily close: +{cnt} rows ({tdur(t0)})")
+        print(f"  · 10m seeded from daily close: +{cnt} rows ({tdur(t0)})")
     return cnt
 
 def backfill_daily_from_api(coin, need_daily: set[dt.date]) -> int:
@@ -285,7 +316,7 @@ def backfill_daily_from_api(coin, need_daily: set[dt.date]) -> int:
     prev_close = None
     for day in days:
         v = by_day.get(day)
-        if not v: 
+        if not v:
             continue
         close = v["price"]
         if prev_close is None:
@@ -328,18 +359,18 @@ def main():
     end_excl = dt.datetime(now.year, now.month, now.day, tzinfo=timezone.utc) + dt.timedelta(days=1)
 
     last_inclusive   = end_excl.date() - dt.timedelta(days=1)
-    start_15m_date   = last_inclusive - dt.timedelta(days=DAYS_15M-1)
+    start_10m_date   = last_inclusive - dt.timedelta(days=DAYS_10M-1)
     start_daily_date = last_inclusive - dt.timedelta(days=DAYS_DAILY-1)
 
-    want_15m_days   = set(date_seq(last_inclusive, DAYS_15M))
+    want_10m_days   = set(date_seq(last_inclusive, DAYS_10M))
     want_daily_days = set(date_seq(last_inclusive, DAYS_DAILY))
 
     assets = top_assets(min(TOP_N_DQ, DQ_MAX_COINS))
-    print(f"[{ts()}] DQ windows → 15m: {start_15m_date.isoformat()}→{last_inclusive.isoformat()} | "
+    print(f"[{ts()}] DQ windows → 10m: {start_10m_date.isoformat()}→{last_inclusive.isoformat()} | "
           f"daily: {start_daily_date.isoformat()}→{last_inclusive.isoformat()}")
 
     coins_needing_api = []
-    fixed15_local = fixedD_local = fixed15_seeded = 0
+    fixed10_local = fixedD_local = fixed10_seeded = 0
     t_all = time.perf_counter()
 
     for i, coin in enumerate(assets, 1):
@@ -347,30 +378,30 @@ def main():
         try:
             print(f"[{ts()}] → Coin {i}/{len(assets)}: {coin.symbol} ({coin.id}) rank={coin.rank}")
 
-            have_15m = existing_days_15m(
+            have_10m = existing_days_10m(
                 coin.id,
-                dt.datetime.combine(start_15m_date, dt.time.min, tzinfo=timezone.utc),
+                dt.datetime.combine(start_10m_date, dt.time.min, tzinfo=timezone.utc),
                 dt.datetime.combine(last_inclusive + dt.timedelta(days=1), dt.time.min, tzinfo=timezone.utc)
             )
-            print(f"[{ts()}]    Found {len(have_15m)} days with 15m")
+            print(f"[{ts()}]    Found {len(have_10m)} days with 10m")
 
             have_daily = existing_days_daily(coin.id, start_daily_date, last_inclusive)
             print(f"[{ts()}]    Found {len(have_daily)} days with daily")
 
-            need_15m   = want_15m_days   - have_15m
+            need_10m   = want_10m_days   - have_10m
             need_daily = want_daily_days - have_daily
-            print(f"[{ts()}]    Missing → 15m:{len(need_15m)} daily:{len(need_daily)}")
+            print(f"[{ts()}]    Missing → 10m:{len(need_10m)} daily:{len(need_daily)}")
 
             if need_daily:
-                fixed = repair_daily_from_15m(coin, need_daily)
+                fixed = repair_daily_from_10m(coin, need_daily)
                 fixedD_local += fixed
                 if fixed:
                     have_daily = existing_days_daily(coin.id, start_daily_date, last_inclusive)
                     need_daily = want_daily_days - have_daily
 
-            if need_15m and SEED_15M_FROM_DAILY:
-                fixed = seed_15m_from_daily(coin, need_15m)
-                fixed15_seeded += fixed
+            if need_10m and SEED_10M_FROM_DAILY:
+                fixed = seed_10m_from_daily(coin, need_10m)
+                fixed10_seeded += fixed
 
             if need_daily:
                 coins_needing_api.append((coin, need_daily))
@@ -404,8 +435,8 @@ def main():
     else:
         print(f"[{ts()}] No API pass needed or disabled.")
 
-    print(f"[{ts()}] DONE in {tdur(t_all)} | Local fixes → daily_from_15m:{fixedD_local} "
-          f"{'(15m_seeded:'+str(fixed15_seeded)+')' if SEED_15M_FROM_DAILY else ''} "
+    print(f"[{ts()}] DONE in {tdur(t_all)} | Local fixes → daily_from_10m:{fixedD_local} "
+          f"{'(10m_seeded:'+str(fixed10_seeded)+')' if SEED_10M_FROM_DAILY else ''} "
           f"| API fixes → daily:{fixedD_api} "
           f"| Remaining coins needing API on future runs: "
           f"{max(0, len(coins_needing_api) - (0 if not BACKFILL_DAILY_FROM_API else DQ_MAX_API_COINS_RUN))}")

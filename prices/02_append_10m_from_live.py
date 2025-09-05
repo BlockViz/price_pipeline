@@ -1,6 +1,27 @@
+# prices/02_append_10m_from_live.py
 import os, time
 from datetime import datetime, timedelta, timezone
+import sys, pathlib
 
+# ───────────────────── Repo root & helpers ─────────────────────
+# Make the backend repo root importable (two levels up from this file)
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.append(str(_REPO_ROOT))
+
+# Try to use shared helper; fall back if not present
+try:
+    from paths import rel, chdir_repo_root
+except Exception:
+    def rel(*parts: str) -> pathlib.Path:
+        return _REPO_ROOT.joinpath(*parts)
+    def chdir_repo_root() -> None:
+        os.chdir(_REPO_ROOT)
+
+# Ensure consistent CWD (so relative files like secure-connect.zip work)
+chdir_repo_root()
+
+# ───────────────────────── 3rd-party ─────────────────────────
 from cassandra import OperationTimedOut, ReadTimeout, ReadFailure, WriteTimeout, DriverException
 from cassandra.cluster import Cluster, EXEC_PROFILE_DEFAULT, ExecutionProfile
 from cassandra.auth import PlainTextAuthProvider
@@ -8,8 +29,10 @@ from cassandra.policies import RoundRobinPolicy
 from cassandra.query import SimpleStatement
 from dotenv import load_dotenv
 
-load_dotenv()
+# Load .env from repo root explicitly
+load_dotenv(dotenv_path=rel(".env"))
 
+# ───────────────────────── Config ─────────────────────────
 BUNDLE         = os.getenv("ASTRA_BUNDLE_PATH", "secure-connect.zip")
 ASTRA_TOKEN    = os.getenv("ASTRA_TOKEN")
 KEYSPACE       = os.getenv("ASTRA_KEYSPACE", "default_keyspace")
