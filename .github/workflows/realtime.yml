@@ -5,7 +5,9 @@ on:
     inputs:
       run_01: { description: "01_load_prices_live.py", required: false, default: "true" }
       run_02: { description: "02_append_10m_from_live.py", required: false, default: "true" }
+      run_rank: { description: "05_update_prices_live_by_rank.py", required: false, default: "true" }
       TOP_N:  { description: "Override TOP_N", required: false, default: "" }
+      RANK_TOP_N: { description: "Override RANK_TOP_N", required: false, default: "" }
       VERBOSE_MODE: { description: "Verbose (0/1)", required: false, default: "0" }
 
 permissions:
@@ -78,3 +80,20 @@ jobs:
           SLOTS_BACKFILL: "2"
           VERBOSE_MODE: ${{ github.event.inputs.VERBOSE_MODE || '0' }}
         run: python prices/02_append_10m_from_live.py
+
+      - name: 05 Update prices_live_by_rank
+        if: ${{ github.event.inputs.run_rank == 'true' }}
+        timeout-minutes: 3
+        env:
+          ASTRA_BUNDLE_PATH: secure-connect.zip
+          ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
+          ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
+          TABLE_SOURCE: prices_live
+          TABLE_DEST: prices_live_by_rank
+          RANK_BUCKET: all
+          RANK_TOP_N: ${{ github.event.inputs.RANK_TOP_N != '' && github.event.inputs.RANK_TOP_N || secrets.TOP_N || '200' }}
+          REQUEST_TIMEOUT_SEC: "60"
+          CONNECT_TIMEOUT_SEC: "15"
+          FETCH_SIZE: "1000"
+          CONSISTENCY: QUORUM
+        run: python prices/05_update_prices_live_by_rank.py
