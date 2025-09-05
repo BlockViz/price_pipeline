@@ -26,6 +26,36 @@ def log(msg: str) -> None:
         now = str(dt.datetime.now())
     print(f"[{now}] {msg}", flush=True)
 
+def to_pydate(x):
+    """Convert Cassandra driver Date/timestamp or strings to datetime.date."""
+    if x is None:
+        return None
+    if isinstance(x, dt.date) and not isinstance(x, dt.datetime):
+        return x
+    if isinstance(x, dt.datetime):
+        return x.date()
+    try:
+        # Some drivers return a Date-like with year/month/day
+        if hasattr(x, "year") and hasattr(x, "month") and hasattr(x, "day"):
+            return dt.date(int(x.year), int(x.month), int(x.day))
+    except Exception:
+        pass
+    try:
+        # Some expose .date() -> datetime.date
+        if hasattr(x, "date") and callable(getattr(x, "date")):
+            d = x.date()
+            if isinstance(d, dt.date):
+                return d
+    except Exception:
+        pass
+    try:
+        # Fallback parse from string 'YYYY-MM-DD'
+        s = str(x)
+        y, m, d = int(s[0:4]), int(s[5:7]), int(s[8:10])
+        return dt.date(y, m, d)
+    except Exception:
+        return None
+
 def get_latest(base, symbols):
     url = "https://api.frankfurter.app/latest"
     params = {"from": base, "to": ",".join(symbols)}
@@ -163,7 +193,8 @@ def main():
         asof_date = dt.date(y,m,d)
         log(f"Latest payload date: {asof_date} ({len(latest_rates)} symbol(s))")
 
-        prev = read_latest_status(s)
+        prev_raw = read_latest_status(s)
+        prev = to_pydate(prev_raw)
         if prev is None:
             # First run: publish latest business date only
             log("No previous status found; publishing latest only")

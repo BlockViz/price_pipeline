@@ -10,7 +10,7 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: '3.11' }
       - run: pip install cassandra-driver python-dotenv requests
-      - run: python ingest_fx_daily_frankfurter.py
+      - run: python load_fx_daily.py
         env:
           ASTRA_BUNDLE_PATH: ${{ secrets.ASTRA_BUNDLE_PATH }}
           ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
