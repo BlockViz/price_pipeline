@@ -55,7 +55,7 @@ jobs:
         with:
           python-version: "3.11"
           cache: "pip"
-          cache-dependency-path: "prices/requirements.txt"  # adjust if different
+          cache-dependency-path: "requirements.txt"  # adjust if different
 
       - name: Install dependencies
         run: |
@@ -63,7 +63,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install "cassandra-driver==3.29.0" requests python-dotenv tzdata
           # Or, if you keep extra pins:
-          # pip install -r prices/requirements.txt
+          # pip install -r requirements.txt
 
       - name: Write Astra secure connect bundle
         run: |
