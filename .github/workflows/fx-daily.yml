@@ -1,5 +1,6 @@
 name: fx-daily
 on:
+  workflow_dispatch:   # <-- allows for manual trigger
   schedule:
     - cron: '30 15 * * 1-5'   # 16:30 Europe/Zurich = 15:30 UTC (adjust for DST)
 jobs:
