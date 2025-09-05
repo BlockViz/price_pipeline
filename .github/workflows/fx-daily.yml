@@ -1,0 +1,17 @@
+name: fx-daily
+on:
+  schedule:
+    - cron: '30 15 * * 1-5'   # 16:30 Europe/Zurich = 15:30 UTC (adjust for DST)
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - run: pip install cassandra-driver python-dotenv requests
+      - run: python ingest_fx_daily_frankfurter.py
+        env:
+          ASTRA_BUNDLE_PATH: ${{ secrets.ASTRA_BUNDLE_PATH }}
+          ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
+          ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}

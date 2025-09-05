@@ -1,101 +1,199 @@
 ﻿Symbol,Category
-BTC,Layer 1
-ETH,Layer 1
-USDT,Stablecoin
-XRP,Layer 1
-BNB,Exchange Token
-SOL,Layer 1
-USDC,Stablecoin
-DOGE,Memecoin
-STETH,DeFi
-TRX,Layer 1
-ADA,Layer 1
-WBTC,Wrapped Asset
-HYPE,Other
-WSTETH,DeFi
-BCH,Layer 1
-WETH,DeFi
-SUI,Layer 1
-LEO,Exchange Token
-LINK,DeFi
-BTCB,Wrapped Asset
-USDS,Stablecoin
-XLM,Layer 1
-AVAX,Layer 1
-TON,Layer 1
-WBT,Exchange Token
-SHIB,Memecoin
-LTC,Layer 1
-HBAR,Layer 1
-XMR,Layer 1
-USDE,Stablecoin
-BGB,Exchange Token
-DOT,Layer 1
-PI,Other
-UNI,DeFi
-PEPE,Memecoin
-AAVE,DeFi
-DAI,Stablecoin
-APT,Layer 1
-OKB,Exchange Token
-TAO,AI / Compute
-sUSDS,Stablecoin
-ICP,Layer 1
-ETC,Layer 1
-NEAR,Layer 1
-ONDO,Other
-CRO,Layer 1
-USD1,Stablecoin
-MNT,Layer 1
-KAS,Layer 1
-FTN,Other
-TRUMP,Memecoin
-VET,Layer 1
-FET,AI / Compute
-JITOSOL,Wrapped Asset
-RENDER,AI / Compute
-ENA,Other
-ATOM,Layer 1
-ARB,DeFi
-FIL,Infrastructure
-ALGO,Layer 1
-POL,Other
-FDUSD,Stablecoin
-WLD,Other
-SOLVBTC,Wrapped Asset
-RETH,DeFi
-KCS,Exchange Token
-GT,Exchange Token
-SEI,Layer 1
-JUP,Other
-QNT,Other
-FLR,Other
-SPX,Other
-BNSOL,Wrapped Asset
-KAIA,Other
-INJ,DeFi
-FORM,Other
-BONK,Memecoin
-WBNB,Wrapped Asset
-STX,Layer 1
-FARTCOIN,Memecoin
-USD0,Stablecoin
-S,Other
-VIRTUAL,Other
-OP,DeFi
-FTM,Layer 1
-TIA,Layer 1
-MKR,DeFi
-IP,Other
-MSOL,Wrapped Asset
-XAUT,Stablecoin
-A,Other
-EOS,Layer 1
-GRT,DeFi
-NEXO,DeFi
-WIF,Memecoin
-IMX,Other
-XDC,Layer 1
-CAKE,DeFi
-FLOKI,Memecoin
-AERO,AI / Compute
+BTC,Layer 1s
+ETH,Layer 1s
+XRP,Payments
+USDT,Stablecoins
+BNB,Exchange & CeFi Tokens
+SOL,Layer 1s
+USDC,Stablecoins
+AKT,"Data, Oracles & Storage"
+TRX,Payments
+ADA,Layer 1s
+LINK,"Data, Oracles & Storage"
+HYPE,DeFi Core
+USDE,Stablecoins
+SUI,Layer 1s
+BCH,Payments
+XLM,Payments
+AVAX,Layer 1s
+HBAR,Layer 1s
+AR,"Data, Oracles & Storage"
+LTC,Payments
+TON,Layer 1s
+DOT,Layer 1s
+UNI,DeFi Core
+DAI,Stablecoins
+XMR,Layer 1s
+AAVE,DeFi Core
+ENA,DeFi Core
+WLFI,Layer 1s
+BGB,Exchange & CeFi Tokens
+BONK,Memecoins
+ETC,Layer 1s
+BRETT,Memecoins
+NEAR,Layer 1s
+POL,Layer 2s & Scaling
+APT,Layer 1s
+PI,Layer 1s
+ARB,Layer 2s & Scaling
+USD1,Stablecoins
+ICP,Layer 1s
+STORY,Layer 1s
+KAS,Payments
+ATOM,Layer 1s
+CRO,Exchange & CeFi Tokens
+VET,Layer 1s
+ALGO,Layer 1s
+DOGE,Memecoins
+SEI,Layer 1s
+FIL,"Data, Oracles & Storage"
+FLOKI,Memecoins
+FLR,Layer 1s
+ASI,"Data, Oracles & Storage"
+XDC,Payments
+FDUSD,Stablecoins
+FOUR,Memecoins
+INJ,DeFi Core
+OP,Layer 2s & Scaling
+GT,Exchange & CeFi Tokens
+PYUSD,Stablecoins
+STX,Layer 2s & Scaling
+SPX6900,Memecoins
+LDO,DeFi Core
+AERO,DeFi Core
+CRV,DeFi Core
+IMX,"Consumer (e.g. Gaming, NFTs)"
+GRT,"Data, Oracles & Storage"
+RAY,DeFi Core
+KAIA,Layer 1s
+CFX,Layer 1s
+S,Layer 1s
+JUP,DeFi Core
+KCS,Exchange & CeFi Tokens
+ENS,"Consumer (e.g. Gaming, NFTs)"
+CAKE,DeFi Core
+LEO,Exchange & CeFi Tokens
+THETA,"Consumer (e.g. Gaming, NFTs)"
+XTZ,Layer 1s
+ZEC,Layer 1s
+FLOW,Layer 1s
+JITO,Liquid Staking
+JASMY,"Data, Oracles & Storage"
+MORPHO,DeFi Core
+BSV,Layer 1s
+MNT,Layer 2s & Scaling
+TUSD,Stablecoins
+DYDX,DeFi Core
+NEO,Layer 1s
+RSR,DeFi Core
+NFT,"Consumer (e.g. Gaming, NFTs)"
+HNT,Layer 1s
+MOG,Memecoins
+APE,"Consumer (e.g. Gaming, NFTs)"
+ZKSYNC,Layer 2s & Scaling
+EIGEN,DeFi Core
+RUNE,DeFi Core
+CORE,Layer 1s
+COMP,DeFi Core
+SUN,DeFi Core
+EGLD,Layer 1s
+KAVA,Layer 1s
+AXS,"Consumer (e.g. Gaming, NFTs)"
+XEC,Payments
+CHZ,"Consumer (e.g. Gaming, NFTs)"
+AIOZ,"Data, Oracles & Storage"
+ONYX,Exchange & CeFi Tokens
+SUPER,"Consumer (e.g. Gaming, NFTs)"
+MX,Exchange & CeFi Tokens
+ZBC,Layer 2s & Scaling
+BEAM,"Consumer (e.g. Gaming, NFTs)"
+GNO,DeFi Core
+ATH,"Data, Oracles & Storage"
+CVX,DeFi Core
+1INCH,DeFi Core
+JST,DeFi Core
+RON,"Consumer (e.g. Gaming, NFTs)"
+LUNC,Layer 1s
+WEMIX,"Consumer (e.g. Gaming, NFTs)"
+MOVE,Layer 2s & Scaling
+AXL,"Data, Oracles & Storage"
+LPT,"Data, Oracles & Storage"
+NEXO,Exchange & CeFi Tokens
+DASH,Payments
+CTC,DeFi Core
+QTUM,Layer 1s
+BERA,Layer 1s
+SNEK,Memecoins
+DCR,Layer 1s
+AMP,DeFi Core
+TURBO,Memecoins
+SAFE,DeFi Core
+KSM,Layer 1s
+FTT,Exchange & CeFi Tokens
+IOTX,Layer 1s
+OKB,Exchange & CeFi Tokens
+MOCA,"Consumer (e.g. Gaming, NFTs)"
+MEW,Memecoins
+TOSHI,Memecoins
+FRAX,Stablecoins
+TFUEL,"Consumer (e.g. Gaming, NFTs)"
+BIO,"Data, Oracles & Storage"
+KAITO,"Data, Oracles & Storage"
+ZORA,"Consumer (e.g. Gaming, NFTs)"
+EURC,Stablecoins
+GLM,"Data, Oracles & Storage"
+VELO,DeFi Core
+ZRX,DeFi Core
+SNX,DeFi Core
+DOG,Memecoins
+SFP,Exchange & CeFi Tokens
+CKB,Layer 1s
+BAT,"Consumer (e.g. Gaming, NFTs)"
+MINA,Layer 1s
+ZIL,Layer 1s
+MANTRA,DeFi Core
+PLUME,Layer 2s & Scaling
+CHEEMS,Memecoins
+SUSHI,DeFi Core
+GAS,Layer 1s
+PEANUT,Memecoins
+RVN,Layer 1s
+SAI,"Data, Oracles & Storage"
+ONDO,RWA & Tokenization
+NOT,"Consumer (e.g. Gaming, NFTs)"
+PAXG,RWA & Tokenization
+AEVO,DeFi Core
+PENDLE,DeFi Core
+WBTC,DeFi Core
+STETH,Liquid Staking
+WSTETH,Liquid Staking
+RETH,Liquid Staking
+JITOSOL,Liquid Staking
+MSOL,Liquid Staking
+BSOL,Liquid Staking
+WBETH,Liquid Staking
+EETH,Liquid Staking
+OETH,Liquid Staking
+RLB,DeFi Core
+GMX,DeFi Core
+AERODROME,DeFi Core
+PEPE,Memecoins
+POPCAT,Memecoins
+PYTH,"Data, Oracles & Storage"
+QNT,"Data, Oracles & Storage"
+FET,"Data, Oracles & Storage"
+RNDR,"Data, Oracles & Storage"
+BAND,"Data, Oracles & Storage"
+POKT,"Data, Oracles & Storage"
+SHIB,Memecoins
+ARWEAVE,"Data, Oracles & Storage"
+STRK,Layer 2s & Scaling
+TAO,"Data, Oracles & Storage"
+TIA,"Data, Oracles & Storage"
+TRUMP,Memecoins
+TWT,Exchange & CeFi Tokens
+W,Layer 2s & Scaling
+WIF,Memecoins
+WLD,"Data, Oracles & Storage"
+XAUT,RWA & Tokenization
+ZRO,Layer 2s & Scaling
