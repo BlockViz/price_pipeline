@@ -11,9 +11,9 @@ doge-dogecoin,DOGE,Memecoins
 ada-cardano,ADA,Layer 1s
 trx-tron,TRX,Payments
 wsteth-wrapped-liquid-staked-ether-20,WSTETH,Liquid Staking
-weth-weth,WETH,DeFi Core
-hype-hyperliquid,HYPE,DeFi Core
-wbtc-wrapped-bitcoin,WBTC,DeFi Core
+weth-weth,WETH,Decentralized Finance
+hype-hyperliquid,HYPE,Decentralized Finance
+wbtc-wrapped-bitcoin,WBTC,Decentralized Finance
 link-chainlink,LINK,"Data, Oracles & Storage"
 weeth-wrapped-eeth,WEETH,Liquid Staking
 sui-sui,SUI,Layer 1s
@@ -24,7 +24,7 @@ avax-avalanche,AVAX,Layer 1s
 hbar-hedera-hashgraph,HBAR,Layer 1s
 leo-leo-token,LEO,Exchange & CeFi Tokens
 ltc-litecoin,LTC,Payments
-btcb-binance-bitcoin,BTCB,DeFi Core
+btcb-binance-bitcoin,BTCB,Decentralized Finance
 toncoin-the-open-network,TON,Layer 1s
 usds-usds,USDS,Stablecoins
 shib-shiba-inu,SHIB,Memecoins
@@ -32,14 +32,14 @@ cro-cryptocom-chain,CRO,Exchange & CeFi Tokens
 wbt-whitebit,WBT,Exchange & CeFi Tokens
 dot-polkadot,DOT,Layer 1s
 bgb-bitget-token,BGB,Exchange & CeFi Tokens
-uni-uniswap,UNI,DeFi Core
+uni-uniswap,UNI,Decentralized Finance
 usde-ethena-usde,USDE,Stablecoins
-cbbtc-coinbase-wrapped-btc,CBBTC,DeFi Core
+cbbtc-coinbase-wrapped-btc,CBBTC,Decentralized Finance
 xmr-monero,XMR,Layer 1s
 susde-ethena-staked-usde,SUSDE,Stablecoins
-ena-ethena,ENA,DeFi Core
-aave-new,AAVE,DeFi Core
-wlfi-official-world-liberty-financial,WLFI,Layer 1s
+ena-ethena,ENA,Decentralized Finance
+aave-new,AAVE,Decentralized Finance
+wlfi-official-world-liberty-financial,WLFI,Decentralized Finance
 pepe-pepe,PEPE,Memecoins
 mnt-mantle,MNT,Layer 2s & Scaling
 dai-dai,DAI,Stablecoins
@@ -47,16 +47,16 @@ etc-ethereum-classic,ETC,Layer 1s
 tao-bittensor,TAO,"Data, Oracles & Storage"
 apt-aptos,APT,Layer 1s
 ondo-ondo,ONDO,RWA & Tokenization
-susds-susds,sUSDS,DeFi Core
+susds-susds,sUSDS,Decentralized Finance
 near-near-protocol,NEAR,Layer 1s
 m-memecore,M,Memecoins
 pi2-pi-network,PI,Layer 1s
-eth-ethereum-token,WETH,DeFi Core
+eth-ethereum-token,WETH,Decentralized Finance
 arb-arbitrum,ARB,Layer 2s & Scaling
 icp-internet-computer,ICP,Layer 1s
 jitosol-jito-staked-sol,JITOSOL,Liquid Staking
 pol-polygon-ecosystem-token,POL,Layer 2s & Scaling
-ip-story,IP,DeFi Core
+ip-story,IP,Decentralized Finance
 kas-kaspa,KAS,Payments
 reth-rocket-pool-eth,RETH,Liquid Staking
 usd1-usd1,USD1,Stablecoins
@@ -64,42 +64,42 @@ vet-vechain,VET,Layer 1s
 algo-algorand,ALGO,Layer 1s
 rseth-rseth,RSETH,Liquid Staking
 gt-gatechain-token,GT,Exchange & CeFi Tokens
-ftn-fasttoken,FTN,DeFi Core
-jlp-jupiter-perpetuals-liquidity-provider-token,JLP,DeFi Core
+ftn-fasttoken,FTN,Decentralized Finance
+jlp-jupiter-perpetuals-liquidity-provider-token,JLP,Decentralized Finance
 pengu-pudgy-penguins,PENGU,"Consumer (e.g. Gaming, NFTs)"
 kcs-kucoin-token,KCS,Exchange & CeFi Tokens
-rndr-render-token,RENDER,DeFi Core
+rndr-render-token,RENDER,Decentralized Finance
 wld-worldcoin,WLD,"Data, Oracles & Storage"
-meth-meth,METH,DeFi Core
+meth-meth,METH,Decentralized Finance
 sei-sei,SEI,Layer 1s
 atom-cosmos,ATOM,Layer 1s
-sky-sky,SKY,DeFi Core
-bfusd-bfusd,BFUSD,DeFi Core
+sky-sky,SKY,Decentralized Finance
+bfusd-bfusd,BFUSD,Decentralized Finance
 trump-official-trump,TRUMP,Memecoins
-pump-pumpfun,PUMP,DeFi Core
+pump-pumpfun,PUMP,Memecoins
 lseth-liquid-staked-ethereum,LSETH,Liquid Staking
 fetch-ai,FET,"Data, Oracles & Storage"
 fil-filecoin,FIL,"Data, Oracles & Storage"
 bnsol-binance-staked-sol,BNSOL,Liquid Staking
 bonk-bonk,BONK,Memecoins
 lbtc-lombard-staked-btc,LBTC,Liquid Staking
-jup-jupiter-exchange-token,JUP,DeFi Core
+jup-jupiter-exchange-token,JUP,Decentralized Finance
 flr-flare-network,FLR,Layer 1s
 usdtb-usdtb,USDTB,Stablecoins
 fdusd-first-digital-usd,FDUSD,Stablecoins
-form-four,FORM,DeFi Core
+form-four,FORM,Decentralized Finance
 ezeth-renzo-restaked-eth,EZETH,Liquid Staking
-wbnb-wrapped-bnb,WBNB,DeFi Core
+wbnb-wrapped-bnb,WBNB,Decentralized Finance
 op-optimism,OP,Layer 2s & Scaling
 jupsol-jupiter-staked-sol,JUPSOL,Liquid Staking
-inj-injective-protocol,INJ,DeFi Core
+inj-injective-protocol,INJ,Decentralized Finance
 qnt-quant,QNT,"Data, Oracles & Storage"
-lend-ethlend,LEND,DeFi Core
+lend-ethlend,LEND,Decentralized Finance
 usdf-falcon-finance,USDF,Stablecoins
-solvbtc-solv-protocol-solvbtc,SOLVBTC,DeFi Core
+solvbtc-solv-protocol-solvbtc,SOLVBTC,Decentralized Finance
 stx-stacks,STX,Layer 2s & Scaling
-aero-aerodrome-finance,AERO,DeFi Core
-ldo-lido-dao,LDO,DeFi Core
+aero-aerodrome-finance,AERO,Decentralized Finance
+ldo-lido-dao,LDO,Decentralized Finance
 spx-spx6900,SPX,Memecoins
 msol-marinade-staked-sol,MSOL,Liquid Staking
 tia-celestia,TIA,"Data, Oracles & Storage"
@@ -107,10 +107,10 @@ xdc-xdc-network,XDC,Payments
 stsol-lido-staked-sol,STSOL,Liquid Staking
 s-sonic,S,Layer 1s
 usd0-usual-usd,USD0,Stablecoins
-crv-curve-dao-token,CRV,DeFi Core
+crv-curve-dao-token,CRV,Decentralized Finance
 superoeth-super-oeth,SUPEROETH,Liquid Staking
 imx-immutable-x,IMX,"Consumer (e.g. Gaming, NFTs)"
-ray-raydium,RAY,DeFi Core
+ray-raydium,RAY,Decentralized Finance
 kaia-kaia,KAIA,Layer 1s
 stkaave-staked-aave,STKAAVE,Liquid Staking
 floki-floki-inu,FLOKI,Memecoins
@@ -119,70 +119,70 @@ ftm-fantom,FTM,"Consumer (e.g. Gaming, NFTs)"
 grt-the-graph,GRT,"Data, Oracles & Storage"
 cfx-conflux-network,CFX,Layer 1s
 nexo-nexo,NEXO,Exchange & CeFi Tokens
-cake-pancakeswap,CAKE,DeFi Core
+cake-pancakeswap,CAKE,Decentralized Finance
 wif-dogwifcoin,WIF,Memecoins
 ens-ethereum-name-service,ENS,"Consumer (e.g. Gaming, NFTs)"
 theta-theta-token,THETA,"Consumer (e.g. Gaming, NFTs)"
-pendle-pendle,PENDLE,DeFi Core
+pendle-pendle,PENDLE,Decentralized Finance
 fartcoin-fartcoin,FARTCOIN,Memecoins
 xtz-tezos,XTZ,Layer 1s
-a-vaulta,A,DeFi Core
+a-vaulta,A,Decentralized Finance
 hex-hex-from-pulsechain,HEX,"Data, Oracles & Storage"
-virtual-virtual-protocol,VIRTUAL,DeFi Core
+virtual-virtual-protocol,VIRTUAL,Decentralized Finance
 sand-the-sandbox,SAND,"Consumer (e.g. Gaming, NFTs)"
 paxg-pax-gold,PAXG,RWA & Tokenization
 jasmy-jasmycoin,JASMY,"Data, Oracles & Storage"
-tbtc-tbtc,TBTC,DeFi Core
-miota-iota,IOTA,DeFi Core
+tbtc-tbtc,TBTC,Decentralized Finance
+miota-iota,IOTA,Decentralized Finance
 zec-zcash,ZEC,Layer 1s
 usdce-usd-coine,USDC.e,Stablecoins
-mkr-maker,MKR,DeFi Core
+mkr-maker,MKR,Decentralized Finance
 flow-flow,FLOW,Layer 1s
-ab-ab,AB,DeFi Core
+ab-ab,AB,Decentralized Finance
 frax-frax,FRAX,Stablecoins
 ethx-stader-ethx,ETHX,Liquid Staking
 mana-decentraland,MANA,"Consumer (e.g. Gaming, NFTs)"
 bttc-bittorrent-chain,BTT,"Data, Oracles & Storage"
 cbeth-coinbase-wrapped-staked-eth,CBETH,Liquid Staking
 gala-gala,GALA,"Consumer (e.g. Gaming, NFTs)"
-syrup-syrup-token,SYRUP,DeFi Core
-b-buildon,B,DeFi Core
-plsx-pulsex,PLSX,DeFi Core
-sweth-swell-ethereum,SWETH,DeFi Core
+syrup-syrup-token,SYRUP,Decentralized Finance
+b-buildon,B,Decentralized Finance
+plsx-pulsex,PLSX,Decentralized Finance
+sweth-swell-ethereum,SWETH,Decentralized Finance
 pls-pulsechain,PLS,"Data, Oracles & Storage"
-frxeth-frax-ether,FRXETH,DeFi Core
-jto-jito,JTO,DeFi Core
-wal-walrus,WAL,DeFi Core
+frxeth-frax-ether,FRXETH,Decentralized Finance
+jto-jito,JTO,Decentralized Finance
+wal-walrus,WAL,Decentralized Finance
 pyth-pyth-network,PYTH,"Data, Oracles & Storage"
 matic-polygon,MATIC,Layer 2s & Scaling
-vsn-vision,VSN,DeFi Core
-ethfi-etherfi,ETHFI,DeFi Core
-solvbtcbbn-solv-protocol-solvbtcbbn,SOLVBTCBBN,DeFi Core
+vsn-vision,VSN,Decentralized Finance
+ethfi-etherfi,ETHFI,Decentralized Finance
+solvbtcbbn-solv-protocol-solvbtcbbn,SOLVBTCBBN,Decentralized Finance
 bsv-bitcoin-sv,BSV,Layer 1s
 strk-starknet,STRK,Layer 2s & Scaling
-btcb-bitcoin-avalanche-bridged-btcb,BTC.B,DeFi Core
-bdx-beldex,BDX,DeFi Core
-zbu-zeebu,ZBU,DeFi Core
+btcb-bitcoin-avalanche-bridged-btcb,BTC.B,Decentralized Finance
+bdx-beldex,BDX,Decentralized Finance
+zbu-zeebu,ZBU,Decentralized Finance
 tusd-trueusd,TUSD,Stablecoins
-tel-telcoin,TEL,DeFi Core
-morpho-morpho,MORPHO,DeFi Core
+tel-telcoin,TEL,Decentralized Finance
+morpho-morpho,MORPHO,Decentralized Finance
 beth-binance-beacon-eth,BETH,Exchange & CeFi Tokens
-botx-botxcoin,BOTX,DeFi Core
+botx-botxcoin,BOTX,Decentralized Finance
 klay-klaytn,KLAY,Layer 1s
 usdd-usdd,USDD,Stablecoins
 neo-neo,NEO,Layer 1s
 brett-brett-base,BRETT,Memecoins
-rsr-reserve-rights,RSR,DeFi Core
-wtrx-wrapped-trx,WTRX,DeFi Core
+rsr-reserve-rights,RSR,Decentralized Finance
+wtrx-wrapped-trx,WTRX,Decentralized Finance
 nft-apenft,NFT,"Consumer (e.g. Gaming, NFTs)"
-dydx-dydx-chain,DYDX,DeFi Core
+dydx-dydx-chain,DYDX,Decentralized Finance
 ar-arweave,AR,"Data, Oracles & Storage"
 ape-apecoin,APE,"Consumer (e.g. Gaming, NFTs)"
 hnt-helium,HNT,Layer 1s
 sfrxeth-staked-frax-ether,SFRXETH,Liquid Staking
-rune-thorchain,RUNE,DeFi Core
-sun-sun,SUN,DeFi Core
-dexe-dexe,DEXE,DeFi Core
+rune-thorchain,RUNE,Decentralized Finance
+sun-sun,SUN,Decentralized Finance
+dexe-dexe,DEXE,Decentralized Finance
 luna-terra,LUNC,Layer 1s
 usdb-usdb,USDB,Stablecoins
 egld-elrond,EGLD,Layer 1s
@@ -190,16 +190,16 @@ kava-kava,KAVA,Layer 1s
 axs-axie-infinity,AXS,"Consumer (e.g. Gaming, NFTs)"
 chz-chiliz,CHZ,"Consumer (e.g. Gaming, NFTs)"
 xec-ecash,XEC,Payments
-teth-treehouse-eth,TETH,DeFi Core
+teth-treehouse-eth,TETH,Decentralized Finance
 core-core-dao,CORE,Layer 1s
-comp-compoundd,COMP,DeFi Core
-kta-keeta,KTA,DeFi Core
+comp-compoundd,COMP,Decentralized Finance
+kta-keeta,KTA,Decentralized Finance
 aioz-aioz-network,AIOZ,"Data, Oracles & Storage"
 ebtc-etherfi-staked-btc,EBTC,Liquid Staking
 beam-beam-eth,BEAM,"Consumer (e.g. Gaming, NFTs)"
 w-wormhole,W,Layer 2s & Scaling
-usr-resolv-usr,USR,DeFi Core
-ath14-aethir,ATH,DeFi Core
-ohmv2-olympus-v2,OHMv2,DeFi Core
+usr-resolv-usr,USR,Decentralized Finance
+ath14-aethir,ATH,Decentralized Finance
+ohmv2-olympus-v2,OHMv2,Decentralized Finance
 xcn-chain,XCN,"Data, Oracles & Storage"
-cvx-convex-finance,CVX,DeFi Core
+cvx-convex-finance,CVX,Decentralized Finance
