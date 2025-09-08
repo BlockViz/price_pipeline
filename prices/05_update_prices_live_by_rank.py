@@ -1,7 +1,8 @@
 """
-Populate and refresh the `prices_live_by_rank` table from `prices_live`.
+Populate and refresh the `prices_live_by_rank` table from `prices_live`,
+recomputing category from the canonical `asset_categories` table.
 
-Schema target:
+Target schema:
   CREATE TABLE default_keyspace.prices_live_by_rank (
     bucket text,
     rank int,
@@ -15,20 +16,12 @@ Schema target:
     last_updated timestamp,
     PRIMARY KEY ((bucket), rank, id)
   ) WITH CLUSTERING ORDER BY (rank ASC, id ASC);
-
-Strategy:
-- Read all rows from `prices_live` (source), collect minimal fields.
-- Sort client-side by `rank` asc and take top N.
-- Delete the destination partition for `bucket` (default: 'all').
-- Upsert rows in ranked order for that bucket.
 """
 
-import os
-import sys
-import pathlib
-from datetime import datetime
-from typing import Any, Iterable
+import os, sys, pathlib, time
+from datetime import datetime, timezone
 
+# ───────────────────── Repo root & helpers ─────────────────────
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.append(str(_REPO_ROOT))
@@ -43,20 +36,25 @@ except Exception:
 
 chdir_repo_root()
 
-from dotenv import load_dotenv
+# ───────────────────────── 3rd-party ─────────────────────────
+from cassandra import OperationTimedOut, ReadTimeout, Unavailable, DriverException, WriteTimeout
 from cassandra.cluster import Cluster, EXEC_PROFILE_DEFAULT, ExecutionProfile
 from cassandra.auth import PlainTextAuthProvider
 from cassandra.policies import RoundRobinPolicy
-from cassandra.query import BatchStatement, SimpleStatement, ConsistencyLevel
+from cassandra.query import SimpleStatement, BatchStatement, ConsistencyLevel
+from dotenv import load_dotenv
 
+# Load .env from repo root explicitly
 load_dotenv(dotenv_path=rel(".env"))
 
+# ───────────────────────── Config ─────────────────────────
 BUNDLE       = os.getenv("ASTRA_BUNDLE_PATH", "secure-connect.zip")
 ASTRA_TOKEN  = os.getenv("ASTRA_TOKEN")
 KEYSPACE     = os.getenv("ASTRA_KEYSPACE", "default_keyspace")
 
 TABLE_SOURCE = os.getenv("TABLE_SOURCE", "prices_live")
 TABLE_DEST   = os.getenv("TABLE_DEST",   "prices_live_by_rank")
+TABLE_CATS   = os.getenv("TABLE_CATS",   "asset_categories")
 
 RANK_BUCKET  = os.getenv("RANK_BUCKET", "all")
 RANK_TOP_N   = int(os.getenv("RANK_TOP_N", "200"))
@@ -64,22 +62,18 @@ RANK_TOP_N   = int(os.getenv("RANK_TOP_N", "200"))
 REQUEST_TIMEOUT_SEC = int(os.getenv("REQUEST_TIMEOUT_SEC", "60"))
 CONNECT_TIMEOUT_SEC = int(os.getenv("CONNECT_TIMEOUT_SEC", "15"))
 FETCH_SIZE          = int(os.getenv("FETCH_SIZE", "1000"))
-CONSISTENCY         = os.getenv("CONSISTENCY", "QUORUM").upper()
+BATCH_FLUSH_EVERY   = int(os.getenv("BATCH_FLUSH_EVERY", "50"))
 
-if not ASTRA_TOKEN:
-    raise SystemExit("Missing ASTRA_TOKEN")
+if not BUNDLE or not ASTRA_TOKEN or not KEYSPACE:
+    raise SystemExit("Missing ASTRA_BUNDLE_PATH / ASTRA_TOKEN / ASTRA_KEYSPACE")
 
-def now_str() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+def now_str(): return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-print(f"[{now_str()}] Config: src='{TABLE_SOURCE}', dest='{TABLE_DEST}', bucket='{RANK_BUCKET}', topN={RANK_TOP_N}")
+# ───────────────────────── Connect ─────────────────────────
 print(f"[{now_str()}] Connecting to Astra (bundle='{BUNDLE}', keyspace='{KEYSPACE}')")
-
-auth = PlainTextAuthProvider("token", ASTRA_TOKEN)
-exec_profile = ExecutionProfile(
-    load_balancing_policy=RoundRobinPolicy(),
-    request_timeout=REQUEST_TIMEOUT_SEC,
-)
+auth = PlainTextAuthProvider(username="token", password=ASTRA_TOKEN)
+exec_profile = ExecutionProfile(load_balancing_policy=RoundRobinPolicy(),
+                                request_timeout=REQUEST_TIMEOUT_SEC)
 cluster = Cluster(
     cloud={"secure_connect_bundle": BUNDLE},
     auth_provider=auth,
@@ -89,82 +83,97 @@ cluster = Cluster(
 session = cluster.connect(KEYSPACE)
 print(f"[{now_str()}] Connected.")
 
-CONS_MAP = {
-    "ONE": ConsistencyLevel.ONE,
-    "QUORUM": ConsistencyLevel.QUORUM,
-    "LOCAL_QUORUM": ConsistencyLevel.LOCAL_QUORUM,
-    "ALL": ConsistencyLevel.ALL,
-}
-CONS = CONS_MAP.get(CONSISTENCY, ConsistencyLevel.QUORUM)
+# ───────────────────────── Category map (from DB) ─────────────────────────
+def load_category_map_from_db() -> tuple[dict, dict]:
+    id_to_cat, sym_to_cat = {}, {}
+    stmt = SimpleStatement(
+        f"SELECT id, symbol, category FROM {TABLE_CATS}",
+        fetch_size=FETCH_SIZE
+    )
+    rows = session.execute(stmt, timeout=REQUEST_TIMEOUT_SEC)
+    count = 0
+    for r in rows:
+        cid = (getattr(r, "id", None) or "").strip()
+        sym = (getattr(r, "symbol", None) or "").strip()
+        cat = (getattr(r, "category", None) or "").strip() or "Other"
+        if cid:
+            id_to_cat[cid.upper()] = cat
+        if sym:
+            sym_to_cat[sym.upper()] = cat
+        count += 1
+    print(f"[{now_str()}] [category] loaded {count} rows from {TABLE_CATS} "
+          f"(id keys={len(id_to_cat)}, symbol keys={len(sym_to_cat)})")
+    return id_to_cat, sym_to_cat
 
-SEL_SRC = SimpleStatement(
-    f"SELECT id, symbol, name, rank, category, price_usd, market_cap, volume_24h, last_updated FROM {TABLE_SOURCE}",
-    fetch_size=FETCH_SIZE,
-)
+def category_for(id_to_cat: dict, sym_to_cat: dict, cid: str | None, sym: str | None) -> str:
+    if cid:
+        cat = id_to_cat.get(cid.upper())
+        if cat:
+            return cat
+    if sym:
+        cat = sym_to_cat.get(sym.upper())
+        if cat:
+            return cat
+    return "Other"
 
-INS_DEST = session.prepare(
-    f"""
-    INSERT INTO {TABLE_DEST}
-      (bucket, rank, id, symbol, name, category, price_usd, market_cap, volume_24h, last_updated)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """
+# ───────────────────────── I/O statements ─────────────────────────
+INS_RANKED = session.prepare(
+    f"INSERT INTO {TABLE_DEST} (bucket, rank, id, symbol, name, category, "
+    f"price_usd, market_cap, volume_24h, last_updated) "
+    f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
 )
 
 DEL_BUCKET = session.prepare(
     f"DELETE FROM {TABLE_DEST} WHERE bucket=?"
 )
 
-def rows_iter(stmt: SimpleStatement) -> Iterable[Any]:
-    result = session.execute(stmt, timeout=REQUEST_TIMEOUT_SEC)
-    yield from result
-    while result.has_more_pages:
-        result = session.execute(stmt, timeout=REQUEST_TIMEOUT_SEC, paging_state=result.paging_state)
-        yield from result
+# Note: Cassandra cannot ORDER BY arbitrary columns; we scan and sort client-side.
+SEL_SOURCE = SimpleStatement(
+    f"SELECT id, symbol, name, rank, price_usd, market_cap, volume_24h, last_updated "
+    f"FROM {TABLE_SOURCE}",
+    fetch_size=FETCH_SIZE
+)
 
+# ───────────────────────── Main ─────────────────────────
 def main():
-    # Read all, filter valid rank, sort and cap to top N
-    items = []
-    total = 0
-    for r in rows_iter(SEL_SRC):
-        total += 1
-        rk = getattr(r, "rank", None)
-        if rk is None:
-            continue
+    id_to_cat, sym_to_cat = load_category_map_from_db()
+
+    # Read all current rows from source and sort by rank
+    rows = list(session.execute(SEL_SOURCE, timeout=REQUEST_TIMEOUT_SEC))
+    def safe_rank(r):
         try:
-            rk_i = int(rk)
+            rk = getattr(r, "rank", None)
+            return int(rk) if rk is not None and int(rk) > 0 else 10**9
         except Exception:
-            continue
-        if rk_i <= 0:
-            continue
-        items.append((rk_i, r))
+            return 10**9
 
-    items.sort(key=lambda x: (x[0], getattr(x[1], "id", "")))
-    top = items[:RANK_TOP_N]
+    rows.sort(key=safe_rank)
+    top = rows[:RANK_TOP_N]
 
-    print(f"[{now_str()}] Source scanned: rows={total}, ranked={len(items)}, writing_top_n={len(top)}")
-
-    # Replace destination partition
+    # Refresh the destination bucket
+    print(f"[{now_str()}] Deleting existing rows for bucket='{RANK_BUCKET}'…")
     session.execute(DEL_BUCKET, [RANK_BUCKET], timeout=REQUEST_TIMEOUT_SEC)
-    print(f"[{now_str()}] Cleared destination bucket='{RANK_BUCKET}'")
 
-    batch = BatchStatement(consistency_level=CONS)
+    batch = BatchStatement(consistency_level=ConsistencyLevel.QUORUM)
     w = 0
-    for rk_i, r in top:
-        vals = [
-            RANK_BUCKET,
-            rk_i,
-            getattr(r, "id", None),
-            getattr(r, "symbol", None),
-            getattr(r, "name", None),
-            getattr(r, "category", None),
-            getattr(r, "price_usd", None),
-            getattr(r, "market_cap", None),
-            getattr(r, "volume_24h", None),
-            getattr(r, "last_updated", None),
-        ]
-        batch.add(INS_DEST, vals)
+
+    for r in top:
+        cid   = getattr(r, "id", None)
+        sym   = getattr(r, "symbol", None)
+        name  = getattr(r, "name", None)
+        rank  = int(getattr(r, "rank", None) or 0)
+        price = float(getattr(r, "price_usd", None) or 0.0) if getattr(r, "price_usd", None) is not None else None
+        mcap  = float(getattr(r, "market_cap", None) or 0.0) if getattr(r, "market_cap", None) is not None else None
+        vol   = float(getattr(r, "volume_24h", None) or 0.0) if getattr(r, "volume_24h", None) is not None else None
+        lu    = getattr(r, "last_updated", None)
+
+        cat = category_for(id_to_cat, sym_to_cat, cid, sym)
+
+        batch.add(INS_RANKED, [
+            RANK_BUCKET, rank, cid, sym, name, cat, price, mcap, vol, lu
+        ])
         w += 1
-        if (w % 40) == 0:
+        if (w % BATCH_FLUSH_EVERY) == 0:
             session.execute(batch); batch.clear()
 
     if len(batch):
@@ -180,4 +189,3 @@ if __name__ == "__main__":
             cluster.shutdown()
         except Exception:
             pass
-

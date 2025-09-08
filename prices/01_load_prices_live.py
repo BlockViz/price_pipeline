@@ -57,38 +57,43 @@ if not BUNDLE or not ASTRA_TOKEN or not KEYSPACE:
 
 def now_str(): return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-# ─────────────── Category mapping (repo-relative) ───────────────
-# Default to the CSV that now lives under prices/
-CATEGORY_FILE = os.getenv("CATEGORY_FILE", str(rel("prices", "category_mapping.csv")))
+# ─────────────── Category mapping (from DB: asset_categories) ───────────────
+# We completely ignore any CSV and always resolve category via DB now.
+def load_category_map_from_db(session) -> tuple[dict, dict]:
+    """
+    Returns:
+      (id_to_cat, sym_to_cat) — both with upper-cased keys for safety.
+    """
+    id_to_cat, sym_to_cat = {}, {}
+    stmt = SimpleStatement(
+        "SELECT id, symbol, category FROM asset_categories",
+        fetch_size=FETCH_SIZE
+    )
+    rows = session.execute(stmt, timeout=REQUEST_TIMEOUT_SEC)
+    count = 0
+    for r in rows:
+        cid = (getattr(r, "id", None) or "").strip()
+        sym = (getattr(r, "symbol", None) or "").strip()
+        cat = (getattr(r, "category", None) or "").strip() or "Other"
+        if cid:
+            id_to_cat[cid.upper()] = cat
+        if sym:
+            sym_to_cat[sym.upper()] = cat
+        count += 1
+    print(f"[{now_str()}] [category] loaded {count} rows from asset_categories "
+          f"(id keys={len(id_to_cat)}, symbol keys={len(sym_to_cat)})")
+    return id_to_cat, sym_to_cat
 
-def load_category_map(path: str) -> dict:
-    m = {}
-    try:
-        with open(path, "r", encoding="utf-8-sig", newline="") as f:
-            for delim in [",", ";", "\t", "|"]:
-                f.seek(0)
-                reader = csv.DictReader(f, delimiter=delim)
-                headers = [h.strip().lower() for h in (reader.fieldnames or [])]
-                if "symbol" in headers and "category" in headers:
-                    sym_key = reader.fieldnames[headers.index("symbol")]
-                    cat_key = reader.fieldnames[headers.index("category")]
-                    for row in reader:
-                        sym = (row.get(sym_key) or "").strip().upper()
-                        cat = (row.get(cat_key) or "").strip()
-                        if sym:
-                            m[sym] = cat or "Other"
-                    print(f"[{now_str()}] [category] loaded {len(m)} rows from {path}")
-                    break
-            else:
-                print(f"[{now_str()}] [category] header not found in {path} (need Symbol,Category)")
-    except FileNotFoundError:
-        print(f"[{now_str()}] [category] file not found: {path} — defaulting to 'Other'")
-    except Exception as e:
-        print(f"[{now_str()}] [category] failed to read {path}: {e} — defaulting to 'Other'")
-    return m
-
-CATEGORY_MAP = load_category_map(CATEGORY_FILE)
-def category_for(sym: str) -> str: return CATEGORY_MAP.get((sym or "").upper(), "Other")
+def category_for(id_to_cat: dict, sym_to_cat: dict, cid: str | None, sym: str | None) -> str:
+    if cid:
+        cat = id_to_cat.get(cid.upper())
+        if cat:
+            return cat
+    if sym:
+        cat = sym_to_cat.get(sym.upper())
+        if cat:
+            return cat
+    return "Other"
 
 # ───────────────────────── Connect ─────────────────────────
 print(f"[{now_str()}] Connecting to Astra (bundle='{BUNDLE}', keyspace='{KEYSPACE}')")
@@ -195,6 +200,9 @@ def run_once():
     now_ts = datetime.now(timezone.utc)
     rows = fetch_ranked(TOP_N)
 
+    # Load category map once per run from DB
+    id_to_cat, sym_to_cat = load_category_map_from_db(session)
+
     batch_latest = BatchStatement(consistency_level=ConsistencyLevel.QUORUM)
     w_hist = w_lat = 0
 
@@ -218,12 +226,15 @@ def run_once():
         chg_30d = (float(q["percent_change_30d"])/100.0)  if q.get("percent_change_30d") is not None else None
         chg_1y  = (float(q["percent_change_1y"])/100.0)   if q.get("percent_change_1y")  is not None else None
 
+        # Category strictly from DB mapping (ID first, then SYMBOL), default "Other"
+        cat = category_for(id_to_cat, sym_to_cat, c.get("id"), c.get("symbol"))
+
         base_vals = [
             c.get("id"),
             c.get("symbol"),
             c.get("name"),
             int(c["rank"]) if c.get("rank") is not None else None,
-            category_for(c.get("symbol")),
+            cat,
             price_now,
             f(q.get("market_cap")),
             f(q.get("volume_24h")),
