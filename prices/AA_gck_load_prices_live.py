@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
-# prices/01_gecko_load_prices_live.py  (category ONLY in LIVE, NOT in ROLLING)
-import os, time, csv, requests, random
+# prices/AA_gck_load_prices_live.py
+# Loads CoinGecko top markets into:
+#   - gecko_prices_live (with category + change_pct_* + price_*_ago)
+#   - gecko_prices_live_rolling (NO category, but DOES include change_pct_* + price_*_ago)
+
+import os, time, csv, requests
 import sys, pathlib
 from datetime import datetime, timezone
 
@@ -24,7 +28,7 @@ from cassandra import OperationTimedOut, ReadTimeout, Unavailable, DriverExcepti
 from cassandra.cluster import Cluster, EXEC_PROFILE_DEFAULT, ExecutionProfile
 from cassandra.auth import PlainTextAuthProvider
 from cassandra.policies import RoundRobinPolicy
-from cassandra.query import BatchStatement, SimpleStatement, ConsistencyLevel
+from cassandra.query import BatchStatement, ConsistencyLevel
 from dotenv import load_dotenv
 
 # Load .env from repo root explicitly
@@ -42,14 +46,14 @@ MAX_BACKOFF  = int(os.getenv("MAX_BACKOFF_MIN", "30"))
 
 REQUEST_TIMEOUT_SEC = int(os.getenv("REQUEST_TIMEOUT_SEC", "60"))
 CONNECT_TIMEOUT_SEC = int(os.getenv("CONNECT_TIMEOUT_SEC", "15"))
-FETCH_SIZE          = int(os.getenv("FETCH_SIZE", "500"))
 BATCH_FLUSH_EVERY   = int(os.getenv("BATCH_FLUSH_EVERY", "40"))
+VERBOSE_MODE        = os.getenv("VERBOSE_MODE", "0") == "1"
 
-# tables (CoinGecko clean slate)
+# tables (CoinGecko)
 TABLE_LATEST  = os.getenv("TABLE_GECKO_LIVE", "gecko_prices_live")
 TABLE_HIST    = os.getenv("TABLE_GECKO_ROLLING", "gecko_prices_live_rolling")
 
-# categories
+# categories (Symbol -> Category; live only)
 CATEGORY_FILE = os.getenv("CATEGORY_FILE", str(rel("prices", "category_mapping.csv")))
 
 # CoinGecko
@@ -117,22 +121,30 @@ session = cluster.connect(KEYSPACE)
 print(f"[{now_str()}] Connected.")
 
 # ───────────────────────── Helpers ─────────────────────────
-def f(x): return float(x) if x is not None else None
+def f(x):
+    try:
+        return float(x) if x is not None else None
+    except Exception:
+        return None
+
 def safe_iso_to_dt(s):
     if not s: return None
-    return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(timezone.utc)
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(timezone.utc)
+    except Exception:
+        return None
 
-def exec_with_retry(stmt, params=None, timeout=REQUEST_TIMEOUT_SEC, attempts=3, label="CQL"):
-    last = None
-    for i in range(1, attempts + 1):
-        try:
-            return session.execute(stmt, params or [], timeout=timeout)
-        except (OperationTimedOut, ReadTimeout, Unavailable, WriteTimeout, DriverException) as e:
-            last = e
-            wait = min(2 ** i, MAX_BACKOFF)
-            print(f"[{now_str()}] [{label}] attempt {i}/{attempts} failed: {e} — retry in {wait}s")
-            time.sleep(wait)
-    raise last
+def price_ago_from_pct(now_price, pct):
+    """pct is percent (e.g., +3.5), returns baseline price or None."""
+    try:
+        if now_price is None or pct is None:
+            return None
+        denom = 1.0 + (float(pct) / 100.0)
+        if denom == 0:
+            return None
+        return float(now_price) / denom
+    except Exception:
+        return None
 
 def http_get(path, params=None):
     url = f"{BASE}{path}"
@@ -156,27 +168,30 @@ def http_get(path, params=None):
                 raise
 
 # ───────────────────────── Statements ─────────────────────────
-# LIVE table includes category; ROLLING table does NOT include category.
+# LIVE includes category & price_*_ago
 LIVE_COLS = [
     "id","symbol","name","category",
     "market_cap_rank",
     "price_usd","market_cap","volume_24h",
-    "last_fetched","last_updated",
-    "ath_date","ath_price",
+    "last_updated","last_fetched",
+    "ath_price","ath_date",
     "circulating_supply","total_supply","max_supply",
     "change_pct_1h","change_pct_24h","change_pct_7d","change_pct_30d","change_pct_1y",
+    "price_1h_ago","price_24h_ago","price_7d_ago","price_30d_ago","price_1y_ago",
     "vs_currency",
 ]
 
+# ROLLING has NO category, but DOES include price_*_ago
 ROLLING_COLS = [
     "id","last_updated",
     "symbol","name",
     "market_cap_rank",
     "price_usd","market_cap","volume_24h",
     "last_fetched",
-    "ath_date","ath_price",
+    "ath_price","ath_date",
     "circulating_supply","total_supply","max_supply",
     "change_pct_1h","change_pct_24h","change_pct_7d","change_pct_30d","change_pct_1y",
+    "price_1h_ago","price_24h_ago","price_7d_ago","price_30d_ago","price_1y_ago",
     "vs_currency",
 ]
 
@@ -217,32 +232,16 @@ def run_once():
     now_ts = datetime.now(timezone.utc)
     rows = fetch_top_markets(TOP_N)
 
-    # --- DEBUG right after fetching markets ---
-    print(f"[{now_str()}] [debug] preparing to upsert {len(rows)} rows → live={TABLE_LATEST}, rolling={TABLE_HIST}")
+    # Debug preview
     if rows:
         sample = rows[:5]
         preview = [(r.get("id"), (r.get("symbol") or "").upper(), r.get("market_cap_rank"), r.get("last_updated")) for r in sample]
         print(f"[{now_str()}] [debug] sample[0:5]: {preview}")
-    t_loop_start = time.time()
-
 
     batch_latest = BatchStatement(consistency_level=ConsistencyLevel.QUORUM)
     w_hist = w_lat = 0
 
     for idx, c in enumerate(rows, 1):
-        ...
-        # add rolling, add live to batch, maybe flush
-
-        if idx % 20 == 0:
-            print(f"[{now_str()}] [progress] rows={idx}/{len(rows)}; "
-                f"live_batch_size={len(batch_latest)}; "
-                f"w_lat={w_lat} w_hist={w_hist}")
-
-        if w_lat % BATCH_FLUSH_EVERY == 0:
-            session.execute(batch_latest); batch_latest.clear()
-            print(f"[{now_str()}] [progress] live batch FLUSHED at w_lat={w_lat}")
-
-        
         gid   = c.get("id")
         sym   = (c.get("symbol") or "").upper()
         name  = c.get("name")
@@ -252,57 +251,79 @@ def run_once():
         vol   = f(c.get("total_volume"))
         lu    = safe_iso_to_dt(c.get("last_updated"))
         if not gid or lu is None:
+            if VERBOSE_MODE:
+                print(f"[{now_str()}] [skip] missing id/last_updated for row idx={idx}")
             continue
 
-        ath_date = safe_iso_to_dt(c.get("ath_date"))
         ath_price = f(c.get("ath"))
+        ath_date  = safe_iso_to_dt(c.get("ath_date"))
 
         circ = f(c.get("circulating_supply"))
         totl = f(c.get("total_supply"))
         maxs = f(c.get("max_supply"))
 
+        # Percent changes from CG (percent units, e.g. 3.4 = +3.4%)
         ch1h  = pct(c, "price_change_percentage_1h_in_currency")
         ch24h = pct(c, "price_change_percentage_24h_in_currency")
         ch7d  = pct(c, "price_change_percentage_7d_in_currency")
         ch30d = pct(c, "price_change_percentage_30d_in_currency")
         ch1y  = pct(c, "price_change_percentage_1y_in_currency")
 
-        # LIVE row (with category)
+        # Derive baselines from pct where possible
+        p1h  = price_ago_from_pct(price, ch1h)
+        p24h = price_ago_from_pct(price, ch24h)
+        p7d  = price_ago_from_pct(price, ch7d)
+        p30d = price_ago_from_pct(price, ch30d)
+        p1y  = price_ago_from_pct(price, ch1y)
+
+        # LIVE row (with category + price_*_ago)
         live_vals = [
             gid, sym, name, category_for(sym),
             int(rank) if rank is not None else None,
             price, mcap, vol,
-            now_ts, lu,
-            ath_date, ath_price,
+            lu, now_ts,
+            ath_price, ath_date,
             circ, totl, maxs,
             ch1h, ch24h, ch7d, ch30d, ch1y,
+            p1h, p24h, p7d, p30d, p1y,
             "usd",
         ]
 
-        # ROLLING row (NO category)
+        # ROLLING row (NO category, but includes price_*_ago)
         rolling_vals = [
             gid, lu,
             sym, name,
             int(rank) if rank is not None else None,
             price, mcap, vol,
             now_ts,
-            ath_date, ath_price,
+            ath_price, ath_date,
             circ, totl, maxs,
             ch1h, ch24h, ch7d, ch30d, ch1y,
+            p1h, p24h, p7d, p30d, p1y,
             "usd",
         ]
 
+        # Write rolling (IF NOT EXISTS to avoid dupes at the same last_updated)
         try:
-            applied = session.execute(INS_ROLLING_IF_NOT_EXISTS, rolling_vals, timeout=REQUEST_TIMEOUT_SEC).one().applied
+            applied = session.execute(
+                INS_ROLLING_IF_NOT_EXISTS, rolling_vals, timeout=REQUEST_TIMEOUT_SEC
+            ).one().applied
             if applied:
                 w_hist += 1
         except (WriteTimeout, OperationTimedOut, DriverException) as e:
             print(f"[{now_str()}] [rolling] insert failed for {sym}@{lu}: {e}")
 
+        # Buffer live upsert
         batch_latest.add(INS_LIVE_UPSERT, live_vals)
         w_lat += 1
+
+        # Progress + periodic flush
+        if (idx % 20 == 0) or VERBOSE_MODE:
+            print(f"[{now_str()}] [progress] rows={idx}/{len(rows)}; live_batch={len(batch_latest)} w_lat={w_lat} w_hist={w_hist}")
         if (w_lat % BATCH_FLUSH_EVERY) == 0:
             session.execute(batch_latest); batch_latest.clear()
+            if VERBOSE_MODE:
+                print(f"[{now_str()}] [flush] live batch flushed at w_lat={w_lat}")
 
     if len(batch_latest):
         session.execute(batch_latest)
