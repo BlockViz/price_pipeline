@@ -416,44 +416,73 @@ def seed_10m_from_daily(coin, missing_days: set[dt.date]) -> int:
 
 def backfill_daily_from_api(coin, need_daily: set[dt.date]) -> int:
     """
-    Fetch daily via CoinGecko /coins/{id}/market_chart/range and upsert.
-    If multiple intraday points → true OHLC ('hourly'); else prev-close/flat.
-    Enrich rank/supplies per day from rolling states (<= day end).
+    Fetch daily via CoinGecko /coins/{id}/market_chart/range in <=90d tiles, then upsert.
+    - If a day has multiple intraday points → true OHLC ('hourly')
+    - If only one daily point → prev-close/flat candle
+    - Enrich per-day rank/supply from rolling states
     """
-    if not (BACKFILL_DAILY_FROM_API and need_daily): return 0
-
-    days = sorted(need_daily)
-    start_day = days[0]; end_day = days[-1]
-    start_dt, _ = day_bounds_utc(start_day)
-    end_dt = dt.datetime(end_day.year, end_day.month, end_day.day, 23, 59, 59, tzinfo=timezone.utc)
-
-    print(f"[{ts()}]    [api] {coin.symbol} market_chart/range {start_day}→{end_day} …")
-    try:
-        data = http_get(f"/coins/{coin.id}/market_chart/range", params={
-            "vs_currency": "usd",
-            "from": int(start_dt.timestamp()),
-            "to":   int(end_dt.timestamp()),
-        })
-    except Exception as e:
-        print(f"  · API backfill failed for {coin.id}: {e}")
+    if not (BACKFILL_DAILY_FROM_API and need_daily):
         return 0
 
-    prices = data.get("prices", []) or []
-    mcaps  = data.get("market_caps", []) or []
-    vols   = data.get("total_volumes", []) or []
-    print(f"[{ts()}]    [api] payload sizes: prices={len(prices)} mcaps={len(mcaps)} vols={len(vols)}")
+    days = sorted(need_daily)
+    start_day = days[0]
+    end_day   = days[-1]
+    print(f"[{ts()}]    [api] {coin.symbol} tiling {start_day}→{end_day} in <=90d windows …")
 
-    ohlc  = bucket_daily_ohlc(prices, start_day, end_day)
-    m_last = bucket_daily_last(mcaps, start_day, end_day)
-    v_last = bucket_daily_last(vols,  start_day, end_day)
+    # ---- Tile into <=90 day windows ----
+    WINDOW_DAYS = 90
+    cur = start_day
+    all_prices = []
+    all_mcaps  = []
+    all_vols   = []
+
+    while cur <= end_day:
+        w_end = min(end_day, cur + dt.timedelta(days=WINDOW_DAYS - 1))
+        start_dt, _ = day_bounds_utc(cur)
+        end_dt = dt.datetime(w_end.year, w_end.month, w_end.day, 23, 59, 59, tzinfo=timezone.utc)
+
+        try:
+            data = http_get(
+                f"/coins/{coin.id}/market_chart/range",
+                params={"vs_currency": "usd", "from": int(start_dt.timestamp()), "to": int(end_dt.timestamp())}
+            )
+        except Exception as e:
+            print(f"[{ts()}]      · window {cur}→{w_end} failed: {e}")
+            # Move on to next window; throttling/429 will reduce throughput but not kill the run
+            cur = w_end + dt.timedelta(days=1)
+            # Light pacing to avoid tripping rate limits
+            time.sleep(PAUSE_S)
+            continue
+
+        prices = data.get("prices", []) or []
+        mcaps  = data.get("market_caps", []) or []
+        vols   = data.get("total_volumes", []) or []
+        print(f"[{ts()}]      · window {cur}→{w_end} sizes: prices={len(prices)} mcaps={len(mcaps)} vols={len(vols)}")
+
+        # Append; downstream bucketing will restrict to exact day set
+        all_prices.extend(prices)
+        all_mcaps.extend(mcaps)
+        all_vols.extend(vols)
+
+        # Pacing: tiny jitter helps with 429 bursts on free/demo
+        time.sleep(PAUSE_S + random.uniform(0.0, 0.25))
+
+        cur = w_end + dt.timedelta(days=1)
+
+    if not all_prices:
+        print(f"[{ts()}]    [api] no payload for {coin.symbol} across all windows → skip (wrote=0)")
+        return 0
+
+    # ---- Bucket to days and enrich ----
+    ohlc   = bucket_daily_ohlc(all_prices, start_day, end_day)
+    m_last = bucket_daily_last(all_mcaps,  start_day, end_day)
+    v_last = bucket_daily_last(all_vols,   start_day, end_day)
     print(f"[{ts()}]    [api] bucketed days with price={len(ohlc)}")
 
-    # Enrich from rolling for the entire window
-    roll_rows = list(session.execute(SEL_ROLLING_RANGE, [
-        coin.id,
-        start_dt,
-        end_dt + dt.timedelta(seconds=1)
-    ], timeout=REQUEST_TIMEOUT))
+    # Enrich from rolling states (rank/supplies) within the same span
+    start_dt, _ = day_bounds_utc(start_day)
+    end_dt      = dt.datetime(end_day.year, end_day.month, end_day.day, 23, 59, 59, tzinfo=timezone.utc)
+    roll_rows = list(session.execute(SEL_ROLLING_RANGE, [coin.id, start_dt, end_dt + dt.timedelta(seconds=1)], timeout=REQUEST_TIMEOUT))
     roll_rows.sort(key=lambda r: r.last_updated)
     st_i = -1
     cur_rank = getattr(coin, "market_cap_rank", None)
@@ -478,11 +507,14 @@ def backfill_daily_from_api(coin, need_daily: set[dt.date]) -> int:
         mcap = m_last.get(d, {}).get("val")
         vol  = v_last.get(d,  {}).get("val")
         if not row:
+            # no price at all for that day from CG — skip quietly
             continue
 
         o, h, l, c, last_ts = row["open"], row["high"], row["low"], row["close"], row["last_ts"]
-        csrc = "hourly" if row.get("is_true_ohlc") else "prev_close"
-        if not row.get("is_true_ohlc"):
+        if row.get("is_true_ohlc"):
+            csrc = "hourly"
+        else:
+            # only one point → synthesize prev-close candle
             if prev_close is None:
                 o = h = l = c
                 csrc = "flat"
@@ -499,41 +531,34 @@ def backfill_daily_from_api(coin, need_daily: set[dt.date]) -> int:
         if _daily_row_equal(existing, o, h, l, c, mcap, vol, csrc):
             prev_close = c
             if (di % 25 == 0) or (di == len(days)):
-                try:
-                    bs = len(batch)
-                except Exception:
-                    bs = "n/a"
-                print(f"[{ts()}]      · API {coin.symbol} day {di}/{len(days)} wrote={cnt_daily} batch_size={bs} (unchanged)")
+                print(f"[{ts()}]      · API {coin.symbol} day {di}/{len(days)} wrote={cnt_daily} (unchanged)")
             continue
 
-        if not DRY_RUN:
-            batch.add(INS_DAY, (
-                coin.id, d, coin.symbol, coin.name,
-                float(o), float(h), float(l), float(c), float(c),
-                float(mcap) if mcap is not None else None,
-                float(vol)  if vol  is not None else None,
-                cur_rank, cur_circ, cur_tot,
-                csrc, last_ts if row.get("is_true_ohlc") else day_end
-            ))
+        batch.add(INS_DAY, (
+            coin.id, d, coin.symbol, coin.name,
+            float(o), float(h), float(l), float(c), float(c),
+            float(mcap) if mcap is not None else None,
+            float(vol)  if vol  is not None else None,
+            cur_rank, cur_circ, cur_tot,
+            csrc, last_ts if row.get("is_true_ohlc") else day_end
+        ))
         cnt_daily += 1
         prev_close = c
 
-        if (cnt_daily % 40 == 0) and not DRY_RUN:
+        if (cnt_daily % 40 == 0):
             print(f"[{ts()}]      · API flush at cnt_daily={cnt_daily}")
             session.execute(batch); batch.clear()
 
         if (di % 25 == 0) or (di == len(days)):
-            try:
-                bs = len(batch)
-            except Exception:
-                bs = "n/a"
-            print(f"[{ts()}]      · API {coin.symbol} day {di}/{len(days)} wrote={cnt_daily} batch_size={bs}")
+            print(f"[{ts()}]      · API {coin.symbol} day {di}/{len(days)} wrote={cnt_daily}")
 
-    if (cnt_daily % 40 != 0) and not DRY_RUN and len(batch) > 0:
+    if len(batch):
         print(f"[{ts()}]      · API final flush at cnt_daily={cnt_daily}")
         session.execute(batch)
+
     print(f"[{ts()}]    [api] {coin.symbol} wrote={cnt_daily}")
     return cnt_daily
+
 
 # ---------- Main ----------
 def main():
