@@ -49,6 +49,8 @@ jobs:
         if: ${{ github.event.inputs.run_01 == 'true' }}
         timeout-minutes: 8
         env:
+          COINGECKO_API_KEY: ${{ vars.COINGECKO_API_KEY }}
+          COINGECKO_API_TIER: ${{ secrets.COINGECKO_API_TIER }}
           ASTRA_BUNDLE_PATH: secure-connect.zip
           ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
           ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
@@ -69,6 +71,8 @@ jobs:
         if: ${{ github.event.inputs.run_02 == 'true' }}
         timeout-minutes: 7
         env:
+          COINGECKO_API_KEY: ${{ vars.COINGECKO_API_KEY }}
+          COINGECKO_API_TIER: ${{ secrets.COINGECKO_API_TIER }}
           ASTRA_BUNDLE_PATH: secure-connect.zip
           ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
           ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
@@ -85,6 +89,8 @@ jobs:
         if: ${{ github.event.inputs.run_rank == 'true' }}
         timeout-minutes: 3
         env:
+          COINGECKO_API_KEY: ${{ vars.COINGECKO_API_KEY }}
+          COINGECKO_API_TIER: ${{ secrets.COINGECKO_API_TIER }}
           ASTRA_BUNDLE_PATH: secure-connect.zip
           ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
           ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}

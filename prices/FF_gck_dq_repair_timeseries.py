@@ -42,8 +42,8 @@ TEN_MIN_TABLE   = os.getenv("TEN_MIN_TABLE", "gecko_prices_10m_7d")
 DAILY_TABLE     = os.getenv("DAILY_TABLE", "gecko_candles_daily_contin")
 TABLE_ROLLING   = os.getenv("TABLE_ROLLING", "gecko_prices_live_rolling")
 
-TOP_N_DQ               = int(os.getenv("TOP_N_DQ", "110"))
-DQ_MAX_COINS           = int(os.getenv("DQ_MAX_COINS", "110"))
+TOP_N_DQ               = int(os.getenv("TOP_N_DQ", "210"))
+DQ_MAX_COINS           = int(os.getenv("DQ_MAX_COINS", "210"))
 DQ_MAX_API_COINS_RUN   = int(os.getenv("DQ_MAX_API_COINS_PER_RUN", "20"))
 
 DAYS_10M     = int(os.getenv("DQ_WINDOW_10M_DAYS", "7"))
@@ -85,37 +85,31 @@ def ts(): return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 def tdur(t0): return f"{(time.perf_counter()-t0):.2f}s"
 def utcnow(): return dt.datetime.now(timezone.utc)
 
-# put near the other helpers
 def _to_pydate(x) -> dt.date:
     """
     Coerce various Cassandra/Python types to a plain datetime.date.
     Handles:
       - datetime.date
-      - datetime.datetime  (uses .date())
+      - datetime.datetime (uses .date())
       - cassandra.util.Date (string parse fallback)
       - ISO strings like 'YYYY-MM-DD'
-      - integer day offsets (Cassandra epoch-days), as a last resort
+      - integer day offsets (Cassandra epoch-days)
     """
     if x is None:
         raise TypeError("Cannot coerce None to date")
 
-    # Already a date (but not datetime)
     if isinstance(x, dt.date) and not isinstance(x, dt.datetime):
         return x
 
-    # Datetime → date
     if isinstance(x, dt.datetime):
         return x.date()
 
-    # cassandra.util.Date or anything that stringifies to 'YYYY-MM-DD'
     s = str(x)
     try:
-        # most robust for cassandra.util.Date
         return dt.date.fromisoformat(s[:10])
     except Exception:
         pass
 
-    # Integer-like: Cassandra 'date' can be days since epoch
     try:
         days = int(x)
         return dt.date(1970, 1, 1) + dt.timedelta(days=days)
@@ -123,7 +117,6 @@ def _to_pydate(x) -> dt.date:
         pass
 
     raise TypeError(f"Cannot interpret date value {x!r}")
-
 
 def equalish(a, b, eps=1e-12):
     if a is None and b is None: return True
@@ -169,8 +162,8 @@ def http_get(path, params=None):
 def bucket_daily_ohlc(prices_ms_values, start_d: dt.date, end_d: dt.date):
     per_day = defaultdict(list)
     for ms, price in prices_ms_values or []:
-        ts = dt.datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc)
-        per_day[ts.date()].append((ts, float(price)))
+        ts_ = dt.datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc)
+        per_day[ts_.date()].append((ts_, float(price)))
     out = {}
     d = start_d
     while d <= end_d:
@@ -183,7 +176,7 @@ def bucket_daily_ohlc(prices_ms_values, start_d: dt.date, end_d: dt.date):
                 "low":  min(vals),
                 "close": vals[-1],
                 "last_ts": pts[-1][0],
-                "is_true_ohlc": len(vals) > 1,  # heuristic: >1 intraday points
+                "is_true_ohlc": len(vals) > 1,
             }
         d += dt.timedelta(days=1)
     return out
@@ -191,9 +184,9 @@ def bucket_daily_ohlc(prices_ms_values, start_d: dt.date, end_d: dt.date):
 def bucket_daily_last(values_ms_values, start_d: dt.date, end_d: dt.date):
     per_day = defaultdict(list)
     for ms, val in values_ms_values or []:
-        ts = dt.datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc)
+        ts_ = dt.datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc)
         v = float(val) if val is not None else None
-        per_day[ts.date()].append((ts, v))
+        per_day[ts_.date()].append((ts_, v))
     out = {}
     d = start_d
     while d <= end_d:
@@ -314,13 +307,16 @@ def _daily_row_equal(existing, o, h, l, c, mcap, vol, source):
 def repair_daily_from_10m(coin, missing_days: set[dt.date]) -> int:
     """Compute daily OHLC from 10m and upsert (candle_source='10m_final')."""
     if not (FIX_DAILY_FROM_10M and missing_days): return 0
+    print(f"[{ts()}]    [repair_daily_from_10m] {coin.symbol}: {len(missing_days)} day(s) to fix")
     t0 = time.perf_counter()
     cnt = 0
     batch = BatchStatement(consistency_level=ConsistencyLevel.QUORUM)
-    for day in sorted(missing_days):
+    for idx, day in enumerate(sorted(missing_days), 1):
         day_start, day_end_excl = day_bounds_utc(day)
         try:
+            t_read = time.perf_counter()
             pts = list(session.execute(SEL_10M_RANGE_FULL, [coin.id, day_start, day_end_excl], timeout=REQUEST_TIMEOUT))
+            print(f"[{ts()}]      · {coin.symbol} {day} → 10m rows={len(pts)} in {tdur(t_read)}")
         except (OperationTimedOut, ReadTimeout, DriverException) as e:
             print(f"  · [READ-ERR] {coin.symbol} {day}: {e}")
             continue
@@ -344,8 +340,8 @@ def repair_daily_from_10m(coin, missing_days: set[dt.date]) -> int:
         vol  = vols[-1]  if vols  else None
         rnk  = ranks[-1] if ranks else None
         circ = circs[-1] if circs else None
-        tot  = tots[-1]  if tots  else None
-        last_upd = last_ts or (day_end_excl - timedelta(seconds=1))
+        tot  = tots[-1]  if tots else None
+        last_upd = last_ts or (day_end_excl - dt.timedelta(seconds=1))
 
         existing = session.execute(SEL_DAILY_ONE, [coin.id, day], timeout=REQUEST_TIMEOUT).one()
         if _daily_row_equal(existing, o, h, l, c, mcap, vol, "10m_final"):
@@ -361,22 +357,31 @@ def repair_daily_from_10m(coin, missing_days: set[dt.date]) -> int:
                 "10m_final", last_upd
             ))
         cnt += 1
-        if cnt % 40 == 0 and not DRY_RUN:
+        if (idx % 25 == 0) or (idx == len(missing_days)):
+            try:
+                bs = len(batch)
+            except Exception:
+                bs = "n/a"
+            print(f"[{ts()}]      · progress {idx}/{len(missing_days)} (batch_size={bs})")
+        if (cnt % 40 == 0) and not DRY_RUN:
+            print(f"[{ts()}]      · flushing batch at cnt={cnt}")
             session.execute(batch); batch.clear()
 
     if (cnt % 40 != 0) and not DRY_RUN and len(batch) > 0:
+        print(f"[{ts()}]      · final flush at cnt={cnt}")
         session.execute(batch)
-    if cnt and VERBOSE:
-        print(f"  · daily OHLC from 10m: +{cnt} rows ({tdur(t0)})")
+
+    print(f"[{ts()}]    [repair_daily_from_10m] {coin.symbol} wrote={cnt} ({tdur(t0)})")
     return cnt
 
 def seed_10m_from_daily(coin, missing_days: set[dt.date]) -> int:
     """OPTIONAL: seed a synthetic 10m row at 23:59:59Z using the daily close."""
     if not (SEED_10M_FROM_DAILY and missing_days): return 0
+    print(f"[{ts()}]    [seed_10m] {coin.symbol}: {len(missing_days)} day(s) to seed")
     t0 = time.perf_counter()
     cnt = 0
     batch = BatchStatement(consistency_level=ConsistencyLevel.QUORUM)
-    for day in sorted(missing_days):
+    for idx, day in enumerate(sorted(missing_days), 1):
         row = session.execute(SEL_DAILY_ONE, [coin.id, day], timeout=REQUEST_TIMEOUT).one()
         if not row: continue
         close = float(row.close if row.close is not None else (row.price_usd or 0.0))
@@ -393,33 +398,41 @@ def seed_10m_from_daily(coin, missing_days: set[dt.date]) -> int:
                 rnk, circ, tot, last_updated
             ))
         cnt += 1
-        if cnt % 40 == 0 and not DRY_RUN:
+        if (idx % 25 == 0) or (idx == len(missing_days)):
+            try:
+                bs = len(batch)
+            except Exception:
+                bs = "n/a"
+            print(f"[{ts()}]      · seed progress {idx}/{len(missing_days)} (batch_size={bs})")
+        if (cnt % 40 == 0) and not DRY_RUN:
+            print(f"[{ts()}]      · seed flush at cnt={cnt}")
             session.execute(batch); batch.clear()
+
     if (cnt % 40 != 0) and not DRY_RUN and len(batch) > 0:
+        print(f"[{ts()}]      · seed final flush at cnt={cnt}")
         session.execute(batch)
-    if cnt and VERBOSE:
-        print(f"  · 10m seeded from daily close: +{cnt} rows ({tdur(t0)})")
+    print(f"[{ts()}]    [seed_10m] {coin.symbol} wrote={cnt} ({tdur(t0)})")
     return cnt
 
 def backfill_daily_from_api(coin, need_daily: set[dt.date]) -> int:
     """
-    Fetch daily snapshots via CoinGecko /coins/{id}/market_chart/range and upsert.
-    If multiple intraday points in a day → true OHLC (source='hourly'), else prev-close/flat.
+    Fetch daily via CoinGecko /coins/{id}/market_chart/range and upsert.
+    If multiple intraday points → true OHLC ('hourly'); else prev-close/flat.
     Enrich rank/supplies per day from rolling states (<= day end).
     """
     if not (BACKFILL_DAILY_FROM_API and need_daily): return 0
 
     days = sorted(need_daily)
     start_day = days[0]; end_day = days[-1]
-    start_dt, end_dt_excl = day_bounds_utc(start_day)
-    end_dt = end_dt_excl + dt.timedelta(days=(end_day - start_day).days) - dt.timedelta(seconds=1)
+    start_dt, _ = day_bounds_utc(start_day)
+    end_dt = dt.datetime(end_day.year, end_day.month, end_day.day, 23, 59, 59, tzinfo=timezone.utc)
 
-    # Fetch range once
+    print(f"[{ts()}]    [api] {coin.symbol} market_chart/range {start_day}→{end_day} …")
     try:
         data = http_get(f"/coins/{coin.id}/market_chart/range", params={
             "vs_currency": "usd",
             "from": int(start_dt.timestamp()),
-            "to":   int((dt.datetime(end_day.year, end_day.month, end_day.day, 23, 59, 59, tzinfo=timezone.utc)).timestamp()),
+            "to":   int(end_dt.timestamp()),
         })
     except Exception as e:
         print(f"  · API backfill failed for {coin.id}: {e}")
@@ -428,16 +441,18 @@ def backfill_daily_from_api(coin, need_daily: set[dt.date]) -> int:
     prices = data.get("prices", []) or []
     mcaps  = data.get("market_caps", []) or []
     vols   = data.get("total_volumes", []) or []
+    print(f"[{ts()}]    [api] payload sizes: prices={len(prices)} mcaps={len(mcaps)} vols={len(vols)}")
 
-    ohlc = bucket_daily_ohlc(prices, start_day, end_day)
+    ohlc  = bucket_daily_ohlc(prices, start_day, end_day)
     m_last = bucket_daily_last(mcaps, start_day, end_day)
     v_last = bucket_daily_last(vols,  start_day, end_day)
+    print(f"[{ts()}]    [api] bucketed days with price={len(ohlc)}")
 
     # Enrich from rolling for the entire window
     roll_rows = list(session.execute(SEL_ROLLING_RANGE, [
         coin.id,
         start_dt,
-        dt.datetime(end_day.year, end_day.month, end_day.day, 23, 59, 59, tzinfo=timezone.utc) + dt.timedelta(seconds=1)
+        end_dt + dt.timedelta(seconds=1)
     ], timeout=REQUEST_TIMEOUT))
     roll_rows.sort(key=lambda r: r.last_updated)
     st_i = -1
@@ -458,19 +473,15 @@ def backfill_daily_from_api(coin, need_daily: set[dt.date]) -> int:
     cnt_daily = 0
     prev_close = None
 
-    for d in days:
+    for di, d in enumerate(days, 1):
         row = ohlc.get(d)
         mcap = m_last.get(d, {}).get("val")
         vol  = v_last.get(d,  {}).get("val")
-        if row:
-            # We have ≥1 intraday points for that day in "prices"
-            o, h, l, c, last_ts = row["open"], row["high"], row["low"], row["close"], row["last_ts"]
-            csrc = "hourly" if row.get("is_true_ohlc") else "prev_close"
-        else:
-            # No price point for this day → skip
+        if not row:
             continue
 
-        # If it's a single point (daily), prev_close logic:
+        o, h, l, c, last_ts = row["open"], row["high"], row["low"], row["close"], row["last_ts"]
+        csrc = "hourly" if row.get("is_true_ohlc") else "prev_close"
         if not row.get("is_true_ohlc"):
             if prev_close is None:
                 o = h = l = c
@@ -481,13 +492,18 @@ def backfill_daily_from_api(coin, need_daily: set[dt.date]) -> int:
                 l = min(o, c)
                 csrc = "prev_close"
 
-        # Enrich rank/supplies as of day end
         day_end = day_bounds_utc(d)[1] - dt.timedelta(seconds=1)
         advance_state_until(day_end)
 
         existing = session.execute(SEL_DAILY_ONE, [coin.id, d], timeout=REQUEST_TIMEOUT).one()
         if _daily_row_equal(existing, o, h, l, c, mcap, vol, csrc):
             prev_close = c
+            if (di % 25 == 0) or (di == len(days)):
+                try:
+                    bs = len(batch)
+                except Exception:
+                    bs = "n/a"
+                print(f"[{ts()}]      · API {coin.symbol} day {di}/{len(days)} wrote={cnt_daily} batch_size={bs} (unchanged)")
             continue
 
         if not DRY_RUN:
@@ -501,13 +517,22 @@ def backfill_daily_from_api(coin, need_daily: set[dt.date]) -> int:
             ))
         cnt_daily += 1
         prev_close = c
-        if cnt_daily % 40 == 0 and not DRY_RUN:
+
+        if (cnt_daily % 40 == 0) and not DRY_RUN:
+            print(f"[{ts()}]      · API flush at cnt_daily={cnt_daily}")
             session.execute(batch); batch.clear()
 
+        if (di % 25 == 0) or (di == len(days)):
+            try:
+                bs = len(batch)
+            except Exception:
+                bs = "n/a"
+            print(f"[{ts()}]      · API {coin.symbol} day {di}/{len(days)} wrote={cnt_daily} batch_size={bs}")
+
     if (cnt_daily % 40 != 0) and not DRY_RUN and len(batch) > 0:
+        print(f"[{ts()}]      · API final flush at cnt_daily={cnt_daily}")
         session.execute(batch)
-    if VERBOSE:
-        print(f"  · API fixed daily={cnt_daily}")
+    print(f"[{ts()}]    [api] {coin.symbol} wrote={cnt_daily}")
     return cnt_daily
 
 # ---------- Main ----------
@@ -549,27 +574,26 @@ def main():
             need_daily = want_daily_days - have_daily
             print(f"[{ts()}]    Missing → 10m:{len(need_10m)} daily:{len(need_daily)}")
 
-            # --- DEBUG START ---
+            # Plan print
             print(f"[{ts()}]    Plan: daily_from_10m={bool(need_daily and FIX_DAILY_FROM_10M)} "
-                f"seed_10m={bool(need_10m and SEED_10M_FROM_DAILY)} "
-                f"api_pass={bool(need_daily and BACKFILL_DAILY_FROM_API)}")
-            # --- DEBUG END ---
-
+                  f"seed_10m={bool(need_10m and SEED_10M_FROM_DAILY)} "
+                  f"api_pass={bool(need_daily and BACKFILL_DAILY_FROM_API)}")
 
             if need_daily:
                 fixed = repair_daily_from_10m(coin, need_daily)
-                print(f"[{ts()}]    repair_daily_from_10m → wrote {fixed} rows")
                 fixedD_local += fixed
+                print(f"[{ts()}]    repair_daily_from_10m → wrote {fixed} rows")
                 if fixed:
                     have_daily = existing_days_daily(coin.id, start_daily_date, last_inclusive)
                     need_daily = want_daily_days - have_daily
 
             if need_10m and SEED_10M_FROM_DAILY:
                 fixed = seed_10m_from_daily(coin, need_10m)
-                print(f"[{ts()}]    seed_10m_from_daily → wrote {fixed} rows")
                 fixed10_seeded += fixed
+                print(f"[{ts()}]    seed_10m_from_daily → wrote {fixed} rows")
 
             if need_daily:
+                print(f"[{ts()}]    → defer to API: {len(need_daily)} daily day(s)")
                 coins_needing_api.append((coin, need_daily))
 
             time.sleep(PAUSE_S)

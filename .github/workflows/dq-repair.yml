@@ -80,13 +80,13 @@ jobs:
           ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
 
           # Tables
-          TABLE_LIVE: "prices_live"
-          TEN_MIN_TABLE: "prices_10m_7d"
-          DAILY_TABLE: "candles_daily_contin"
+          TABLE_LIVE: "gecko_prices_live"
+          TEN_MIN_TABLE: "gecko_prices_10m_7d"
+          DAILY_TABLE: "gecko_candles_daily_contin"
 
           # Windows & scope
           TOP_N_DQ: ${{ github.event.inputs.TOP_N_DQ != '' && github.event.inputs.TOP_N_DQ || '110' }}
-          DQ_MAX_COINS: "110"
+          DQ_MAX_COINS: "210"
           DQ_WINDOW_10M_DAYS: "7"
           DQ_WINDOW_DAILY_DAYS: "365"
 
@@ -113,4 +113,4 @@ jobs:
           DQ_TIME_API: "1"
         run: |
           set -euo pipefail
-          python prices/dq_repair_timeseries.py
+          python prices/FF_gck_dq_repair_timeseries.py
