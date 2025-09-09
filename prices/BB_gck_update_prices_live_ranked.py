@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# prices/BB_gck_update_prices_live_ranked.py
 import os, sys, pathlib, time
 from datetime import datetime
 
@@ -45,6 +46,21 @@ REQUEST_TIMEOUT_SEC = int(os.getenv("REQUEST_TIMEOUT_SEC", "60"))
 CONNECT_TIMEOUT_SEC = int(os.getenv("CONNECT_TIMEOUT_SEC", "15"))
 FETCH_SIZE          = int(os.getenv("FETCH_SIZE", "1000"))
 BATCH_FLUSH_EVERY   = int(os.getenv("BATCH_FLUSH_EVERY", "50"))
+
+# optional env to control batch consistency (defaults to QUORUM)
+CONSISTENCY_NAME = (os.getenv("CONSISTENCY") or "QUORUM").upper()
+CONSISTENCY_MAP = {
+    "ANY": ConsistencyLevel.ANY,
+    "ONE": ConsistencyLevel.ONE,
+    "TWO": ConsistencyLevel.TWO,
+    "THREE": ConsistencyLevel.THREE,
+    "QUORUM": ConsistencyLevel.QUORUM,
+    "ALL": ConsistencyLevel.ALL,
+    "LOCAL_QUORUM": ConsistencyLevel.LOCAL_QUORUM,
+    "EACH_QUORUM": ConsistencyLevel.EACH_QUORUM,
+    "LOCAL_ONE": ConsistencyLevel.LOCAL_ONE,
+}
+BATCH_CL = CONSISTENCY_MAP.get(CONSISTENCY_NAME, ConsistencyLevel.QUORUM)
 
 if not BUNDLE or not ASTRA_TOKEN or not KEYSPACE:
     raise SystemExit("Missing ASTRA_BUNDLE_PATH / ASTRA_TOKEN / ASTRA_KEYSPACE")
@@ -100,20 +116,27 @@ def category_for(id_to_cat, sym_to_cat, cid: str | None, sym: str | None) -> str
     return "Other"
 
 # ───────────────────────── I/O statements ─────────────────────────
+# Destination insert matches *new* schema (incl. change_pct_* and price_*_ago)
 INS_RANKED = session.prepare(
-    f"INSERT INTO {TABLE_DEST} (bucket, market_cap_rank, id, symbol, name, category, "
-    f"price_usd, market_cap, volume_24h, circulating_supply, total_supply, last_updated) "
-    f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    f"INSERT INTO {TABLE_DEST} ("
+    f"  bucket, market_cap_rank, id, symbol, name, category, "
+    f"  price_usd, market_cap, volume_24h, "
+    f"  circulating_supply, total_supply, last_updated, "
+    f"  change_pct_1h, change_pct_24h, change_pct_7d, change_pct_30d, change_pct_1y, "
+    f"  price_1h_ago, price_24h_ago, price_7d_ago, price_30d_ago, price_1y_ago"
+    f") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
 )
 
 DEL_BUCKET = session.prepare(
     f"DELETE FROM {TABLE_DEST} WHERE bucket=?"
 )
 
-# Note: Cassandra cannot ORDER BY arbitrary columns; we scan and sort client-side.
+# Source select includes all fields we need
 SEL_SOURCE = SimpleStatement(
     f"SELECT id, symbol, name, market_cap_rank, price_usd, market_cap, volume_24h, "
-    f"circulating_supply, total_supply, last_updated "
+    f"circulating_supply, total_supply, last_updated, "
+    f"change_pct_1h, change_pct_24h, change_pct_7d, change_pct_30d, change_pct_1y, "
+    f"price_1h_ago, price_24h_ago, price_7d_ago, price_30d_ago, price_1y_ago "
     f"FROM {TABLE_SOURCE}",
     fetch_size=FETCH_SIZE
 )
@@ -139,7 +162,7 @@ def main():
     print(f"[{now_str()}] Deleting existing rows for bucket='{RANK_BUCKET}' in {TABLE_DEST} …")
     session.execute(DEL_BUCKET, [RANK_BUCKET], timeout=REQUEST_TIMEOUT_SEC)
 
-    batch = BatchStatement(consistency_level=ConsistencyLevel.QUORUM)
+    batch = BatchStatement(consistency_level=BATCH_CL)
     wrote = 0
 
     for r in top:
@@ -147,18 +170,45 @@ def main():
         sym   = getattr(r, "symbol", None)
         name  = getattr(r, "name", None)
         rank  = safe_rank(r)
-        price = float(getattr(r, "price_usd", 0.0) or 0.0)
-        mcap  = float(getattr(r, "market_cap", 0.0) or 0.0)
-        vol   = float(getattr(r, "volume_24h", 0.0) or 0.0)
-        circ  = float(getattr(r, "circulating_supply", 0.0) or 0.0) if getattr(r, "circulating_supply", None) is not None else None
-        tot   = float(getattr(r, "total_supply", 0.0) or 0.0) if getattr(r, "total_supply", None) is not None else None
+        price = getattr(r, "price_usd", None)
+        mcap  = getattr(r, "market_cap", None)
+        vol   = getattr(r, "volume_24h", None)
+        circ  = getattr(r, "circulating_supply", None)
+        tot   = getattr(r, "total_supply", None)
         lu    = getattr(r, "last_updated", None)
+
+        ch1h  = getattr(r, "change_pct_1h", None)
+        ch24h = getattr(r, "change_pct_24h", None)
+        ch7d  = getattr(r, "change_pct_7d", None)
+        ch30d = getattr(r, "change_pct_30d", None)
+        ch1y  = getattr(r, "change_pct_1y", None)
+
+        p1h   = getattr(r, "price_1h_ago", None)
+        p24h  = getattr(r, "price_24h_ago", None)
+        p7d   = getattr(r, "price_7d_ago", None)
+        p30d  = getattr(r, "price_30d_ago", None)
+        p1y   = getattr(r, "price_1y_ago", None)
 
         cat = category_for(id_to_cat, sym_to_cat, cid, sym)
 
         batch.add(INS_RANKED, [
             RANK_BUCKET, rank, cid, sym, name, cat,
-            price, mcap, vol, circ, tot, lu
+            float(price) if price is not None else None,
+            float(mcap) if mcap is not None else None,
+            float(vol) if vol is not None else None,
+            float(circ) if circ is not None else None,
+            float(tot) if tot is not None else None,
+            lu,
+            float(ch1h) if ch1h is not None else None,
+            float(ch24h) if ch24h is not None else None,
+            float(ch7d) if ch7d is not None else None,
+            float(ch30d) if ch30d is not None else None,
+            float(ch1y) if ch1y is not None else None,
+            float(p1h) if p1h is not None else None,
+            float(p24h) if p24h is not None else None,
+            float(p7d) if p7d is not None else None,
+            float(p30d) if p30d is not None else None,
+            float(p1y) if p1y is not None else None,
         ])
         wrote += 1
         if (wrote % BATCH_FLUSH_EVERY) == 0:
@@ -168,7 +218,7 @@ def main():
         session.execute(batch)
 
     print(f"[{now_str()}] Wrote rows={wrote} into {TABLE_DEST} for bucket='{RANK_BUCKET}' "
-          f"(source={TABLE_SOURCE})")
+          f"(source={TABLE_SOURCE}, CL={CONSISTENCY_NAME})")
 
 if __name__ == "__main__":
     try:
