@@ -1,10 +1,10 @@
-name: prices-candles
+name: gecko-prices-candles
 
 on:
   workflow_dispatch:
     inputs:
-      run_03: { description: "03_create_hourly_from_10m.py", required: false, default: "true" }
-      run_04: { description: "04_create_daily_from_10m.py", required: false, default: "true" }
+      run_03: { description: "DD_gck_create_hourly_from_10m.py", required: false, default: "true" }
+      run_04: { description: "EE_gck_create_daily_from_10m.py", required: false, default: "true" }
       TOP_N:  { description: "Override TOP_N", required: false, default: "" }
       VERBOSE_MODE: { description: "Verbose (0/1)", required: false, default: "0" }
 
@@ -12,7 +12,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: prices-candles-${{ github.ref }}
+  group: gecko-prices-candles-${{ github.ref }}
   cancel-in-progress: false   # let a candle run finish
 
 jobs:
@@ -62,7 +62,7 @@ jobs:
           FINALIZE_PREV: "1"
           PROGRESS_EVERY: "20"
           VERBOSE_MODE: ${{ github.event.inputs.VERBOSE_MODE || '0' }}
-        run: python prices/03_create_hourly_from_10m.py   # <-- updated
+        run: python prices/DD_gck_create_hourly_from_10m.py   # <-- updated
 
       - name: 04 Update/close daily from 10m
         if: ${{ github.event.inputs.run_04 == 'true' }}
@@ -78,4 +78,4 @@ jobs:
           SLOT_DELAY_SEC: "120"
           PROGRESS_EVERY: "20"
           VERBOSE_MODE: ${{ github.event.inputs.VERBOSE_MODE || '0' }}
-        run: python prices/04_create_daily_from_10m.py     # <-- updated
+        run: python prices/EE_gck_create_daily_from_10m.py     # <-- updated
