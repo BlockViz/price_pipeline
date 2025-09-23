@@ -122,8 +122,11 @@ try:
         f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS"
     )
 
+    # ── UPDATED to match schema: gecko_market_cap_10m_7d(category, ts, last_updated, market_cap, market_cap_rank, volume_24h)
     INS_MCAP_10M_UPSERT = s.prepare(
-        f"INSERT INTO {TABLE_MCAP_OUT} (category, ts, id, name, symbol, market_cap, market_cap_rank, volume_24h, last_updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        f"INSERT INTO {TABLE_MCAP_OUT} "
+        f"(category, ts, last_updated, market_cap, market_cap_rank, volume_24h) "
+        f"VALUES (?, ?, ?, ?, ?, ?)"
     )
 
     def main():
@@ -226,14 +229,11 @@ try:
             agg_written = 0
             for (slot_start, category), totals in sorted(slot_totals.items(), key=lambda kv: (kv[0][0], 0 if kv[0][1] == 'ALL' else 1, kv[0][1].lower())):
                 last_upd = totals.get('last_updated') or (slot_start + timedelta(minutes=SLOT_MINUTES) - timedelta(seconds=1))
-                cat_id = f"CATEGORY::{category}"
-                display_name = 'All Categories' if category == 'ALL' else category
-                symbol_val = 'ALL' if category == 'ALL' else category.upper().replace(' ', '_')
                 rank_value = 0 if category == 'ALL' else None
                 try:
                     s.execute(
                         INS_MCAP_10M_UPSERT,
-                        [category, slot_start, cat_id, display_name, symbol_val, totals['market_cap'], rank_value, totals['volume_24h'], last_upd],
+                        [category, slot_start, last_upd, totals['market_cap'], rank_value, totals['volume_24h']],
                         timeout=REQUEST_TIMEOUT
                     )
                     agg_written += 1

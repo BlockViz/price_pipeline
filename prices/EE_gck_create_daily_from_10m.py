@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# backend/prices/04_create_daily_from_10m.py
+# backend/prices/EE_create_daily_from_10m.py
 import os, time
 from datetime import datetime, timedelta, timezone, date
 import sys, pathlib
@@ -56,7 +56,7 @@ MIN_10M_POINTS_FOR_FINAL = int(os.getenv("MIN_10M_POINTS_FOR_FINAL", "2"))
 if not ASTRA_TOKEN:
     raise SystemExit("Missing ASTRA_TOKEN")
 
-def now_str(): 
+def now_str():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 def floor_10m(dt_utc: datetime) -> datetime:
@@ -133,9 +133,11 @@ INS_UPSERT = s.prepare(f"""
   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """)
 
+# ── UPDATED to match schema: gecko_market_cap_daily_contin(category, date, last_updated, market_cap, market_cap_rank, volume_24h)
 INS_MCAP_DAILY = s.prepare(f"""
-  INSERT INTO {TABLE_MCAP_DAILY} (category, date, id, name, symbol, market_cap, market_cap_rank, volume_24h, last_updated)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO {TABLE_MCAP_DAILY}
+    (category, date, last_updated, market_cap, market_cap_rank, volume_24h)
+  VALUES (?, ?, ?, ?, ?, ?)
 """)
 
 # ───────────────────────── Helpers ─────────────────────────
@@ -145,7 +147,7 @@ def compute_daily_from_10m(rows, allow_finalize: bool):
     Returns dict or None:
       { 'open','high','low','close','price_usd','market_cap','volume_24h',
         'market_cap_rank','circulating_supply','total_supply',
-        'last_updated','candle_source' }
+        'last_updated' }
     """
     prices, mcaps, vols = [], [], []
     ranks, circs, tots = [], [], []
@@ -326,6 +328,7 @@ def main():
             bump_day_total(yesterday, coin_category, mcap_total, vol_total, last_upd_val)
             bump_day_total(yesterday, 'ALL', mcap_total, vol_total, last_upd_val)
             ok = write_daily_row(c, yesterday, agg, candle_source="10m_final")
+            wrote += int(bool(ok))
             if not ok:
                 unchanged += 1
 
@@ -347,6 +350,7 @@ def main():
                 bump_day_total(today, coin_category, mcap_total, vol_total, last_upd_val)
                 bump_day_total(today, 'ALL', mcap_total, vol_total, last_upd_val)
                 ok = write_daily_row(c, today, agg, candle_source="10m_partial")
+                wrote += int(bool(ok))
                 if not ok:
                     unchanged += 1
             else:
@@ -382,6 +386,7 @@ def main():
                 bump_day_total(today, coin_category, mcap_total, vol_total, last_upd_val)
                 bump_day_total(today, 'ALL', mcap_total, vol_total, last_upd_val)
                 ok = write_daily_row(c, today, stub, candle_source=csrc)
+                wrote += int(bool(ok))
                 if not ok:
                     unchanged += 1
 
@@ -391,19 +396,19 @@ def main():
         for (day_key, category), totals in sorted(day_totals.items(), key=lambda kv: (kv[0][0], 0 if kv[0][1] == 'ALL' else 1, kv[0][1].lower())):
             day_end = day_bounds_utc(day_key)[1]
             last_upd = totals.get('last_updated') or (day_end - timedelta(seconds=1))
-            cat_id = f"CATEGORY::{category}"
-            display_name = 'All Categories' if category == 'ALL' else category
-            symbol_val = 'ALL' if category == 'ALL' else category.upper().replace(' ', '_')
             rank_value = 0 if category == 'ALL' else None
             try:
-                s.execute(INS_MCAP_DAILY, [category, day_key, cat_id, display_name, symbol_val, totals['market_cap'], rank_value, totals['volume_24h'], last_upd], timeout=REQUEST_TIMEOUT)
+                s.execute(
+                    INS_MCAP_DAILY,
+                    [category, day_key, last_upd, totals['market_cap'], rank_value, totals['volume_24h']],
+                    timeout=REQUEST_TIMEOUT
+                )
                 agg_written += 1
             except (WriteTimeout, OperationTimedOut, DriverException) as e:
                 print(f"[{now_str()}] [mcap-daily] failed for category='{category}' day={day_key}: {e}")
         print(f"[{now_str()}] [mcap-daily] rows_written={agg_written}")
     else:
         print(f"[{now_str()}] [mcap-daily] no aggregates captured (coins={len(coins)})")
-
 
     print(f"[{now_str()}] [daily-from-10m] wrote≈{wrote} unchanged≈{unchanged} errors={errors}")
 

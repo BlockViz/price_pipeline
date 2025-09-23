@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# prices/03_create_hourly_from_10m.py
+# prices/DD_create_hourly_from_10m.py
 import os, time
 from datetime import datetime, timedelta, timezone
 import sys, pathlib
@@ -155,8 +155,9 @@ def main():
     """)
 
     INS_MCAP_HOURLY = s.prepare(f"""
-      INSERT INTO {TABLE_MCAP_HOURLY} (category, ts, id, name, symbol, market_cap, market_cap_rank, volume_24h, last_updated)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO {TABLE_MCAP_HOURLY}
+        (category, ts, last_updated, market_cap, market_cap_rank, volume_24h)
+      VALUES (?, ?, ?, ?, ?, ?)
     """)
     print(f"[{now_str()}] Prepared in {time.time()-t0:.2f}s")
 
@@ -365,7 +366,10 @@ def main():
     if hour_totals:
         print(f"[{now_str()}] [mcap-hourly] writing {len(hour_totals)} aggregates into {TABLE_MCAP_HOURLY}")
         agg_written = 0
-        for (slot_start, category), totals in sorted(hour_totals.items(), key=lambda kv: (kv[0][0], 0 if kv[0][1] == 'ALL' else 1, kv[0][1].lower())):
+        for (slot_start, category), totals in sorted(
+            hour_totals.items(),
+            key=lambda kv: (kv[0][0], 0 if kv[0][1] == 'ALL' else 1, kv[0][1].lower())
+        ):
             last_upd = totals.get('last_updated') or (slot_start + timedelta(hours=1) - timedelta(seconds=1))
             cat_id = f"CATEGORY::{category}"
             display_name = 'All Categories' if category == 'ALL' else category
@@ -374,7 +378,15 @@ def main():
             try:
                 s.execute(
                     INS_MCAP_HOURLY,
-                    [category, slot_start, cat_id, display_name, symbol_val, totals['market_cap'], rank_value, totals['volume_24h'], last_upd],
+                    [
+                        category,
+                        slot_start,
+                        last_upd,
+                        totals['market_cap'],
+                        rank_value,
+                        totals['volume_24h'],
+                    ],
+                    
                     timeout=REQUEST_TIMEOUT
                 )
                 agg_written += 1

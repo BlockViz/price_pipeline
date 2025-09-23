@@ -38,8 +38,12 @@ KEYSPACE     = os.getenv("ASTRA_KEYSPACE", "default_keyspace")
 TABLE_SOURCE = os.getenv("TABLE_SOURCE", "gecko_prices_live")
 TABLE_DEST   = os.getenv("TABLE_DEST",   "gecko_prices_live_ranked")
 TABLE_CATS   = os.getenv("TABLE_CATS",   "asset_categories")
-TABLE_MCAP_LIVE        = os.getenv("TABLE_GECKO_MCAP_LIVE", "gecko_market_cap_live")
-TABLE_MCAP_LIVE_RANKED = os.getenv("TABLE_GECKO_MCAP_LIVE_RANKED", "gecko_market_cap_live_ranked")
+
+# Market-cap aggregate tables (match provided schemas)
+TABLE_MCAP_LIVE        = os.getenv("TABLE_GECKO_MCAP_LIVE", "gecko_market_cap_live")               # (category PK, last_updated, market_cap, market_cap_rank, volume_24h)
+TABLE_MCAP_LIVE_RANKED = os.getenv("TABLE_GECKO_MCAP_LIVE_RANKED", "gecko_market_cap_live_ranked") # (category, market_cap_rank) PK; plus last_updated, market_cap, volume_24h
+
+# kept for compatibility/logging; not used in schema anymore
 MCAP_RANK_BUCKET       = os.getenv("GECKO_MCAP_BUCKET", "categories")
 
 RANK_BUCKET  = os.getenv("RANK_BUCKET", "all")
@@ -119,7 +123,7 @@ def category_for(id_to_cat, sym_to_cat, cid: str | None, sym: str | None) -> str
     return "Other"
 
 # ───────────────────────── I/O statements ─────────────────────────
-# Destination insert matches *new* schema (incl. change_pct_* and price_*_ago)
+# Destination insert for prices_live_ranked (unchanged)
 INS_RANKED = session.prepare(
     f"INSERT INTO {TABLE_DEST} ("
     f"  bucket, market_cap_rank, id, symbol, name, category, "
@@ -130,16 +134,24 @@ INS_RANKED = session.prepare(
     f") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
 )
 
+# ── UPDATED to match schema: gecko_market_cap_live(category PK, last_updated, market_cap, market_cap_rank, volume_24h)
 INS_MCAP_LIVE_UPSERT = session.prepare(
-    f"INSERT INTO {TABLE_MCAP_LIVE} (category,id,name,symbol,market_cap,market_cap_rank,volume_24h,last_updated) VALUES (?,?,?,?,?,?,?,?)"
-)
-DEL_MCAP_RANKED_BUCKET = session.prepare(
-    f"DELETE FROM {TABLE_MCAP_LIVE_RANKED} WHERE bucket=?"
-)
-INS_MCAP_RANKED = session.prepare(
-    f"INSERT INTO {TABLE_MCAP_LIVE_RANKED} (bucket,market_cap_rank,category,id,name,symbol,market_cap,volume_24h,last_updated) VALUES (?,?,?,?,?,?,?,?,?)"
+    f"INSERT INTO {TABLE_MCAP_LIVE} "
+    f"(category, last_updated, market_cap, market_cap_rank, volume_24h) "
+    f"VALUES (?,?,?,?,?)"
 )
 
+# ── UPDATED to match schema: gecko_market_cap_live_ranked(category, market_cap_rank) PK
+DEL_MCAP_RANKED_BY_CATEGORY = session.prepare(
+    f"DELETE FROM {TABLE_MCAP_LIVE_RANKED} WHERE category=?"
+)
+INS_MCAP_RANKED = session.prepare(
+    f"INSERT INTO {TABLE_MCAP_LIVE_RANKED} "
+    f"(category, market_cap_rank, last_updated, market_cap, volume_24h) "
+    f"VALUES (?,?,?,?,?)"
+)
+
+# prices_live_ranked maintenance (unchanged)
 DEL_BUCKET = session.prepare(
     f"DELETE FROM {TABLE_DEST} WHERE bucket=?"
 )
@@ -179,7 +191,7 @@ def main():
     rows.sort(key=safe_rank)
     top = rows[:RANK_TOP_N]
 
-    # Refresh the destination bucket
+    # Refresh the destination bucket for prices_live_ranked
     print(f"[{now_str()}] Deleting existing rows for bucket='{RANK_BUCKET}' in {TABLE_DEST} …")
     session.execute(DEL_BUCKET, [RANK_BUCKET], timeout=REQUEST_TIMEOUT_SEC)
 
@@ -243,12 +255,14 @@ def main():
     if len(batch):
         session.execute(batch)
 
+    # ───────────────── Market-cap aggregates ─────────────────
     if category_totals:
         totals_items = []
         for cat_name, totals in category_totals.items():
             last_upd = totals.get("last_updated") or datetime.utcnow()
             totals_items.append((cat_name, float(totals["market_cap"]), float(totals["volume_24h"]), last_upd))
 
+        # sort for deterministic writes
         totals_items.sort(key=lambda entry: (0 if entry[0] == "ALL" else 1, entry[0].lower()))
         ranked_entries = [entry for entry in totals_items if entry[0] != "ALL"]
         ranked_entries.sort(key=lambda entry: entry[1], reverse=True)
@@ -256,16 +270,14 @@ def main():
         if "ALL" in category_totals:
             ranks["ALL"] = 0
 
+        # Live (per-category) upserts
         print(f"[{now_str()}] [mcap-live] writing {len(totals_items)} category aggregates into {TABLE_MCAP_LIVE}")
         live_written = 0
         for cat_name, total_mcap, total_vol, last_upd in totals_items:
-            cat_id = f"CATEGORY::{cat_name}"
-            display_name = "All Categories" if cat_name == "ALL" else cat_name
-            symbol_val = "ALL" if cat_name == "ALL" else cat_name.upper().replace(' ', '_')
             try:
                 session.execute(
                     INS_MCAP_LIVE_UPSERT,
-                    [cat_name, cat_id, display_name, symbol_val, total_mcap, ranks.get(cat_name), total_vol, last_upd],
+                    [cat_name, last_upd, total_mcap, ranks.get(cat_name), total_vol],
                     timeout=REQUEST_TIMEOUT_SEC,
                 )
                 live_written += 1
@@ -274,37 +286,36 @@ def main():
 
         print(f"[{now_str()}] [mcap-live] rows_written={live_written}")
 
-        try:
-            session.execute(DEL_MCAP_RANKED_BUCKET, [MCAP_RANK_BUCKET], timeout=REQUEST_TIMEOUT_SEC)
-        except (WriteTimeout, OperationTimedOut, DriverException) as e:
-            print(f"[{now_str()}] [mcap-ranked] failed to clear bucket='{MCAP_RANK_BUCKET}': {e}")
-        else:
-            ranked_payload = []
-            all_entry = next((entry for entry in totals_items if entry[0] == "ALL"), None)
-            if all_entry:
-                ranked_payload.append(("ALL", 0, all_entry[1], all_entry[2], all_entry[3]))
-            ranked_payload.extend(
-                [
-                    (cat_name, ranks[cat_name], total_mcap, total_vol, last_upd)
-                    for cat_name, total_mcap, total_vol, last_upd in ranked_entries
-                ]
-            )
+        # Ranked table: clear per-category partitions then insert fresh ranks
+        categories_to_refresh = [cat for cat, *_ in totals_items]  # includes "ALL"
+        for cat in categories_to_refresh:
+            try:
+                session.execute(DEL_MCAP_RANKED_BY_CATEGORY, [cat], timeout=REQUEST_TIMEOUT_SEC)
+            except (WriteTimeout, OperationTimedOut, DriverException) as e:
+                print(f"[{now_str()}] [mcap-ranked] failed to clear category='{cat}': {e}")
 
-            wrote_ranked = 0
-            for cat_name, rank_value, total_mcap, total_vol, last_upd in ranked_payload:
-                cat_id = f"CATEGORY::{cat_name}"
-                display_name = "All Categories" if cat_name == "ALL" else cat_name
-                symbol_val = "ALL" if cat_name == "ALL" else cat_name.upper().replace(' ', '_')
-                try:
-                    session.execute(
-                        INS_MCAP_RANKED,
-                        [MCAP_RANK_BUCKET, rank_value, cat_name, cat_id, display_name, symbol_val, total_mcap, total_vol, last_upd],
-                        timeout=REQUEST_TIMEOUT_SEC,
-                    )
-                    wrote_ranked += 1
-                except (WriteTimeout, OperationTimedOut, DriverException) as e:
-                    print(f"[{now_str()}] [mcap-ranked] failed for category='{cat_name}' rank={rank_value}: {e}")
-            print(f"[{now_str()}] [mcap-ranked] bucket='{MCAP_RANK_BUCKET}' rows_written={wrote_ranked}")
+        ranked_payload = []
+        # Include ALL at rank 0 if present
+        all_entry = next((entry for entry in totals_items if entry[0] == "ALL"), None)
+        if all_entry:
+            ranked_payload.append(("ALL", 0, all_entry[3], all_entry[1], all_entry[2]))  # (cat, rank, last_upd, mcap, vol)
+        # Then ranked categories
+        for cat_name, total_mcap, total_vol, last_upd in ranked_entries:
+            ranked_payload.append((cat_name, ranks[cat_name], last_upd, total_mcap, total_vol))
+
+        wrote_ranked = 0
+        for cat_name, rank_value, last_upd, total_mcap, total_vol in ranked_payload:
+            try:
+                session.execute(
+                    INS_MCAP_RANKED,
+                    [cat_name, rank_value, last_upd, total_mcap, total_vol],
+                    timeout=REQUEST_TIMEOUT_SEC,
+                )
+                wrote_ranked += 1
+            except (WriteTimeout, OperationTimedOut, DriverException) as e:
+                print(f"[{now_str()}] [mcap-ranked] failed for category='{cat_name}' rank={rank_value}: {e}")
+        print(f"[{now_str()}] [mcap-ranked] rows_written={wrote_ranked} (bucket env '{MCAP_RANK_BUCKET}' ignored)")
+
     else:
         print(f"[{now_str()}] [mcap-live] no category aggregates computed (rows=0)")
 
