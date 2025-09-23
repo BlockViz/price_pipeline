@@ -110,6 +110,10 @@ def main():
     now = datetime.now(timezone.utc)
     up_count = 0
     none_symbol = 0
+    
+    ## clear table first
+    log("Truncating table asset_categories…")
+    s.execute(f"TRUNCATE {KEYSPACE}.asset_categories")
 
     for rec in records:
         cid = rec["id"]

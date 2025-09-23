@@ -48,6 +48,7 @@ VERBOSE_MODE        = os.getenv("VERBOSE_MODE", "0") == "1"       # extra per-co
 TEN_MIN_TABLE       = os.getenv("TEN_MIN_TABLE", "gecko_prices_10m_7d")
 DAILY_TABLE         = os.getenv("DAILY_TABLE", "gecko_candles_daily_contin")
 TABLE_LIVE          = os.getenv("TABLE_LIVE", "gecko_prices_live")
+TABLE_MCAP_DAILY    = os.getenv("TABLE_MCAP_DAILY", "gecko_market_cap_daily_contin")
 
 # require ≥2 ten-minute points to finalize a closed day
 MIN_10M_POINTS_FOR_FINAL = int(os.getenv("MIN_10M_POINTS_FOR_FINAL", "2"))
@@ -96,7 +97,7 @@ print(f"[{now_str()}] Connected.")
 
 # ───────────────────────── Statements ─────────────────────────
 SEL_LIVE = SimpleStatement(f"""
-  SELECT id, symbol, name, market_cap_rank, price_usd, market_cap, volume_24h, last_updated
+  SELECT id, symbol, name, market_cap_rank, price_usd, market_cap, volume_24h, last_updated, category
   FROM {TABLE_LIVE}
 """, fetch_size=FETCH_SIZE)
 
@@ -130,6 +131,11 @@ INS_UPSERT = s.prepare(f"""
      market_cap_rank, circulating_supply, total_supply,
      candle_source, last_updated)
   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+""")
+
+INS_MCAP_DAILY = s.prepare(f"""
+  INSERT INTO {TABLE_MCAP_DAILY} (category, date, id, name, symbol, market_cap, market_cap_rank, volume_24h, last_updated)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 """)
 
 # ───────────────────────── Helpers ─────────────────────────
@@ -285,9 +291,20 @@ def main():
     coins = coins[:TOP_N]
     print(f"[{now_str()}] Processing top {len(coins)} coins (TOP_N={TOP_N})")
 
+    day_totals = {}
+
+    def bump_day_total(day_key, category, mcap_value, vol_value, last_upd) -> None:
+        key = (day_key, category)
+        entry = day_totals.setdefault(key, {"market_cap": 0.0, "volume_24h": 0.0, "last_updated": last_upd})
+        entry["market_cap"] += mcap_value
+        entry["volume_24h"] += vol_value
+        if last_upd and (entry["last_updated"] is None or last_upd > entry["last_updated"]):
+            entry["last_updated"] = last_upd
+
     wrote = errors = unchanged = 0
 
     for idx, c in enumerate(coins, 1):
+        coin_category = (getattr(c, 'category', None) or 'Other').strip() or 'Other'
         if idx == 1 or idx % PROGRESS_EVERY == 0 or idx == len(coins):
             print(f"[{now_str()}] → Coin {idx}/{len(coins)}: {getattr(c,'symbol','?')} "
                   f"({getattr(c,'id','?')}) rank={getattr(c,'market_cap_rank','?')}")
@@ -303,6 +320,11 @@ def main():
 
         agg = compute_daily_from_10m(pts, allow_finalize=True)
         if agg:
+            mcap_total = sanitize_num(agg.get("market_cap"), 0.0)
+            vol_total = sanitize_num(agg.get("volume_24h"), 0.0)
+            last_upd_val = agg.get("last_updated") or (day_bounds_utc(yesterday)[1] - timedelta(seconds=1))
+            bump_day_total(yesterday, coin_category, mcap_total, vol_total, last_upd_val)
+            bump_day_total(yesterday, 'ALL', mcap_total, vol_total, last_upd_val)
             ok = write_daily_row(c, yesterday, agg, candle_source="10m_final")
             if not ok:
                 unchanged += 1
@@ -319,6 +341,11 @@ def main():
             agg = compute_daily_from_10m(pts, allow_finalize=False)
 
             if agg:
+                mcap_total = sanitize_num(agg.get("market_cap"), 0.0)
+                vol_total = sanitize_num(agg.get("volume_24h"), 0.0)
+                last_upd_val = agg.get("last_updated") or (day_bounds_utc(today)[1] - timedelta(seconds=1))
+                bump_day_total(today, coin_category, mcap_total, vol_total, last_upd_val)
+                bump_day_total(today, 'ALL', mcap_total, vol_total, last_upd_val)
                 ok = write_daily_row(c, today, agg, candle_source="10m_partial")
                 if not ok:
                     unchanged += 1
@@ -349,9 +376,34 @@ def main():
                     "total_supply": None,
                     "last_updated": getattr(c, "last_updated", None),
                 }
+                mcap_total = sanitize_num(stub.get("market_cap"), 0.0)
+                vol_total = sanitize_num(stub.get("volume_24h"), 0.0)
+                last_upd_val = stub.get("last_updated") or (day_bounds_utc(today)[1] - timedelta(seconds=1))
+                bump_day_total(today, coin_category, mcap_total, vol_total, last_upd_val)
+                bump_day_total(today, 'ALL', mcap_total, vol_total, last_upd_val)
                 ok = write_daily_row(c, today, stub, candle_source=csrc)
                 if not ok:
                     unchanged += 1
+
+    if day_totals:
+        print(f"[{now_str()}] [mcap-daily] writing {len(day_totals)} aggregates into {TABLE_MCAP_DAILY}")
+        agg_written = 0
+        for (day_key, category), totals in sorted(day_totals.items(), key=lambda kv: (kv[0][0], 0 if kv[0][1] == 'ALL' else 1, kv[0][1].lower())):
+            day_end = day_bounds_utc(day_key)[1]
+            last_upd = totals.get('last_updated') or (day_end - timedelta(seconds=1))
+            cat_id = f"CATEGORY::{category}"
+            display_name = 'All Categories' if category == 'ALL' else category
+            symbol_val = 'ALL' if category == 'ALL' else category.upper().replace(' ', '_')
+            rank_value = 0 if category == 'ALL' else None
+            try:
+                s.execute(INS_MCAP_DAILY, [category, day_key, cat_id, display_name, symbol_val, totals['market_cap'], rank_value, totals['volume_24h'], last_upd], timeout=REQUEST_TIMEOUT)
+                agg_written += 1
+            except (WriteTimeout, OperationTimedOut, DriverException) as e:
+                print(f"[{now_str()}] [mcap-daily] failed for category='{category}' day={day_key}: {e}")
+        print(f"[{now_str()}] [mcap-daily] rows_written={agg_written}")
+    else:
+        print(f"[{now_str()}] [mcap-daily] no aggregates captured (coins={len(coins)})")
+
 
     print(f"[{now_str()}] [daily-from-10m] wrote≈{wrote} unchanged≈{unchanged} errors={errors}")
 

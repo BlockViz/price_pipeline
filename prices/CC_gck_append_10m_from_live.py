@@ -50,6 +50,7 @@ ALLOW_CARRY_MAX_SLOTS = int(os.getenv("ALLOW_CARRY_MAX_SLOTS", "1"))
 TABLE_LATEST    = os.getenv("TABLE_LATEST", "gecko_prices_live")
 TABLE_ROLLING   = os.getenv("TABLE_ROLLING", "gecko_prices_live_rolling")
 TABLE_OUT       = os.getenv("TABLE_OUT", "gecko_prices_10m_7d")
+TABLE_MCAP_OUT  = os.getenv("TABLE_MCAP_10M", "gecko_market_cap_10m_7d")
 
 if not ASTRA_TOKEN:
     raise SystemExit("Missing ASTRA_TOKEN")
@@ -93,7 +94,7 @@ try:
 
     # gecko live table uses market_cap_rank
     SEL_COINS = SimpleStatement(
-        f"SELECT id, symbol, name, market_cap_rank FROM {TABLE_LATEST}",
+        f"SELECT id, symbol, name, market_cap_rank, category FROM {TABLE_LATEST}",
         fetch_size=FETCH_SIZE
     )
 
@@ -121,6 +122,10 @@ try:
         f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS"
     )
 
+    INS_MCAP_10M_UPSERT = s.prepare(
+        f"INSERT INTO {TABLE_MCAP_OUT} (category, ts, id, name, symbol, market_cap, market_cap_rank, volume_24h, last_updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    )
+
     def main():
         coins_rows = list(s.execute(SEL_COINS, timeout=REQUEST_TIMEOUT))
         # keep only ranked coins with positive rank
@@ -133,6 +138,16 @@ try:
         if slots:
             print(f"[{now_str()}] Slots (oldest→newest): {slots[0][0]} .. {slots[-1][1]} (count={len(slots)})")
 
+        slot_totals = {}
+
+        def bump_slot_total(slot_start, category, mcap_value, vol_value, last_upd) -> None:
+            key = (slot_start, category)
+            entry = slot_totals.setdefault(key, {"market_cap": 0.0, "volume_24h": 0.0, "last_updated": last_upd})
+            entry["market_cap"] += mcap_value
+            entry["volume_24h"] += vol_value
+            if last_upd and (entry["last_updated"] is None or last_upd > entry["last_updated"]):
+                entry["last_updated"] = last_upd
+
         wrote = skipped = 0
 
         for ci, c in enumerate(coins, 1):
@@ -140,6 +155,7 @@ try:
             name = getattr(c, "name", None)
             mkr = getattr(c, "market_cap_rank", None)
             print(f"[{now_str()}] → [{ci}/{len(coins)}] {sym} ({c.id}) rank={mkr}")
+            coin_category = (getattr(c, 'category', None) or 'Other').strip() or 'Other'
             carry_used = 0
 
             for si, (start, end) in enumerate(slots, 1):
@@ -188,11 +204,14 @@ try:
                 slot_last_upd = end - timedelta(seconds=1)
 
                 try:
-                    applied = s.execute(
+                    result = s.execute(
                         INS_10M_IF_NOT_EXISTS_PS,
                         [c.id, start, sym, name, price, mcap, vol, rank, circ, totl, slot_last_upd],
                         timeout=REQUEST_TIMEOUT
-                    ).one().applied
+                    ).one()
+                    applied = bool(getattr(result, 'applied', True)) if result is not None else True
+                    bump_slot_total(start, coin_category, mcap, vol, slot_last_upd)
+                    bump_slot_total(start, 'ALL', mcap, vol, slot_last_upd)
                     print(f"        insert {'applied' if applied else 'skipped'} "
                           f"({source}, price={price}, mcap={mcap}, vol={vol}, rank={rank}, circ={circ}, totl={totl}, last_upd={slot_last_upd})")
                     if applied: wrote += 1
@@ -201,6 +220,28 @@ try:
                     print(f"        [TIMEOUT] insert {sym} {start}: {e} (skip)"); skipped += 1
                 except DriverException as e:
                     print(f"        [ERROR] insert {sym} {start}: {e} (skip)"); skipped += 1
+
+        if slot_totals:
+            print(f"[{now_str()}] [mcap-10m] writing {len(slot_totals)} aggregates into {TABLE_MCAP_OUT}")
+            agg_written = 0
+            for (slot_start, category), totals in sorted(slot_totals.items(), key=lambda kv: (kv[0][0], 0 if kv[0][1] == 'ALL' else 1, kv[0][1].lower())):
+                last_upd = totals.get('last_updated') or (slot_start + timedelta(minutes=SLOT_MINUTES) - timedelta(seconds=1))
+                cat_id = f"CATEGORY::{category}"
+                display_name = 'All Categories' if category == 'ALL' else category
+                symbol_val = 'ALL' if category == 'ALL' else category.upper().replace(' ', '_')
+                rank_value = 0 if category == 'ALL' else None
+                try:
+                    s.execute(
+                        INS_MCAP_10M_UPSERT,
+                        [category, slot_start, cat_id, display_name, symbol_val, totals['market_cap'], rank_value, totals['volume_24h'], last_upd],
+                        timeout=REQUEST_TIMEOUT
+                    )
+                    agg_written += 1
+                except (WriteTimeout, OperationTimedOut, DriverException) as e:
+                    print(f"        [mcap-10m] insert failed for category='{category}' slot={slot_start}: {e}")
+            print(f"[{now_str()}] [mcap-10m] rows_written={agg_written}")
+        else:
+            print(f"[{now_str()}] [mcap-10m] no aggregates captured (coins={len(coins)})")
 
         print(f"[{now_str()}] [10m] wrote={wrote} skipped={skipped}")
 

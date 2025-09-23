@@ -51,6 +51,7 @@ MIN_10M_POINTS_FOR_FINAL = int(os.getenv("MIN_10M_POINTS_FOR_FINAL", "2"))  # re
 TEN_MIN_TABLE       = os.getenv("TEN_MIN_TABLE", "gecko_prices_10m_7d")
 HOURLY_TABLE        = os.getenv("HOURLY_TABLE", "gecko_candles_hourly_30d")
 TABLE_LIVE          = os.getenv("TABLE_LIVE", "gecko_prices_live")           # for coin list
+TABLE_MCAP_HOURLY   = os.getenv("TABLE_MCAP_HOURLY", "gecko_market_cap_hourly_30d")
 
 if not ASTRA_TOKEN:
     raise SystemExit("Missing ASTRA_TOKEN")
@@ -96,7 +97,7 @@ print(f"[{now_str()}] Connected.")
 
 # Live coins (use CoinGecko rank field)
 SEL_LIVE = SimpleStatement(
-    f"SELECT id, symbol, name, market_cap_rank FROM {TABLE_LIVE}",
+    f"SELECT id, symbol, name, market_cap_rank, category FROM {TABLE_LIVE}",
     fetch_size=FETCH_SIZE
 )
 
@@ -152,6 +153,11 @@ def main():
          candle_source, last_updated)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """)
+
+    INS_MCAP_HOURLY = s.prepare(f"""
+      INSERT INTO {TABLE_MCAP_HOURLY} (category, ts, id, name, symbol, market_cap, market_cap_rank, volume_24h, last_updated)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """)
     print(f"[{now_str()}] Prepared in {time.time()-t0:.2f}s")
 
     # Plan windows
@@ -173,11 +179,23 @@ def main():
     coins = coins[:TOP_N]
     print(f"[{now_str()}] Processing top {len(coins)} coins (TOP_N={TOP_N})")
 
+    hour_totals = {}
+
+    def bump_hour_total(slot_start, category, mcap_value, vol_value, last_upd) -> None:
+        key = (slot_start, category)
+        entry = hour_totals.setdefault(key, {"market_cap": 0.0, "volume_24h": 0.0, "last_updated": last_upd})
+        entry["market_cap"] += mcap_value
+        entry["volume_24h"] += vol_value
+        if last_upd and (entry["last_updated"] is None or last_upd > entry["last_updated"]):
+            entry["last_updated"] = last_upd
+
     wrote = skipped = empty = errors = finalized_skips = unchanged_skips = 0
 
     for ci, c in enumerate(coins, 1):
         if ci == 1 or ci % PROGRESS_EVERY == 0 or ci == len(coins):
             print(f"[{now_str()}] → Coin {ci}/{len(coins)}: {getattr(c,'symbol','?')} ({getattr(c,'id','?')}) r={getattr(c,'market_cap_rank','?')}")
+
+        coin_category = (getattr(c, 'category', None) or 'Other').strip() or 'Other'
 
         for (start, end, is_final, label) in windows:
             # Fetch 10m points within the hour window
@@ -333,6 +351,8 @@ def main():
                      candle_source, last_upd],
                     timeout=REQUEST_TIMEOUT
                 )
+                bump_hour_total(start, coin_category, mcap, vol, last_upd)
+                bump_hour_total(start, 'ALL', mcap, vol, last_upd)
                 if VERBOSE_MODE:
                     print(f"[{now_str()}]    UPSERT {c.symbol} {start} ({candle_source}) "
                           f"O={o} H={h} L={l} C={cl} M={mcap} V={vol} R={rank} CS={circ} TS={tot}")
@@ -341,6 +361,28 @@ def main():
                 errors += 1
                 print(f"[{now_str()}] [WRITE-ERR] {c.symbol} {start}: {e}")
                 skipped += 1
+
+    if hour_totals:
+        print(f"[{now_str()}] [mcap-hourly] writing {len(hour_totals)} aggregates into {TABLE_MCAP_HOURLY}")
+        agg_written = 0
+        for (slot_start, category), totals in sorted(hour_totals.items(), key=lambda kv: (kv[0][0], 0 if kv[0][1] == 'ALL' else 1, kv[0][1].lower())):
+            last_upd = totals.get('last_updated') or (slot_start + timedelta(hours=1) - timedelta(seconds=1))
+            cat_id = f"CATEGORY::{category}"
+            display_name = 'All Categories' if category == 'ALL' else category
+            symbol_val = 'ALL' if category == 'ALL' else category.upper().replace(' ', '_')
+            rank_value = 0 if category == 'ALL' else None
+            try:
+                s.execute(
+                    INS_MCAP_HOURLY,
+                    [category, slot_start, cat_id, display_name, symbol_val, totals['market_cap'], rank_value, totals['volume_24h'], last_upd],
+                    timeout=REQUEST_TIMEOUT
+                )
+                agg_written += 1
+            except (WriteTimeout, OperationTimedOut, DriverException) as e:
+                print(f"[{now_str()}] [mcap-hourly] failed for category='{category}' slot={slot_start}: {e}")
+        print(f"[{now_str()}] [mcap-hourly] rows_written={agg_written}")
+    else:
+        print(f"[{now_str()}] [mcap-hourly] no aggregates captured (coins={len(coins)})")
 
     print(f"[{now_str()}] [hourly-from-10m] wrote={wrote} skipped={skipped} empty={empty} "
           f"errors={errors} already_final_identical={finalized_skips} partial_unchanged_skips={unchanged_skips}")

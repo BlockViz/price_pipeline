@@ -3,40 +3,40 @@ bitcoin,BTC,Layer 1s
 ethereum,ETH,Layer 1s
 ripple,XRP,Payments
 mantle-bridged-usdt-mantle,USDT,Stablecoins
-binancecoin,BNB,Exchange & CeFi Tokens
+binancecoin,BNB,Exchange Tokens
 solana,SOL,Layer 1s
 binance-bridged-usdc-bnb-smart-chain,USDC,Stablecoins
-staked-ether,STETH,Liquid Staking
+staked-ether,STETH,Staked or Wrapped
 dogecoin,DOGE,Memecoins
 cardano,ADA,Layer 1s
 tron,TRX,Payments
-wrapped-steth,WSTETH,Liquid Staking
+wrapped-steth,WSTETH,Staked or Wrapped
 polygon-pos-bridged-weth-polygon-pos,WETH,Decentralized Finance
 hyperliquid,HYPE,Decentralized Finance
 arbitrum-bridged-wbtc-arbitrum-one,WBTC,Decentralized Finance
 chainlink,LINK,"Data, Oracles & Storage"
-wrapped-eeth,WEETH,Decentralized Finance
+wrapped-eeth,WEETH,Staked or Wrapped
 sui,SUI,Layer 1s
 bitcoin-cash,BCH,Payments
 stellar,XLM,Payments
-okb,OKB,Exchange & CeFi Tokens
+okb,OKB,Exchange Tokens
 avalanche-2,AVAX,Layer 1s
 hedera-hashgraph,HBAR,Layer 1s
-leo-token,LEO,Exchange & CeFi Tokens
+leo-token,LEO,Exchange Tokens
 litecoin,LTC,Payments
 bitcoin-avalanche-bridged-btc-b,BTC.B,Decentralized Finance
 the-open-network,TON,Layer 1s
 usds,USDS,Stablecoins
 shiba-inu,SHIB,Memecoins
-crypto-com-chain,CRO,Exchange & CeFi Tokens
-whitebit,WBT,Exchange & CeFi Tokens
+crypto-com-chain,CRO,Exchange Tokens
+whitebit,WBT,Exchange Tokens
 polkadot,DOT,Layer 1s
-bitget-token,BGB,Exchange & CeFi Tokens
+bitget-token,BGB,Exchange Tokens
 uniswap,UNI,Decentralized Finance
 ethena-usde,USDE,Stablecoins
-coinbase-wrapped-btc,CBBTC,Decentralized Finance
+coinbase-wrapped-btc,CBBTC,Staked or Wrapped
 monero,XMR,Layer 1s
-ethena-staked-usde,SUSDE,Stablecoins
+ethena-staked-usde,SUSDE,Staked or Wrapped
 ethena,ENA,Decentralized Finance
 aave,AAVE,Decentralized Finance
 world-liberty-financial,WLFI,Decentralized Finance
@@ -54,44 +54,44 @@ pi-network,PI,Decentralized Finance
 polygon-pos-bridged-weth-polygon-pos,WETH,Decentralized Finance
 arbitrum,ARB,Layer 2s & Scaling
 internet-computer,ICP,Layer 1s
-jito-staked-sol,JITOSOL,Decentralized Finance
+jito-staked-sol,JITOSOL,Staked or Wrapped
 polygon-ecosystem-token,POL,Decentralized Finance
 story-2,IP,Decentralized Finance
 kaspa,KAS,Payments
-rocket-pool-eth,RETH,Liquid Staking
+rocket-pool-eth,RETH,Staked or Wrapped
 usd1-wlfi,USD1,Stablecoins
 vechain,VET,Layer 1s
 algorand,ALGO,Layer 1s
-kelp-dao-restaked-eth,RSETH,Liquid Staking
-gatechain-token,GT,Exchange & CeFi Tokens
+kelp-dao-restaked-eth,RSETH,Staked or Wrapped
+gatechain-token,GT,Exchange Tokens
 fasttoken,FTN,Decentralized Finance
 jupiter-perpetuals-liquidity-provider-token,JLP,Decentralized Finance
-pudgy-penguins,PENGU,"Consumer (e.g. Gaming, NFTs)"
-kucoin-shares,KCS,Exchange & CeFi Tokens
+pudgy-penguins,PENGU,Consumer Tokens
+kucoin-shares,KCS,Exchange Tokens
 render-token,RENDER,Decentralized Finance
 worldcoin-wld,WLD,"Data, Oracles & Storage"
-mantle-staked-ether,METH,Decentralized Finance
+mantle-staked-ether,METH,Staked or Wrapped
 sei-network,SEI,Layer 1s
 cosmos,ATOM,Layer 1s
 sky,SKY,Decentralized Finance
 bfusd,BFUSD,Decentralized Finance
 official-trump,TRUMP,Memecoins
 pump-fun,PUMP,Memecoins
-liquid-staked-ethereum,LSETH,Liquid Staking
+liquid-staked-ethereum,LSETH,Staked or Wrapped
 fetch-ai,FET,"Data, Oracles & Storage"
 filecoin,FIL,"Data, Oracles & Storage"
-binance-staked-sol,BNSOL,Decentralized Finance
+binance-staked-sol,BNSOL,Staked or Wrapped
 bonk,BONK,Memecoins
-lombard-staked-btc,LBTC,Decentralized Finance
+lombard-staked-btc,LBTC,Staked or Wrapped
 jupiter-exchange-solana,JUP,Decentralized Finance
 flare-networks,FLR,Decentralized Finance
 usdtb,USDTB,Stablecoins
 first-digital-usd,FDUSD,Stablecoins
 four,FORM,Decentralized Finance
-renzo-restaked-eth,EZETH,Liquid Staking
+renzo-restaked-eth,EZETH,Staked or Wrapped
 wbnb,WBNB,Decentralized Finance
 optimism,OP,Layer 2s & Scaling
-jupiter-staked-sol,JUPSOL,Decentralized Finance
+jupiter-staked-sol,JUPSOL,Staked or Wrapped
 injective-protocol,INJ,Decentralized Finance
 quant-network,QNT,"Data, Oracles & Storage"
 falcon-finance,USDF,Stablecoins
@@ -114,17 +114,17 @@ floki,FLOKI,Memecoins
 tether-gold,XAUT,RWA & Tokenization
 the-graph,GRT,"Data, Oracles & Storage"
 conflux-token,CFX,Layer 1s
-nexo,NEXO,Exchange & CeFi Tokens
+nexo,NEXO,Exchange Tokens
 pancakeswap-token,CAKE,Decentralized Finance
 dogwifcoin,WIF,Memecoins
-ethereum-name-service,ENS,"Consumer (e.g. Gaming, NFTs)"
-theta-token,THETA,"Consumer (e.g. Gaming, NFTs)"
+ethereum-name-service,ENS,Consumer Tokens
+theta-token,THETA,Consumer Tokens
 pendle,PENDLE,Decentralized Finance
 fartcoin,FARTCOIN,Memecoins
 tezos,XTZ,Layer 1s
 vaulta,A,Decentralized Finance
 virtual-protocol,VIRTUAL,Decentralized Finance
-the-sandbox,SAND,"Consumer (e.g. Gaming, NFTs)"
+the-sandbox,SAND,Consumer Tokens
 pax-gold,PAXG,RWA & Tokenization
 jasmycoin,JASMY,"Data, Oracles & Storage"
 tbtc,TBTC,Decentralized Finance
@@ -133,10 +133,10 @@ zcash,ZEC,Layer 1s
 flow,FLOW,Decentralized Finance
 newton-project,AB,Decentralized Finance
 stader-ethx,ETHX,Decentralized Finance
-decentraland,MANA,"Consumer (e.g. Gaming, NFTs)"
+decentraland,MANA,Consumer Tokens
 bittorrent,BTT,"Data, Oracles & Storage"
-coinbase-wrapped-staked-eth,CBETH,Liquid Staking
-gala,GALA,"Consumer (e.g. Gaming, NFTs)"
+coinbase-wrapped-staked-eth,CBETH,Staked or Wrapped
+gala,GALA,Consumer Tokens
 syrup,SYRUP,Decentralized Finance
 build-on,B,Decentralized Finance
 sweth,SWETH,Decentralized Finance
@@ -167,7 +167,7 @@ keeta,KTA,Decentralized Finance
 aethir,ATH,Decentralized Finance
 instadapp,FLUID,Decentralized Finance
 saros-finance,SAROS,Decentralized Finance
-ether-fi-staked-eth,EETH,Liquid Staking
+ether-fi-staked-eth,EETH,Staked or Wrapped
 blackrock-usd-institutional-digital-liquidity-fund,BUIDL,Stablecoins
 ousg,OUSG,RWA & Tokenization
 usdt0,USDT0,Stablecoins
@@ -176,7 +176,7 @@ paypal-usd,PYUSD,Stablecoins
 arbitrum-bridged-weth-arbitrum-one,WETH,Decentralized Finance
 binance-bridged-usdt-bnb-smart-chain,BSC-USD,Stablecoins
 usd-coin,USDC,Stablecoins
-stakewise-v3-oseth,OSETH,Decentralized Finance
+stakewise-v3-oseth,OSETH,Staked or Wrapped
 binance-peg-weth,WETH,Decentralized Finance
 myx-finance,MYX,Decentralized Finance
 global-dollar,USDG,Decentralized Finance
@@ -184,15 +184,15 @@ binance-peg-dogecoin,DOGE,Memecoins
 usdx-money-usdx,USDX,Stablecoins
 figure-heloc,FIGR_HELOC,Decentralized Finance
 weth,WETH,Decentralized Finance
-wrapped-beacon-eth,WBETH,Decentralized Finance
+wrapped-beacon-eth,WBETH,Staked or Wrapped
 polygon-pos-bridged-dai-polygon-pos,DAI,Stablecoins
-wrapped-bitcoin,WBTC,Decentralized Finance
+wrapped-bitcoin,WBTC,Staked or Wrapped
 zksync,ZK,Layer 2s & Scaling
-mantle-restaked-eth,CMETH,Liquid Staking
+mantle-restaked-eth,CMETH,Staked or Wrapped
 l2-standard-bridged-weth-base,WETH,Decentralized Finance
 ripple-usd,RLUSD,Stablecoins
 solv-protocol-solvbtc-bbn,XSOLVBTC,Decentralized Finance
-kinetic-staked-hype,KHYPE,Decentralized Finance
+kinetic-staked-hype,KHYPE,Staked or Wrapped
 clbtc,CLBTC,Decentralized Finance
 hash-2,HASH,Decentralized Finance
 tether,USDT,Stablecoins
@@ -201,6 +201,6 @@ syrupusdc,SYRUPUSDC,Stablecoins
 loaded-lions,LION,Decentralized Finance
 polygon-bridged-usdt-polygon,USDT,Stablecoins
 superstate-short-duration-us-government-securities-fund-ustb,USTB,Decentralized Finance
-benqi-liquid-staked-avax,SAVAX,Decentralized Finance
-bybit-staked-sol,BBSOL,Decentralized Finance
+benqi-liquid-staked-avax,SAVAX,Staked or Wrapped
+bybit-staked-sol,BBSOL,Staked or Wrapped
 eigenlayer,EIGEN,Decentralized Finance
