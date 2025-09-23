@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 # backend/prices/AA_gck_load_prices_all.py
-# One-pass loader that refreshes 5 tables:
+# One-pass loader that refreshes 4 tables:
 #   - gecko_prices_live                  (TRUNCATE → repopulate)
 #   - gecko_prices_live_ranked           (DELETE bucket → repopulate from live buffer)
 #   - gecko_prices_live_rolling          (append idempotently with IF NOT EXISTS)
 #   - gecko_market_cap_live              (TRUNCATE → repopulate)
-#   - gecko_market_cap_live_ranked       (DELETE category=MCAP_RANK_BUCKET → repopulate)
 #
 # Notes:
 # - No hard staleness drop. We always keep Top N coins.
@@ -67,10 +66,7 @@ REQUIRED_LIVE_MIN     = int(os.getenv("REQUIRED_LIVE_MIN", str(int(TOP_N * 0.7))
 TABLE_LIVE            = os.getenv("TABLE_GECKO_LIVE", "gecko_prices_live")
 TABLE_LIVE_RANKED     = os.getenv("TABLE_GECKO_PRICES_LIVE_RANKED", "gecko_prices_live_ranked")
 TABLE_ROLLING         = os.getenv("TABLE_GECKO_ROLLING", "gecko_prices_live_rolling")
-
 TABLE_MCAP_LIVE       = os.getenv("TABLE_GECKO_MCAP_LIVE", "gecko_market_cap_live")
-TABLE_MCAP_RANKED     = os.getenv("TABLE_GECKO_MCAP_LIVE_RANKED", "gecko_market_cap_live_ranked")
-MCAP_RANK_BUCKET      = os.getenv("GECKO_MCAP_BUCKET", "categories")  # single-partition value
 
 # ranked bucket for prices_live_ranked
 RANK_BUCKET           = os.getenv("RANK_BUCKET", "all")
@@ -243,15 +239,9 @@ DEL_PRICES_LIVE_RANKED_BUCKET = session.prepare(
     f"DELETE FROM {TABLE_LIVE_RANKED} WHERE bucket=?"
 )
 
-# Market-cap live & ranked
+# Market-cap live (no ranked table anymore)
 INS_MCAP_LIVE_UPSERT = session.prepare(
     f"INSERT INTO {TABLE_MCAP_LIVE} (category,last_updated,market_cap,market_cap_rank,volume_24h) VALUES (?,?,?,?,?)"
-)
-DEL_MCAP_RANKED_BUCKET = session.prepare(
-    f"DELETE FROM {TABLE_MCAP_RANKED} WHERE category=?"
-)
-INS_MCAP_RANKED = session.prepare(
-    f"INSERT INTO {TABLE_MCAP_RANKED} (category,market_cap_rank,last_updated,market_cap,volume_24h) VALUES (?,?,?,?,?)"
 )
 
 # ───────────────────────── Fetch ─────────────────────────
@@ -313,7 +303,7 @@ def run_once():
         if not gid or lu is None:
             missing_count += 1
             if VERBOSE_MODE:
-                print(f"[{now_str()}] [skip-missing] id/last_updated missing for idx={idx}, id={gid}, {sym} {fmt_rank(rank)}")
+                print(f"[{now_str()}] [skip-missing] idx={idx}, id={gid}, {sym} {fmt_rank(rank)}")
             continue
 
         # Warn on staleness but DO NOT drop
@@ -481,38 +471,6 @@ def run_once():
             except (WriteTimeout, OperationTimedOut, DriverException) as e:
                 print(f"[{now_str()}] [mcap-live] failed for category='{cat_name}': {e}")
         print(f"[{now_str()}] [mcap-live] rows_written={live_written}")
-
-        # Rebuild ranked (single partition = MCAP_RANK_BUCKET)
-        try:
-            session.execute(DEL_MCAP_RANKED_BUCKET, [MCAP_RANK_BUCKET], timeout=REQUEST_TIMEOUT_SEC)
-        except (WriteTimeout, OperationTimedOut, DriverException) as e:
-            print(f"[{now_str()}] [mcap-ranked] failed to clear category='{MCAP_RANK_BUCKET}': {e}")
-        else:
-            wrote_ranked = 0
-            all_entry = next((entry for entry in totals_items if entry[0] == "ALL"), None)
-            if all_entry:
-                _, all_mcap, all_vol, all_upd = all_entry
-                try:
-                    session.execute(
-                        INS_MCAP_RANKED,
-                        [MCAP_RANK_BUCKET, 0, all_upd, all_mcap, all_vol],
-                        timeout=REQUEST_TIMEOUT_SEC,
-                    )
-                    wrote_ranked += 1
-                except (WriteTimeout, OperationTimedOut, DriverException) as e:
-                    print(f"[{now_str()}] [mcap-ranked] failed for rank=0: {e}")
-
-            for cat_name, total_mcap, total_vol, last_upd in ranked_entries:
-                try:
-                    session.execute(
-                        INS_MCAP_RANKED,
-                        [MCAP_RANK_BUCKET, ranks[cat_name], last_upd, total_mcap, total_vol],
-                        timeout=REQUEST_TIMEOUT_SEC,
-                    )
-                    wrote_ranked += 1
-                except (WriteTimeout, OperationTimedOut, DriverException) as e:
-                    print(f"[{now_str()}] [mcap-ranked] failed for category='{cat_name}' rank={ranks[cat_name]}: {e}")
-            print(f"[{now_str()}] [mcap-ranked] category(partition)='{MCAP_RANK_BUCKET}' rows_written={wrote_ranked}")
     else:
         print(f"[{now_str()}] [mcap-live] no category aggregates computed (rows=0)")
 
