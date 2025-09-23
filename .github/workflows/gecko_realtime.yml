@@ -3,12 +3,23 @@ name: gecko-prices-realtime
 on:
   workflow_dispatch:
     inputs:
-      run_01: { description: "AA_gck_load_prices_live.py", required: false, default: "true" }
-      run_02: { description: "CC_gck_append_10m_from_live.py", required: false, default: "true" }
-      run_rank: { description: "BB_gck_update_prices_live_ranked.py", required: false, default: "true" }
-      TOP_N:  { description: "Override TOP_N", required: false, default: "" }
-      RANK_TOP_N: { description: "Override RANK_TOP_N", required: false, default: "" }
-      VERBOSE_MODE: { description: "Verbose (0/1)", required: false, default: "0" }
+      run_01:
+        {
+          description: "AA_gck_load_prices_all.py (5-in-1)",
+          required: false,
+          default: "true",
+        }
+      run_02:
+        {
+          description: "CC_gck_append_10m_from_live.py",
+          required: false,
+          default: "true",
+        }
+      TOP_N: { description: "Override TOP_N", required: false, default: "" }
+      RANK_TOP_N:
+        { description: "Override RANK_TOP_N", required: false, default: "" }
+      VERBOSE_MODE:
+        { description: "Verbose (0/1)", required: false, default: "0" }
 
 permissions:
   contents: read
@@ -45,27 +56,36 @@ jobs:
           echo "${{ secrets.ASTRA_BUNDLE_BASE64 }}" | base64 -d > secure-connect.zip
           test -s secure-connect.zip
 
-      - name: 01 Load prices_live and _rolling
+      - name: 01 Load ALL live tables (5-in-1)
         if: ${{ github.event.inputs.run_01 == 'true' }}
-        timeout-minutes: 8
+        timeout-minutes: 10
         env:
           COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
           COINGECKO_API_TIER: ${{ secrets.COINGECKO_API_TIER }}
           ASTRA_BUNDLE_PATH: secure-connect.zip
           ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
           ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
+
+          # knobs
           TOP_N: ${{ github.event.inputs.TOP_N != '' && github.event.inputs.TOP_N || secrets.TOP_N || '200' }}
+          RANK_TOP_N: ${{ github.event.inputs.RANK_TOP_N != '' && github.event.inputs.RANK_TOP_N || secrets.TOP_N || '200' }}
+          STALE_WARN_MINUTES: "10" # warn only (no dropping)
+          REQUIRED_LIVE_MIN: "140" # safety guard before TRUNCATE (optional)
+
+          # I/O & perf
           RETRIES: "3"
           BACKOFF_MIN: "5"
           MAX_BACKOFF_MIN: "30"
           REQUEST_TIMEOUT_SEC: "60"
           CONNECT_TIMEOUT_SEC: "15"
-          FETCH_SIZE: "500"
           BATCH_FLUSH_EVERY: "40"
-          RUN_FOREVER: "0"
-          WAIT_STALE_SEC: "60"
+
+          # ranked partitions
+          RANK_BUCKET: "all"
+          GECKO_MCAP_BUCKET: "categories"
+
           VERBOSE_MODE: ${{ github.event.inputs.VERBOSE_MODE || '0' }}
-        run: python prices/AA_gck_load_prices_live.py
+        run: python prices/AA_gck_load_prices_all.py
 
       - name: 02 Append 10m from live_rolling
         if: ${{ github.event.inputs.run_02 == 'true' }}
@@ -84,22 +104,3 @@ jobs:
           SLOTS_BACKFILL: "2"
           VERBOSE_MODE: ${{ github.event.inputs.VERBOSE_MODE || '0' }}
         run: python prices/CC_gck_append_10m_from_live.py
-
-      - name: 03 Update prices_live_ranked
-        if: ${{ github.event.inputs.run_rank == 'true' }}
-        timeout-minutes: 3
-        env:
-          COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
-          COINGECKO_API_TIER: ${{ secrets.COINGECKO_API_TIER }}
-          ASTRA_BUNDLE_PATH: secure-connect.zip
-          ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
-          ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
-          TABLE_SOURCE: gecko_prices_live
-          TABLE_DEST: gecko_prices_live_ranked
-          RANK_BUCKET: all
-          RANK_TOP_N: ${{ github.event.inputs.RANK_TOP_N != '' && github.event.inputs.RANK_TOP_N || secrets.TOP_N || '200' }}
-          REQUEST_TIMEOUT_SEC: "60"
-          CONNECT_TIMEOUT_SEC: "15"
-          FETCH_SIZE: "1000"
-          CONSISTENCY: QUORUM
-        run: python prices/BB_gck_update_prices_live_ranked.py

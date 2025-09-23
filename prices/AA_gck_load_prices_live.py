@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
-# prices/AA_gck_load_prices_live.py
-# Loads CoinGecko top markets into:
-#   - gecko_prices_live (with category + change_pct_* + price_*_ago)
-#   - gecko_prices_live_rolling (NO category, but DOES include change_pct_* + price_*_ago)
-# Also writes category market-cap aggregates into:
-#   - gecko_market_cap_live (category PK)
-#   - gecko_market_cap_live_ranked (partition=MCAP_RANK_BUCKET, cluster by market_cap_rank)
+# backend/prices/AA_gck_load_prices_all.py
+# One-pass loader that refreshes 5 tables:
+#   - gecko_prices_live                  (TRUNCATE → repopulate)
+#   - gecko_prices_live_ranked           (DELETE bucket → repopulate from live buffer)
+#   - gecko_prices_live_rolling          (append idempotently with IF NOT EXISTS)
+#   - gecko_market_cap_live              (TRUNCATE → repopulate)
+#   - gecko_market_cap_live_ranked       (DELETE category=MCAP_RANK_BUCKET → repopulate)
+#
+# Notes:
+# - No hard staleness drop. We always keep Top N coins.
+# - We log WARN if last_updated is older than STALE_WARN_MINUTES.
+# - Safe refresh: only truncate/clear once we have enough fresh rows buffered.
 
 import os, time, csv, requests
 import sys, pathlib
-from datetime import datetime, timezone, date
+from datetime import datetime, timezone, timedelta
 
 # ───────────────────── Repo root & helpers ─────────────────────
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -27,18 +32,18 @@ except Exception:
 chdir_repo_root()
 
 # ───────────────────────── 3rd-party ─────────────────────────
-from cassandra import OperationTimedOut, ReadTimeout, Unavailable, DriverException, WriteTimeout
+from cassandra import OperationTimedOut, DriverException, WriteTimeout
 from cassandra.cluster import Cluster, EXEC_PROFILE_DEFAULT, ExecutionProfile
 from cassandra.auth import PlainTextAuthProvider
 from cassandra.policies import RoundRobinPolicy
-from cassandra.query import BatchStatement, ConsistencyLevel
+from cassandra.query import BatchStatement, ConsistencyLevel, SimpleStatement
 from dotenv import load_dotenv
 
 # Load .env from repo root explicitly
 load_dotenv(dotenv_path=rel(".env"))
 
 # ───────────────────────── Config ─────────────────────────
-BUNDLE       = os.getenv("ASTRA_BUNDLE_PATH")
+BUNDLE       = os.getenv("ASTRA_BUNDLE_PATH", "secure-connect.zip")
 ASTRA_TOKEN  = os.getenv("ASTRA_TOKEN")
 KEYSPACE     = os.getenv("ASTRA_KEYSPACE", "default_keyspace")
 
@@ -47,19 +52,29 @@ RETRIES      = int(os.getenv("RETRIES", "3"))
 BACKOFF_MIN  = int(os.getenv("BACKOFF_MIN", "5"))
 MAX_BACKOFF  = int(os.getenv("MAX_BACKOFF_MIN", "30"))
 
-REQUEST_TIMEOUT_SEC = int(os.getenv("REQUEST_TIMEOUT_SEC", "60"))
-CONNECT_TIMEOUT_SEC = int(os.getenv("CONNECT_TIMEOUT_SEC", "15"))
-BATCH_FLUSH_EVERY   = int(os.getenv("BATCH_FLUSH_EVERY", "40"))
-VERBOSE_MODE        = os.getenv("VERBOSE_MODE", "0") == "1"
+REQUEST_TIMEOUT_SEC   = int(os.getenv("REQUEST_TIMEOUT_SEC", "60"))
+CONNECT_TIMEOUT_SEC   = int(os.getenv("CONNECT_TIMEOUT_SEC", "15"))
+BATCH_FLUSH_EVERY     = int(os.getenv("BATCH_FLUSH_EVERY", "40"))
+VERBOSE_MODE          = os.getenv("VERBOSE_MODE", "0") == "1"
 
-# tables (CoinGecko)
-TABLE_LATEST  = os.getenv("TABLE_GECKO_LIVE", "gecko_prices_live")
-TABLE_HIST    = os.getenv("TABLE_GECKO_ROLLING", "gecko_prices_live_rolling")
+# Warn if older than this; DO NOT drop
+STALE_WARN_MINUTES    = int(os.getenv("STALE_WARN_MINUTES", "10"))
 
-# category MCAP tables (match provided schemas: no id/name/symbol)
-TABLE_MCAP_LIVE         = os.getenv("TABLE_GECKO_MCAP_LIVE", "gecko_market_cap_live")
-TABLE_MCAP_LIVE_RANKED  = os.getenv("TABLE_GECKO_MCAP_LIVE_RANKED", "gecko_market_cap_live_ranked")
-MCAP_RANK_BUCKET        = os.getenv("GECKO_MCAP_BUCKET", "categories")  # used as partition key 'category' in *_ranked
+# Safety threshold before truncating live tables
+REQUIRED_LIVE_MIN     = int(os.getenv("REQUIRED_LIVE_MIN", str(int(TOP_N * 0.7))))
+
+# tables
+TABLE_LIVE            = os.getenv("TABLE_GECKO_LIVE", "gecko_prices_live")
+TABLE_LIVE_RANKED     = os.getenv("TABLE_GECKO_PRICES_LIVE_RANKED", "gecko_prices_live_ranked")
+TABLE_ROLLING         = os.getenv("TABLE_GECKO_ROLLING", "gecko_prices_live_rolling")
+
+TABLE_MCAP_LIVE       = os.getenv("TABLE_GECKO_MCAP_LIVE", "gecko_market_cap_live")
+TABLE_MCAP_RANKED     = os.getenv("TABLE_GECKO_MCAP_LIVE_RANKED", "gecko_market_cap_live_ranked")
+MCAP_RANK_BUCKET      = os.getenv("GECKO_MCAP_BUCKET", "categories")  # single-partition value
+
+# ranked bucket for prices_live_ranked
+RANK_BUCKET           = os.getenv("RANK_BUCKET", "all")
+RANK_TOP_N            = int(os.getenv("RANK_TOP_N", str(TOP_N)))
 
 # categories (Symbol -> Category; live only)
 CATEGORY_FILE = os.getenv("CATEGORY_FILE", str(rel("prices", "category_mapping.csv")))
@@ -143,7 +158,6 @@ def safe_iso_to_dt(s):
         return None
 
 def price_ago_from_pct(now_price, pct):
-    """pct is percent (e.g., +3.5), returns baseline price or None."""
     try:
         if now_price is None or pct is None:
             return None
@@ -175,8 +189,13 @@ def http_get(path, params=None):
                 print(f"[{now_str()}] [fetch] giving up after {attempt} attempts.")
                 raise
 
+def fmt_rank(r):
+    try:
+        return f"r={int(r)}" if r is not None and int(r) > 0 else "r=?"
+    except Exception:
+        return "r=?"
+
 # ───────────────────────── Statements ─────────────────────────
-# LIVE includes category & price_*_ago
 LIVE_COLS = [
     "id","symbol","name","category",
     "market_cap_rank",
@@ -188,8 +207,6 @@ LIVE_COLS = [
     "price_1h_ago","price_24h_ago","price_7d_ago","price_30d_ago","price_1y_ago",
     "vs_currency",
 ]
-
-# ROLLING has NO category, but DOES include price_*_ago
 ROLLING_COLS = [
     "id","last_updated",
     "symbol","name",
@@ -206,22 +223,35 @@ ROLLING_COLS = [
 def placeholders(n): return ",".join(["?"]*n)
 
 INS_LIVE_UPSERT = session.prepare(
-    f"INSERT INTO {TABLE_LATEST} ({','.join(LIVE_COLS)}) VALUES ({placeholders(len(LIVE_COLS))})"
+    f"INSERT INTO {TABLE_LIVE} ({','.join(LIVE_COLS)}) VALUES ({placeholders(len(LIVE_COLS))})"
 )
 INS_ROLLING_IF_NOT_EXISTS = session.prepare(
-    f"INSERT INTO {TABLE_HIST} ({','.join(ROLLING_COLS)}) VALUES ({placeholders(len(ROLLING_COLS))}) IF NOT EXISTS"
+    f"INSERT INTO {TABLE_ROLLING} ({','.join(ROLLING_COLS)}) VALUES ({placeholders(len(ROLLING_COLS))}) IF NOT EXISTS"
 )
 
-# Updated to match your schemas (no id/name/symbol)
+# prices_live_ranked
+INS_PRICES_LIVE_RANKED = session.prepare(
+    f"INSERT INTO {TABLE_LIVE_RANKED} ("
+    f"  bucket, market_cap_rank, id, symbol, name, category, "
+    f"  price_usd, market_cap, volume_24h, "
+    f"  circulating_supply, total_supply, last_updated, "
+    f"  change_pct_1h, change_pct_24h, change_pct_7d, change_pct_30d, change_pct_1y, "
+    f"  price_1h_ago, price_24h_ago, price_7d_ago, price_30d_ago, price_1y_ago"
+    f") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+)
+DEL_PRICES_LIVE_RANKED_BUCKET = session.prepare(
+    f"DELETE FROM {TABLE_LIVE_RANKED} WHERE bucket=?"
+)
+
+# Market-cap live & ranked
 INS_MCAP_LIVE_UPSERT = session.prepare(
     f"INSERT INTO {TABLE_MCAP_LIVE} (category,last_updated,market_cap,market_cap_rank,volume_24h) VALUES (?,?,?,?,?)"
 )
-# In *_ranked the partition key is named 'category'. We use MCAP_RANK_BUCKET as that partition value.
 DEL_MCAP_RANKED_BUCKET = session.prepare(
-    f"DELETE FROM {TABLE_MCAP_LIVE_RANKED} WHERE category=?"
+    f"DELETE FROM {TABLE_MCAP_RANKED} WHERE category=?"
 )
 INS_MCAP_RANKED = session.prepare(
-    f"INSERT INTO {TABLE_MCAP_LIVE_RANKED} (category,market_cap_rank,last_updated,market_cap,volume_24h) VALUES (?,?,?,?,?)"
+    f"INSERT INTO {TABLE_MCAP_RANKED} (category,market_cap_rank,last_updated,market_cap,volume_24h) VALUES (?,?,?,?,?)"
 )
 
 # ───────────────────────── Fetch ─────────────────────────
@@ -250,6 +280,8 @@ def pct(d: dict, key: str):
 # ───────────────────────── Run once ─────────────────────────
 def run_once():
     now_ts = datetime.now(timezone.utc)
+    warn_cutoff = now_ts - timedelta(minutes=STALE_WARN_MINUTES)
+
     rows = fetch_top_markets(TOP_N)
 
     # Debug preview
@@ -258,8 +290,10 @@ def run_once():
         preview = [(r.get("id"), (r.get("symbol") or "").upper(), r.get("market_cap_rank"), r.get("last_updated")) for r in sample]
         print(f"[{now_str()}] [debug] sample[0:5]: {preview}")
 
-    batch_latest = BatchStatement(consistency_level=ConsistencyLevel.QUORUM)
-    w_hist = w_lat = 0
+    live_buffer = []
+    w_hist = 0
+    warn_count = 0
+    missing_count = 0
     category_totals = {}
 
     def bump_total(cat_name: str, mcap_value: float, vol_value: float, last_upd) -> None:
@@ -274,14 +308,23 @@ def run_once():
         sym   = (c.get("symbol") or "").upper()
         name  = c.get("name")
         rank  = c.get("market_cap_rank")
+
+        lu    = safe_iso_to_dt(c.get("last_updated"))
+        if not gid or lu is None:
+            missing_count += 1
+            if VERBOSE_MODE:
+                print(f"[{now_str()}] [skip-missing] id/last_updated missing for idx={idx}, id={gid}, {sym} {fmt_rank(rank)}")
+            continue
+
+        # Warn on staleness but DO NOT drop
+        if lu < warn_cutoff:
+            delta_min = round((now_ts - lu).total_seconds() / 60.0, 1)
+            print(f"[{now_str()}] [stale-warn] {sym} {fmt_rank(rank)} lu={lu.isoformat()} ({delta_min}m old)")
+            warn_count += 1
+
         price = f(c.get("current_price"))
         mcap  = f(c.get("market_cap"))
         vol   = f(c.get("total_volume"))
-        lu    = safe_iso_to_dt(c.get("last_updated"))
-        if not gid or lu is None:
-            if VERBOSE_MODE:
-                print(f"[{now_str()}] [skip] missing id/last_updated for row idx={idx}")
-            continue
 
         ath_price = f(c.get("ath"))
         ath_date  = safe_iso_to_dt(c.get("ath_date"))
@@ -290,21 +333,20 @@ def run_once():
         totl = f(c.get("total_supply"))
         maxs = f(c.get("max_supply"))
 
-        # Percent changes from CG (percent units, e.g. 3.4 = +3.4%)
+        # Percent changes from CG
         ch1h  = pct(c, "price_change_percentage_1h_in_currency")
         ch24h = pct(c, "price_change_percentage_24h_in_currency")
         ch7d  = pct(c, "price_change_percentage_7d_in_currency")
         ch30d = pct(c, "price_change_percentage_30d_in_currency")
         ch1y  = pct(c, "price_change_percentage_1y_in_currency")
 
-        # Derive baselines from pct where possible
+        # Derived baselines
         p1h  = price_ago_from_pct(price, ch1h)
         p24h = price_ago_from_pct(price, ch24h)
         p7d  = price_ago_from_pct(price, ch7d)
         p30d = price_ago_from_pct(price, ch30d)
         p1y  = price_ago_from_pct(price, ch1y)
 
-        # LIVE row (with category + price_*_ago)
         cat = category_for(sym)
 
         mcap_total = float(mcap) if mcap is not None else 0.0
@@ -312,7 +354,8 @@ def run_once():
         bump_total(cat, mcap_total, vol_total, lu)
         bump_total("ALL", mcap_total, vol_total, lu)
 
-        live_vals = [
+        # Buffer LIVE
+        live_buffer.append([
             gid, sym, name, cat,
             int(rank) if rank is not None else None,
             price, mcap, vol,
@@ -322,9 +365,9 @@ def run_once():
             ch1h, ch24h, ch7d, ch30d, ch1y,
             p1h, p24h, p7d, p30d, p1y,
             "usd",
-        ]
+        ])
 
-        # ROLLING row (NO category, but includes price_*_ago)
+        # Write ROLLING (idempotent)
         rolling_vals = [
             gid, lu,
             sym, name,
@@ -337,40 +380,84 @@ def run_once():
             p1h, p24h, p7d, p30d, p1y,
             "usd",
         ]
-
-        # Write rolling (IF NOT EXISTS to avoid dupes at the same last_updated)
         try:
-            applied = session.execute(
-                INS_ROLLING_IF_NOT_EXISTS, rolling_vals, timeout=REQUEST_TIMEOUT_SEC
-            ).one().applied
-            if applied:
+            res = session.execute(INS_ROLLING_IF_NOT_EXISTS, rolling_vals, timeout=REQUEST_TIMEOUT_SEC).one()
+            if res and bool(getattr(res, "applied", True)):
                 w_hist += 1
         except (WriteTimeout, OperationTimedOut, DriverException) as e:
             print(f"[{now_str()}] [rolling] insert failed for {sym}@{lu}: {e}")
 
-        # Buffer live upsert
-        batch_latest.add(INS_LIVE_UPSERT, live_vals)
-        w_lat += 1
-
-        # Progress + periodic flush
         if (idx % 20 == 0) or VERBOSE_MODE:
-            print(f"[{now_str()}] [progress] rows={idx}/{len(rows)}; live_batch={len(batch_latest)} w_lat={w_lat} w_hist={w_hist}")
-        if (w_lat % BATCH_FLUSH_EVERY) == 0:
-            session.execute(batch_latest); batch_latest.clear()
-            if VERBOSE_MODE:
-                print(f"[{now_str()}] [flush] live batch flushed at w_lat={w_lat}")
+            print(f"[{now_str()}] [progress] parsed={idx}/{len(rows)}; live_buf={len(live_buffer)} w_hist={w_hist}")
 
-    if len(batch_latest):
-        session.execute(batch_latest)
+    # ───── Refresh gecko_prices_live (safe) ─────
+    print(f"[{now_str()}] [live-buffer] prepared={len(live_buffer)} rows "
+          f"(required_min={REQUIRED_LIVE_MIN}; missing_id/lu={missing_count}; stale_warns={warn_count})")
+    if len(live_buffer) < REQUIRED_LIVE_MIN:
+        print(f"[{now_str()}] [ABORT] Not enough rows to refresh {TABLE_LIVE}. Live table NOT cleared.")
+        wrote_live = 0
+    else:
+        session.execute(SimpleStatement(f"TRUNCATE {TABLE_LIVE}"))
+        print(f"[{now_str()}] TRUNCATED {TABLE_LIVE}")
+        wrote_live = 0
+        batch_live = BatchStatement(consistency_level=ConsistencyLevel.QUORUM)
+        for i, vals in enumerate(live_buffer, 1):
+            batch_live.add(INS_LIVE_UPSERT, vals)
+            if (i % BATCH_FLUSH_EVERY) == 0:
+                session.execute(batch_live); batch_live.clear()
+            wrote_live += 1
+        if len(batch_live):
+            session.execute(batch_live)
+        print(f"[{now_str()}] [live] inserted={wrote_live}")
 
-    # ─────────────── Category MCAP aggregates (new schemas) ───────────────
+    # ───── Build gecko_prices_live_ranked from the same buffer ─────
+    def safe_rank_from_live(vals):
+        r = vals[4]  # market_cap_rank position in live_vals
+        try:
+            return int(r) if r is not None and int(r) > 0 else 10**9
+        except Exception:
+            return 10**9
+
+    rank_source = sorted(live_buffer, key=safe_rank_from_live)[:RANK_TOP_N]
+    if len(rank_source) == 0:
+        print(f"[{now_str()}] [prices_live_ranked] SKIP: no rows to write")
+    else:
+        session.execute(DEL_PRICES_LIVE_RANKED_BUCKET, [RANK_BUCKET], timeout=REQUEST_TIMEOUT_SEC)
+        wrote_ranked_prices = 0
+        batch_ranked = BatchStatement(consistency_level=ConsistencyLevel.QUORUM)
+        for vals in rank_source:
+            (gid, sym, name, cat, rnk,
+             price, mcap, vol,
+             lu, _now_ts,
+             _ath_price, _ath_date,
+             circ, totl, _maxs,
+             ch1h, ch24h, ch7d, ch30d, ch1y,
+             p1h, p24h, p7d, p30d, p1y,
+             _vs) = vals
+
+            batch_ranked.add(INS_PRICES_LIVE_RANKED, [
+                RANK_BUCKET, int(rnk) if rnk is not None else None,
+                gid, sym, name, cat,
+                price, mcap, vol,
+                circ, totl, lu,
+                ch1h, ch24h, ch7d, ch30d, ch1y,
+                p1h, p24h, p7d, p30d, p1y
+            ])
+            wrote_ranked_prices += 1
+            if (wrote_ranked_prices % BATCH_FLUSH_EVERY) == 0:
+                session.execute(batch_ranked); batch_ranked.clear()
+
+        if len(batch_ranked):
+            session.execute(batch_ranked)
+        print(f"[{now_str()}] [prices_live_ranked] bucket='{RANK_BUCKET}' inserted={wrote_ranked_prices}")
+
+    # ───── Market-cap aggregates (from buffer) ─────
     if category_totals:
         totals_items = []
         for cat_name, totals in category_totals.items():
             last_upd = totals.get("last_updated") or now_ts
             totals_items.append((cat_name, float(totals["market_cap"]), float(totals["volume_24h"]), last_upd))
 
-        # Sort for stable output; compute ranks by market cap
         totals_items.sort(key=lambda entry: (0 if entry[0] == "ALL" else 1, entry[0].lower()))
         ranked_entries = [entry for entry in totals_items if entry[0] != "ALL"]
         ranked_entries.sort(key=lambda entry: entry[1], reverse=True)
@@ -378,7 +465,10 @@ def run_once():
         if "ALL" in category_totals:
             ranks["ALL"] = 0
 
-        print(f"[{now_str()}] [mcap-live] writing {len(totals_items)} category aggregates into {TABLE_MCAP_LIVE}")
+        # Refresh market_cap_live fully (safe because totals are ready)
+        session.execute(SimpleStatement(f"TRUNCATE {TABLE_MCAP_LIVE}"))
+        print(f"[{now_str()}] TRUNCATED {TABLE_MCAP_LIVE}")
+
         live_written = 0
         for cat_name, total_mcap, total_vol, last_upd in totals_items:
             try:
@@ -392,14 +482,13 @@ def run_once():
                 print(f"[{now_str()}] [mcap-live] failed for category='{cat_name}': {e}")
         print(f"[{now_str()}] [mcap-live] rows_written={live_written}")
 
-        # Rebuild ranked table under single partition key value = MCAP_RANK_BUCKET
+        # Rebuild ranked (single partition = MCAP_RANK_BUCKET)
         try:
             session.execute(DEL_MCAP_RANKED_BUCKET, [MCAP_RANK_BUCKET], timeout=REQUEST_TIMEOUT_SEC)
         except (WriteTimeout, OperationTimedOut, DriverException) as e:
             print(f"[{now_str()}] [mcap-ranked] failed to clear category='{MCAP_RANK_BUCKET}': {e}")
         else:
             wrote_ranked = 0
-            # Emit ALL first (rank 0) if present
             all_entry = next((entry for entry in totals_items if entry[0] == "ALL"), None)
             if all_entry:
                 _, all_mcap, all_vol, all_upd = all_entry
@@ -413,7 +502,6 @@ def run_once():
                 except (WriteTimeout, OperationTimedOut, DriverException) as e:
                     print(f"[{now_str()}] [mcap-ranked] failed for rank=0: {e}")
 
-            # Emit ranked categories
             for cat_name, total_mcap, total_vol, last_upd in ranked_entries:
                 try:
                     session.execute(
@@ -428,7 +516,8 @@ def run_once():
     else:
         print(f"[{now_str()}] [mcap-live] no category aggregates computed (rows=0)")
 
-    print(f"[{now_str()}] wrote rolling={w_hist} latest={w_lat}")
+    print(f"[{now_str()}] wrote: live={wrote_live}; ranked_prices={min(len(rank_source), RANK_TOP_N)}; "
+          f"rolling_new={w_hist}; mcap_live_cats={len(category_totals)}; stale_warns={warn_count}")
 
 # ───────────────────────── Entrypoint ─────────────────────────
 def main():
