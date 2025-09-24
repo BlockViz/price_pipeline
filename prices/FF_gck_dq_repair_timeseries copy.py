@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
-# prices/dq_repair_timeseries.py
-# Plan-first API ranges, hourly repair + tz fix + rate limit + neg-cache
-# NEW: interpolation fallback for market_cap & volume_24h (daily + hourly)
-
+# prices/dq_repair_timeseries.py  (drop-in replacement with hourly repair + tz fix)
 import os, time, requests, random, datetime as dt
 from datetime import timezone
 import sys, pathlib
-from collections import defaultdict, deque
+from collections import defaultdict
 
 # ───────────────────── Repo root & helpers ─────────────────────
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -90,51 +87,13 @@ QS  = "x_cg_demo_api_key" if API_TIER == "demo" else "x_cg_pro_api_key"
 if not ASTRA_TOKEN:
     raise SystemExit("Missing ASTRA_TOKEN")
 
-# ---------- New tunables for planned API pass ----------
-DAILY_API_REQ_BUDGET = int(os.getenv("DAILY_API_REQ_BUDGET", "150"))   # total request budget per run
-PAD_DAYS             = int(os.getenv("DAILY_API_PAD_DAYS", "1"))       # pad contiguous gaps by ± days
-MAX_RANGE_DAYS       = int(os.getenv("DAILY_API_MAX_RANGE_DAYS", "90"))# clamp per-call range
-
-# ---------- Interpolation knobs (NEW) ----------
-# If True, fill missing market_cap / volume_24h via interpolation (daily + hourly).
-INTERPOLATE_MCAP_VOL_DAILY  = os.getenv("INTERPOLATE_MCAP_VOL_DAILY", "1") == "1"
-INTERPOLATE_MCAP_VOL_HOURLY = os.getenv("INTERPOLATE_MCAP_VOL_HOURLY", "1") == "1"
-# Max gap limits (set high if you want “always continuous”)
-INTERP_MAX_DAYS  = int(os.getenv("INTERP_MAX_DAYS", "60"))   # daily gaps up to 60d will be interpolated
-INTERP_MAX_HOURS = int(os.getenv("INTERP_MAX_HOURS", "168")) # hourly gaps up to 168h (7d)
-
-# ---------- Rate limiting ----------
-CG_REQ_INTERVAL_S = float(os.getenv("CG_REQUEST_INTERVAL_S", "1.0" if API_TIER == "demo" else "0.25"))
-CG_MAX_RPM        = int(os.getenv("CG_MAX_RPM", "50" if API_TIER == "demo" else "120"))
-_req_times = deque()  # timestamps (seconds) of recent requests
-
-# ---------- Negative cache for coins with no data ----------
-NEG_CACHE_PATH = os.getenv("COINGECKO_NEG_CACHE_PATH", str(rel("tmp/coingecko_no_market.ids")))
-try:
-    os.makedirs(os.path.dirname(NEG_CACHE_PATH), exist_ok=True)
-except Exception:
-    pass
-
-def load_neg_cache() -> set[str]:
-    try:
-        with open(NEG_CACHE_PATH, "r", encoding="utf-8") as f:
-            return {line.strip() for line in f if line.strip()}
-    except FileNotFoundError:
-        return set()
-
-def add_to_neg_cache(coin_id: str):
-    try:
-        with open(NEG_CACHE_PATH, "a", encoding="utf-8") as f:
-            f.write(coin_id + "\n")
-    except Exception as e:
-        print(f"[{ts()}] [WARN] could not update neg cache: {e}")
-
 # ---------- Helpers ----------
 def ts(): return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 def tdur(t0): return f"{(time.perf_counter()-t0):.2f}s"
 def utcnow(): return dt.datetime.now(timezone.utc)
 
 def to_utc(x: dt.datetime | None) -> dt.datetime | None:
+    """Force timezone-aware UTC for datetimes (handles naive)."""
     if x is None:
         return None
     if x.tzinfo is None:
@@ -188,44 +147,6 @@ def hour_seq(start_dt: dt.datetime, end_excl: dt.datetime):
         yield cur
         cur += dt.timedelta(hours=1)
 
-# ---- NEW: contiguous grouping + clamping helpers ----
-def group_contiguous_dates(dates: set[dt.date]) -> list[tuple[dt.date, dt.date]]:
-    if not dates:
-        return []
-    sdates = sorted(dates)
-    runs = []
-    run_start = run_end = sdates[0]
-    for d in sdates[1:]:
-        if d == run_end + dt.timedelta(days=1):
-            run_end = d
-        else:
-            runs.append((run_start, run_end))
-            run_start = run_end = d
-    runs.append((run_start, run_end))
-    return runs
-
-def clamp_date_range(s: dt.date, e: dt.date, max_days: int) -> list[tuple[dt.date, dt.date]]:
-    out = []
-    cur = s
-    while cur <= e:
-        end = min(e, cur + dt.timedelta(days=max_days-1))
-        out.append((cur, end))
-        cur = end + dt.timedelta(days=1)
-    return out
-
-# ---- HTTP with rate limiting & Retry-After respect ----
-def _throttle():
-    now = time.time()
-    if _req_times and (now - _req_times[-1]) < CG_REQ_INTERVAL_S:
-        time.sleep(CG_REQ_INTERVAL_S - (now - _req_times[-1]))
-        now = time.time()
-    cutoff = now - 60.0
-    while _req_times and _req_times[0] < cutoff:
-        _req_times.popleft()
-    if len(_req_times) >= CG_MAX_RPM:
-        sleep_for = 60.0 - (now - _req_times[0]) + 0.01
-        time.sleep(max(0.0, sleep_for))
-
 def http_get(path, params=None):
     url = f"{BASE}{path}"
     params = dict(params or {})
@@ -233,37 +154,23 @@ def http_get(path, params=None):
     if API_KEY:
         params[QS] = API_KEY
     last = None
+    t0 = time.perf_counter()
     for i in range(RETRIES):
-        _throttle()
-        t0 = time.perf_counter()
         try:
-            r = requests.get(url, params=params, headers=headers, timeout=REQUEST_TIMEOUT)
+            r = requests.get(url, params=params, headers=headers, timeout=30)
             if r.status_code in (402, 429, 500, 502, 503, 504):
-                ra = r.headers.get("Retry-After")
-                if ra:
-                    try:
-                        wait_s = float(ra)
-                    except Exception:
-                        wait_s = BACKOFF_S * (i + 1)
-                else:
-                    wait_s = BACKOFF_S * (i + 1)
-                print(f"[{ts()}] API {path} error: {r.status_code} — sleeping {wait_s:.1f}s (retry {i+1}/{RETRIES})")
-                time.sleep(wait_s + random.uniform(0, 0.5))
-                last = requests.HTTPError(f"{r.status_code} from CoinGecko", response=r)
-                continue
+                raise requests.HTTPError(f"{r.status_code} from CoinGecko", response=r)
             r.raise_for_status()
             if TIME_API:
                 print(f"[{ts()}] API OK {path} took {tdur(t0)}")
-            _req_times.append(time.time())
             return r.json()
-        except (requests.ConnectionError, requests.Timeout) as e:
+        except (requests.HTTPError, requests.ConnectionError, requests.Timeout) as e:
             last = e
             sleep_for = BACKOFF_S * (i + 1)
             print(f"[{ts()}] API {path} error: {e} — backoff {sleep_for}s")
-            time.sleep(sleep_for + random.uniform(0, 0.5))
+            time.sleep(sleep_for)
     raise RuntimeError(f"CoinGecko failed: {url} :: {last}")
 
-# ---- Daily bucketing helpers ----
 def bucket_daily_ohlc(prices_ms_values, start_d: dt.date, end_d: dt.date):
     per_day = defaultdict(list)
     for ms, price in prices_ms_values or []:
@@ -299,79 +206,6 @@ def bucket_daily_last(values_ms_values, start_d: dt.date, end_d: dt.date):
         if pts:
             out[d] = {"val": pts[-1][1], "ts": pts[-1][0]}
         d += dt.timedelta(days=1)
-    return out
-
-# ---- NEW: Interpolation utilities ----
-def _interp_linear(x0, y0, x1, y1, x):
-    if x1 == x0:
-        return y0
-    w = (x - x0) / (x1 - x0)
-    return y0 + (y1 - y0) * w
-
-def interpolate_daily_series(dates: list[dt.date], values_map: dict[dt.date, float | None],
-                             max_gap_days: int | None = None) -> dict[dt.date, float | None]:
-    """Return a new dict with missing values filled by linear interpolation; carry at edges."""
-    out = {}
-    known = sorted([d for d in dates if values_map.get(d) is not None])
-    if not known:
-        # nothing to interpolate; leave Nones
-        return {d: None for d in dates}
-    # Precompute for fast neighbor search
-    for d in dates:
-        v = values_map.get(d)
-        if v is not None:
-            out[d] = float(v)
-            continue
-        # find left & right known
-        left = max([k for k in known if k < d], default=None)
-        right = min([k for k in known if k > d], default=None)
-        if left is None and right is None:
-            out[d] = None
-        elif left is None:
-            out[d] = float(values_map[right])
-        elif right is None:
-            out[d] = float(values_map[left])
-        else:
-            gap = (right - left).days
-            if (max_gap_days is not None) and (gap > max_gap_days):
-                # too wide: prefer nearest (carry)
-                out[d] = float(values_map[left])
-            else:
-                y = _interp_linear(left.toordinal(), float(values_map[left]),
-                                   right.toordinal(), float(values_map[right]),
-                                   d.toordinal())
-                out[d] = float(y)
-    return out
-
-def interpolate_hourly_series(hours: list[dt.datetime], values_map: dict[dt.datetime, float | None],
-                              max_gap_hours: int | None = None) -> dict[dt.datetime, float | None]:
-    out = {}
-    known = sorted([h for h in hours if values_map.get(h) is not None])
-    if not known:
-        return {h: None for h in hours}
-    for h in hours:
-        v = values_map.get(h)
-        if v is not None:
-            out[h] = float(v)
-            continue
-        # neighbors
-        left = max([k for k in known if k < h], default=None)
-        right = min([k for k in known if k > h], default=None)
-        if left is None and right is None:
-            out[h] = None
-        elif left is None:
-            out[h] = float(values_map[right])
-        elif right is None:
-            out[h] = float(values_map[left])
-        else:
-            gap = int((right - left).total_seconds() // 3600)
-            if (max_gap_hours is not None) and (gap > max_gap_hours):
-                out[h] = float(values_map[left])
-            else:
-                y = _interp_linear(left.timestamp(), float(values_map[left]),
-                                   right.timestamp(), float(values_map[right]),
-                                   h.timestamp())
-                out[h] = float(y)
     return out
 
 # ---------- Connect ----------
@@ -418,6 +252,7 @@ SEL_DAILY_RANGE = session.prepare(f"""
   WHERE id = ? AND date >= ? AND date <= ?
 """)
 
+# Enrichment from rolling for API repair
 SEL_ROLLING_RANGE = session.prepare(f"""
   SELECT last_updated, market_cap_rank, circulating_supply, total_supply
   FROM {TABLE_ROLLING}
@@ -505,11 +340,11 @@ def _daily_row_equal(existing, o, h, l, c, mcap, vol, source):
 
 def repair_daily_from_10m(coin, missing_days: set[dt.date]) -> int:
     if not (FIX_DAILY_FROM_10M and missing_days): return 0
-    print(f"[{ts()}]    [repair_daily_from_10m] {coin.symbol}: {len(missing_days)} day(s) to fix)")
+    print(f"[{ts()}]    [repair_daily_from_10m] {coin.symbol}: {len(missing_days)} day(s) to fix")
     t0 = time.perf_counter()
     cnt = 0
     batch = BatchStatement(consistency_level=ConsistencyLevel.QUORUM)
-    for day in sorted(missing_days):
+    for idx, day in enumerate(sorted(missing_days), 1):
         day_start, day_end_excl = day_bounds_utc(day)
         try:
             pts = list(session.execute(SEL_10M_RANGE_FULL, [coin.id, day_start, day_end_excl], timeout=REQUEST_TIMEOUT))
@@ -593,59 +428,57 @@ def seed_10m_from_daily(coin, missing_days: set[dt.date]) -> int:
     print(f"[{ts()}]    [seed_10m] {coin.symbol} wrote={cnt} ({tdur(t0)})")
     return cnt
 
-# ---------- NEW: Range-based daily backfill with interpolation ----------
-def backfill_daily_from_api_ranges(coin, need_daily: set[dt.date], dt_ranges: list[tuple[dt.datetime, dt.datetime]]) -> int:
-    if not (BACKFILL_DAILY_FROM_API and need_daily and dt_ranges):
+def backfill_daily_from_api(coin, need_daily: set[dt.date]) -> int:
+    if not (BACKFILL_DAILY_FROM_API and need_daily):
         return 0
 
-    # Aggregate payloads only for requested ranges
+    days = sorted(need_daily)
+    start_day = days[0]
+    end_day   = days[-1]
+    print(f"[{ts()}]    [api] {coin.symbol} tiling {start_day}→{end_day} in <=90d windows …")
+
+    WINDOW_DAYS = 90
+    cur = start_day
     all_prices, all_mcaps, all_vols = [], [], []
-    for (start_dt, end_dt) in dt_ranges:
+
+    while cur <= end_day:
+        w_end = min(end_day, cur + dt.timedelta(days=WINDOW_DAYS - 1))
+        start_dt, _ = day_bounds_utc(cur)
+        end_dt = dt.datetime(w_end.year, w_end.month, w_end.day, 23, 59, 59, tzinfo=timezone.utc)
+
         try:
             data = http_get(
                 f"/coins/{coin.id}/market_chart/range",
-                params={"vs_currency": "usd", "from": int(to_utc(start_dt).timestamp()), "to": int(to_utc(end_dt).timestamp())}
+                params={"vs_currency": "usd", "from": int(start_dt.timestamp()), "to": int(end_dt.timestamp())}
             )
         except Exception as e:
-            print(f"[{ts()}]      · window {start_dt.date()}→{end_dt.date()} failed: {e}")
+            print(f"[{ts()}]      · window {cur}→{w_end} failed: {e}")
+            cur = w_end + dt.timedelta(days=1)
+            time.sleep(PAUSE_S)
             continue
 
         prices = data.get("prices", []) or []
         mcaps  = data.get("market_caps", []) or []
         vols   = data.get("total_volumes", []) or []
-        print(f"[{ts()}]      · window {start_dt.date()}→{end_dt.date()} sizes: prices={len(prices)} mcaps={len(mcaps)} vols={len(vols)}")
+        print(f"[{ts()}]      · window {cur}→{w_end} sizes: prices={len(prices)} mcaps={len(mcaps)} vols={len(vols)}")
 
         all_prices.extend(prices)
         all_mcaps.extend(mcaps)
         all_vols.extend(vols)
 
         time.sleep(PAUSE_S + random.uniform(0.0, 0.25))
+        cur = w_end + dt.timedelta(days=1)
 
     if not all_prices:
-        print(f"[{ts()}]    [api] no payload for {coin.symbol} across planned windows → skip (wrote=0)")
-        add_to_neg_cache(coin.id)
+        print(f"[{ts()}]    [api] no payload for {coin.symbol} across all windows → skip (wrote=0)")
         return 0
 
-    # Build buckets constrained to actually-needed days
-    days = sorted(need_daily)
-    start_day, end_day = days[0], days[-1]
     ohlc   = bucket_daily_ohlc(all_prices, start_day, end_day)
     m_last = bucket_daily_last(all_mcaps,  start_day, end_day)
     v_last = bucket_daily_last(all_vols,   start_day, end_day)
     print(f"[{ts()}]    [api] bucketed days with price={len(ohlc)}")
 
-    # ---- NEW: Interpolate market_cap & volume_24h if missing ----
-    if INTERPOLATE_MCAP_VOL_DAILY:
-        # Prepare per-day maps (value or None) just across needed days
-        m_series = {d: (m_last.get(d, {}).get("val")) for d in days}
-        v_series = {d: (v_last.get(d, {}).get("val")) for d in days}
-        m_series = interpolate_daily_series(days, m_series, max_gap_days=INTERP_MAX_DAYS)
-        v_series = interpolate_daily_series(days, v_series, max_gap_days=INTERP_MAX_DAYS)
-    else:
-        m_series = {d: (m_last.get(d, {}).get("val")) for d in days}
-        v_series = {d: (v_last.get(d, {}).get("val")) for d in days}
-
-    # Normalize rolling states
+    # Normalize rolling states to UTC-aware
     start_dt, _ = day_bounds_utc(start_day)
     end_dt      = dt.datetime(end_day.year, end_day.month, end_day.day, 23, 59, 59, tzinfo=timezone.utc)
     raw = list(session.execute(SEL_ROLLING_RANGE, [coin.id, start_dt, end_dt + dt.timedelta(seconds=1)], timeout=REQUEST_TIMEOUT))
@@ -663,6 +496,7 @@ def backfill_daily_from_api_ranges(coin, need_daily: set[dt.date], dt_ranges: li
     cur_rank = getattr(coin, "market_cap_rank", None)
     cur_circ = None
     cur_tot  = None
+
     def advance_state_until(day_end_dt):
         nonlocal st_i, cur_rank, cur_circ, cur_tot
         while st_i + 1 < len(states) and states[st_i + 1][0] <= day_end_dt:
@@ -676,10 +510,10 @@ def backfill_daily_from_api_ranges(coin, need_daily: set[dt.date], dt_ranges: li
     cnt_daily = 0
     prev_close = None
 
-    for d in days:
-        row  = ohlc.get(d)
-        mcap = m_series.get(d)
-        vol  = v_series.get(d)
+    for di, d in enumerate(days, 1):
+        row = ohlc.get(d)
+        mcap = m_last.get(d, {}).get("val")
+        vol  = v_last.get(d,  {}).get("val")
         if not row:
             continue
 
@@ -691,7 +525,9 @@ def backfill_daily_from_api_ranges(coin, need_daily: set[dt.date], dt_ranges: li
                 o = h = l = c
                 csrc = "flat"
             else:
-                o = float(prev_close); h = max(o, c); l = min(o, c)
+                o = float(prev_close)
+                h = max(o, c)
+                l = min(o, c)
                 csrc = "prev_close"
 
         day_end = day_bounds_utc(d)[1] - dt.timedelta(seconds=1)
@@ -778,29 +614,6 @@ def repair_hourly_from_api_or_interp(coin, missing_hours: set[dt.datetime]) -> i
         price = pl + (pr - pl) * w
         return float(price), to_utc(right)  # anchor last_updated
 
-    # NEW: interpolation for hourly mcap/vol
-    def interp_generic(h: dt.datetime, amap: dict[dt.datetime, tuple[float|None, dt.datetime]], max_gap_hours: int | None):
-        if not amap:
-            return None
-        known_hours = sorted([k for k,(v,_) in amap.items() if v is not None])
-        if not known_hours:
-            return None
-        if h in amap and amap[h][0] is not None:
-            return float(amap[h][0])
-        left = max([k for k in known_hours if k < h], default=None)
-        right = min([k for k in known_hours if k > h], default=None)
-        if left is None and right is None:
-            return None
-        if left is None:
-            return float(amap[right][0])
-        if right is None:
-            return float(amap[left][0])
-        gap = int((right - left).total_seconds() // 3600)
-        if (max_gap_hours is not None) and (gap > max_gap_hours):
-            return float(amap[left][0])
-        y = _interp_linear(left.timestamp(), float(amap[left][0]), right.timestamp(), float(amap[right][0]), h.timestamp())
-        return float(y)
-
     # prev_close before first missing hour
     prev_row = session.execute(SEL_PREV_CLOSE, [coin.id, hours_sorted[0]], timeout=REQUEST_TIMEOUT).one()
     prev_close = float(prev_row.close) if (prev_row and prev_row.close is not None) else None
@@ -859,20 +672,8 @@ def repair_hourly_from_api_or_interp(coin, missing_hours: set[dt.datetime]) -> i
             hih = max(o, c)
             lo  = min(o, c)
 
-        # NEW: mcap/vol interpolation for hourly
-        if mc_map and (h in mc_map) and (mc_map[h][0] is not None):
-            mcap = float(mc_map[h][0])
-        elif INTERPOLATE_MCAP_VOL_HOURLY:
-            mcap = interp_generic(h, mc_map, INTERP_MAX_HOURS)
-        else:
-            mcap = None
-
-        if v_map and (h in v_map) and (v_map[h][0] is not None):
-            vol = float(v_map[h][0])
-        elif INTERPOLATE_MCAP_VOL_HOURLY:
-            vol = interp_generic(h, v_map, INTERP_MAX_HOURS)
-        else:
-            vol = None
+        mcap = mc_map.get(h, (None, None))[0] if mc_map else None
+        vol  = v_map.get(h, (None, None))[0] if v_map else None
 
         hr_end = h + dt.timedelta(hours=1) - dt.timedelta(seconds=1)
         advance_state_until(hr_end)
@@ -915,21 +716,16 @@ def main():
     print(f"[{ts()}] DQ windows → 10m: {start_10m_date.isoformat()}→{last_inclusive.isoformat()} | "
           f"daily: {start_daily_date.isoformat()}→{last_inclusive.isoformat()}")
 
+    coins_needing_api = []
     fixedD_local = fixed10_seeded = 0
     t_all = time.perf_counter()
-
-    neg_cache = load_neg_cache()
-    api_plans = []  # each: {"coin": coin, "ranges": [(start_dt, end_dt)], "need_days": set[date]}
 
     for i, coin in enumerate(assets, 1):
         t_coin = time.perf_counter()
         try:
             print(f"[{ts()}] → Coin {i}/{len(assets)}: {coin.symbol} ({coin.id}) rank={coin.market_cap_rank}")
 
-            if coin.id in neg_cache:
-                print(f"[{ts()}]    Skip {coin.symbol} — in negative cache")
-                continue
-
+            # Which days exist in 10m and daily windows
             have_10m = existing_days_10m(
                 coin.id,
                 dt.datetime.combine(start_10m_date, dt.time.min, tzinfo=timezone.utc),
@@ -940,10 +736,14 @@ def main():
             have_daily = existing_days_daily(coin.id, start_daily_date, last_inclusive)
             print(f"[{ts()}]    Found {len(have_daily)} days with daily")
 
+            # What’s missing overall in the daily window
             need_daily_all = want_daily_days - have_daily
+
+            # Limit local (10m-derived) fixes strictly to days we actually have 10m for
             need_daily_local = need_daily_all & have_10m
             need_daily_api   = need_daily_all - need_daily_local
 
+            # 10m table itself (for optional seeding from daily)
             need_10m = want_10m_days - have_10m
 
             print(f"[{ts()}]    Missing → 10m:{len(need_10m)} "
@@ -953,19 +753,29 @@ def main():
                   f"seed_10m={bool(need_10m and SEED_10M_FROM_DAILY)} "
                   f"api_pass={bool(need_daily_api and BACKFILL_DAILY_FROM_API)}")
 
+            # Local daily repair from 10m (only for days we KNOW 10m exists)
             if need_daily_local and FIX_DAILY_FROM_10M:
                 fixed = repair_daily_from_10m(coin, need_daily_local)
                 fixedD_local += fixed
                 print(f"[{ts()}]    repair_daily_from_10m → wrote {fixed} rows")
+
+                # Refresh daily coverage after local write
                 if fixed:
                     have_daily = existing_days_daily(coin.id, start_daily_date, last_inclusive)
 
+            # Optional: seed 10m from daily for gaps inside the 10m window
             if need_10m and SEED_10M_FROM_DAILY:
                 fixed = seed_10m_from_daily(coin, need_10m)
                 fixed10_seeded += fixed
                 print(f"[{ts()}]    seed_10m_from_daily → wrote {fixed} rows")
 
-            # Hourly window repair
+            # Defer ONLY the remaining missing daily days to API
+            remaining_daily = (want_daily_days - have_daily)
+            if remaining_daily and BACKFILL_DAILY_FROM_API:
+                print(f"[{ts()}]    → defer to API: {len(remaining_daily)} daily day(s)")
+                coins_needing_api.append((coin, remaining_daily))
+
+            # ----- Hourly window repair (last DAYS_HOURLY days) -----
             if FILL_HOURLY:
                 start_hour_dt = dt.datetime.combine(last_inclusive - dt.timedelta(days=DAYS_HOURLY-1),
                                                     dt.time.min, tzinfo=timezone.utc)
@@ -982,26 +792,6 @@ def main():
                     except Exception as e:
                         print(f"[{ts()}]    [WARN] hourly repair failed for {coin.symbol}: {e}")
 
-            # PLAN daily API gaps
-            remaining_daily = (want_daily_days - have_daily)
-            if remaining_daily and BACKFILL_DAILY_FROM_API:
-                if not have_10m and not have_daily:
-                    print(f"[{ts()}]    Heuristic-skip API for {coin.symbol}: no local rows in window")
-                else:
-                    runs = group_contiguous_dates(remaining_daily)
-                    padded_runs = []
-                    for s, e in runs:
-                        s_pad = max(start_daily_date, s - dt.timedelta(days=PAD_DAYS))
-                        e_pad = min(last_inclusive,   e + dt.timedelta(days=PAD_DAYS))
-                        padded_runs.extend(clamp_date_range(s_pad, e_pad, MAX_RANGE_DAYS))
-                    dt_ranges = []
-                    for s, e in padded_runs:
-                        start_dt = dt.datetime(s.year, s.month, s.day, 0, 0, 0, tzinfo=timezone.utc)
-                        end_dt   = dt.datetime(e.year, e.month, e.day, 23, 59, 59, tzinfo=timezone.utc)
-                        dt_ranges.append((start_dt, end_dt))
-                    if dt_ranges:
-                        api_plans.append({"coin": coin, "ranges": dt_ranges, "need_days": remaining_daily})
-
             time.sleep(PAUSE_S)
             elapsed_coin = time.perf_counter() - t_coin
             print(f"[{ts()}] ← Done {coin.symbol} in {elapsed_coin:.2f}s")
@@ -1010,47 +800,32 @@ def main():
                 print(f"[{ts()}] Progress {i}/{len(assets)} (last coin {elapsed_coin:.2f}s)")
 
         except Exception as e:
-            print(f"[{ts()}] [WARN] coin {getattr(coin, 'symbol', '?')} ({getattr(coin, 'id', '?')}) failed: {e}")
+            print(f"[{ts()}] [WARN] coin {coin.symbol} ({coin.id}) failed: {e}")
             continue
 
-    # Execute the API plan with a global request budget
     fixedD_api = 0
-    if BACKFILL_DAILY_FROM_API and api_plans:
-        def _plan_days(p):
-            return sum(((r[1]-r[0]).days + 1) for r in p["ranges"])
-        api_plans.sort(key=_plan_days)
-
-        coins_done = 0
-        reqs_left  = DAILY_API_REQ_BUDGET
-        for plan in api_plans[:DQ_MAX_API_COINS_RUN]:
-            coin   = plan["coin"]
-            ranges = plan["ranges"]
-            if reqs_left <= 0:
-                break
-            to_run = []
-            for r in ranges:
-                if reqs_left <= 0: break
-                to_run.append(r)
-                reqs_left -= 1
-            if not to_run:
-                break
+    if BACKFILL_DAILY_FROM_API and coins_needing_api:
+        api_targets = coins_needing_api[:DQ_MAX_API_COINS_RUN]
+        print(f"[{ts()}] Coins still missing daily after local repair: {len(coins_needing_api)}; "
+              f"API target this run: {len(api_targets)} (cap={DQ_MAX_API_COINS_RUN})")
+        for j, (coin, need_daily) in enumerate(api_targets, 1):
+            if VERBOSE:
+                print(f"[{ts()}] API repair {j}/{len(api_targets)} → {coin.symbol} ({coin.id}) "
+                      f"need_daily={len(need_daily)}")
             try:
-                fixedD_api += backfill_daily_from_api_ranges(coin, plan["need_days"], to_run)
-                coins_done += 1
+                fixedD_api += backfill_daily_from_api(coin, need_daily)
             except Exception as e:
                 print(f"[{ts()}]  · API repair failed for {coin.symbol}: {e}")
             time.sleep(PAUSE_S)
-
-        remaining = max(0, len(api_plans) - coins_done)
-        print(f"[{ts()}] API pass done: coins={coins_done} daily_rows={fixedD_api} remaining_coins={remaining} "
-              f"(requests_budget_left={reqs_left})")
     else:
         print(f"[{ts()}] No API pass needed or disabled.")
 
     print(f"[{ts()}] DONE in {tdur(t_all)} | Local fixes → daily_from_10m:{fixedD_local} "
           f"{'(10m_seeded:'+str(fixed10_seeded)+')' if SEED_10M_FROM_DAILY else ''} "
           f"| API fixes → daily:{fixedD_api} "
-          f"| Planned coins for API (pre-cap): {len(api_plans)}")
+          f"| Remaining coins needing API on future runs: "
+          f"{max(0, len(coins_needing_api) - (0 if not BACKFILL_DAILY_FROM_API else DQ_MAX_API_COINS_RUN))}")
+
 
 if __name__ == "__main__":
     try:

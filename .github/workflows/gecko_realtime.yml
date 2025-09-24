@@ -5,7 +5,7 @@ on:
     inputs:
       run_01:
         {
-          description: "AA_gck_load_prices_all.py (5-in-1)",
+          description: "AA_gck_load_prices_live.py (5-in-1)",
           required: false,
           default: "true",
         }
@@ -85,7 +85,7 @@ jobs:
           GECKO_MCAP_BUCKET: "categories"
 
           VERBOSE_MODE: ${{ github.event.inputs.VERBOSE_MODE || '0' }}
-        run: python prices/AA_gck_load_prices_all.py
+        run: python prices/AA_gck_load_prices_live.py
 
       - name: 02 Append 10m from live_rolling
         if: ${{ github.event.inputs.run_02 == 'true' }}
