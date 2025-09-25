@@ -6,29 +6,25 @@ on:
   workflow_dispatch:
     inputs:
       DRY_RUN:
-        description: "Dry run (no writes) 0/1"
-        required: false
-        default: "0"
+        {
+          description: "Dry run (no writes) 0/1",
+          required: false,
+          default: "0",
+        }
       VERBOSE:
-        description: "Verbose logs 0/1"
-        required: false
-        default: "0"
+        { description: "Verbose logs 0/1", required: false, default: "0" }
       BACKFILL_DAILY_FROM_API:
-        description: "Use API to fill missing daily 0/1"
-        required: false
-        default: "1"
+        { description: "Use API backfill 0/1", required: false, default: "1" }
       SEED_10M_FROM_DAILY:
-        description: "Seed synthetic 10m from daily 0/1 (usually keep OFF)"
-        required: false
-        default: "0"
+        {
+          description: "Seed 10m from daily 0/1",
+          required: false,
+          default: "0",
+        }
       TOP_N_DQ:
-        description: "Max coins to scan (blank=default)"
-        required: false
-        default: ""
+        { description: "Max coins to scan", required: false, default: "" }
       DQ_MAX_API_COINS_RUN:
-        description: "API backfills per run (cap)"
-        required: false
-        default: "20"
+        { description: "API backfills per run", required: false, default: "20" }
 
 permissions:
   contents: read
@@ -46,14 +42,11 @@ jobs:
       PYTHONUNBUFFERED: "1"
       PYTHONUTF8: "1"
       PYTHONWARNINGS: "ignore::DeprecationWarning"
-      # Make backend/astra_connect importable everywhere:
-      PYTHONPATH: ${{ github.workspace }}/backend:${{ env.PYTHONPATH }}
+      PYTHONPATH: ${{ github.workspace }}/backend
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
@@ -78,40 +71,33 @@ jobs:
       - name: Data Quality & Repair
         timeout-minutes: 25
         env:
-          # Astra
           ASTRA_BUNDLE_PATH: secure-connect.zip
           ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
           ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
 
-          # Tables (all used by the repair script)
           TABLE_LIVE: "gecko_prices_live"
           TEN_MIN_TABLE: "gecko_prices_10m_7d"
           DAILY_TABLE: "gecko_candles_daily_contin"
           TABLE_ROLLING: "gecko_prices_live_rolling"
           HOURLY_TABLE: "gecko_candles_hourly_30d"
 
-          # Scope & windows
           TOP_N_DQ: ${{ github.event.inputs.TOP_N_DQ != '' && github.event.inputs.TOP_N_DQ || '110' }}
           DQ_MAX_COINS: "210"
           DQ_WINDOW_10M_DAYS: "7"
           DQ_WINDOW_DAILY_DAYS: "365"
           DQ_WINDOW_HOURLY_DAYS: "30"
 
-          # Behavior toggles
           FIX_DAILY_FROM_10M: "1"
           BACKFILL_DAILY_FROM_API: ${{ github.event.inputs.BACKFILL_DAILY_FROM_API || '1' }}
           SEED_10M_FROM_DAILY: ${{ github.event.inputs.SEED_10M_FROM_DAILY || '0' }}
           DQ_DRY_RUN: ${{ github.event.inputs.DRY_RUN || '0' }}
 
-          # API pass caps
           DAILY_API_REQ_BUDGET: "150"
           DQ_MAX_API_COINS_RUN: ${{ github.event.inputs.DQ_MAX_API_COINS_RUN || '20' }}
 
-          # (Optional) CoinGecko creds if you use API backfill
           COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
           COINGECKO_API_TIER: ${{ secrets.COINGECKO_API_TIER }}
 
-          # Tuning
           DQ_REQUEST_TIMEOUT_SEC: "30"
           DQ_CONNECT_TIMEOUT_SEC: "15"
           DQ_FETCH_SIZE: "500"
@@ -119,10 +105,7 @@ jobs:
           DQ_BACKOFF_SEC: "4"
           DQ_PAUSE_PER_COIN: "0.2"
 
-          # Logging
           DQ_LOG_EVERY: "10"
           DQ_VERBOSE: ${{ github.event.inputs.VERBOSE || '0' }}
           DQ_TIME_API: "1"
-        run: |
-          set -euo pipefail
-          python prices/FF_gck_dq_repair_timeseries.py
+        run: python prices/FF_gck_dq_repair_timeseries.py

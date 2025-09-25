@@ -24,7 +24,7 @@ permissions:
 
 concurrency:
   group: gecko-prices-candles-${{ github.ref }}
-  cancel-in-progress: false # let a candle run finish
+  cancel-in-progress: false
 
 jobs:
   run:
@@ -35,8 +35,7 @@ jobs:
       PYTHONUNBUFFERED: "1"
       PYTHONUTF8: "1"
       PYTHONWARNINGS: default
-      # Make shared connector importable (backend/astra_connect/...):
-      PYTHONPATH: ${{ github.workspace }}/backend:${{ env.PYTHONPATH }}
+      PYTHONPATH: ${{ github.workspace }}/backend
     steps:
       - uses: actions/checkout@v4
 
@@ -50,12 +49,8 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          # Use your pinned requirements if present, otherwise minimal set:
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          else
-            pip install "cassandra-driver==3.29.0" requests python-dotenv tzdata
-          fi
+          pip install "cassandra-driver==3.29.0" requests python-dotenv tzdata
+          # Or: pip install -r requirements.txt
 
       - name: Astra bundle
         run: |
@@ -76,7 +71,7 @@ jobs:
           CONNECT_TIMEOUT_SEC: "15"
           FETCH_SIZE: "500"
           SLOT_DELAY_SEC: "120"
-          CURRENT_ONLY: "1" # prev + current hour
+          CURRENT_ONLY: "1"
           FINALIZE_PREV: "1"
           PROGRESS_EVERY: "20"
           VERBOSE_MODE: ${{ github.event.inputs.VERBOSE_MODE || '0' }}

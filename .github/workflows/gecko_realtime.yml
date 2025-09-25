@@ -4,25 +4,22 @@ on:
   workflow_dispatch:
     inputs:
       run_01:
-        description: "AA_gck_load_prices_live.py (5-in-1)"
-        required: false
-        default: "true"
+        {
+          description: "AA_gck_load_prices_live.py (5-in-1)",
+          required: false,
+          default: "true",
+        }
       run_02:
-        description: "CC_gck_append_10m_from_live.py"
-        required: false
-        default: "true"
-      TOP_N:
-        description: "Override TOP_N"
-        required: false
-        default: ""
+        {
+          description: "CC_gck_append_10m_from_live.py",
+          required: false,
+          default: "true",
+        }
+      TOP_N: { description: "Override TOP_N", required: false, default: "" }
       RANK_TOP_N:
-        description: "Override RANK_TOP_N"
-        required: false
-        default: ""
+        { description: "Override RANK_TOP_N", required: false, default: "" }
       VERBOSE_MODE:
-        description: "Verbose (0/1)"
-        required: false
-        default: "0"
+        { description: "Verbose (0/1)", required: false, default: "0" }
 
 permissions:
   contents: read
@@ -40,8 +37,8 @@ jobs:
       PYTHONUNBUFFERED: "1"
       PYTHONUTF8: "1"
       PYTHONWARNINGS: default
-      # Make our shared connector importable in all steps:
-      PYTHONPATH: ${{ github.workspace }}/backend:${{ env.PYTHONPATH }}
+      # Make backend/astra_connect importable:
+      PYTHONPATH: ${{ github.workspace }}/backend
     steps:
       - uses: actions/checkout@v4
 
@@ -71,13 +68,11 @@ jobs:
           ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
           ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
 
-          # knobs
           TOP_N: ${{ github.event.inputs.TOP_N != '' && github.event.inputs.TOP_N || secrets.TOP_N || '200' }}
-          RANK_TOP_N: ${{ github.event.inputs.RANK_TOP_N != '' && github.event.inputs.RANK_TOP_N || secrets.RANK_TOP_N || '200' }}
-          STALE_WARN_MINUTES: "10" # warn only (no dropping)
-          REQUIRED_LIVE_MIN: "140" # safety guard before TRUNCATE (optional)
+          RANK_TOP_N: ${{ github.event.inputs.RANK_TOP_N != '' && github.event.inputs.RANK_TOP_N || secrets.TOP_N || '200' }}
+          STALE_WARN_MINUTES: "10"
+          REQUIRED_LIVE_MIN: "140"
 
-          # I/O & perf
           RETRIES: "3"
           BACKOFF_MIN: "5"
           MAX_BACKOFF_MIN: "30"
@@ -85,7 +80,6 @@ jobs:
           CONNECT_TIMEOUT_SEC: "15"
           BATCH_FLUSH_EVERY: "40"
 
-          # ranked partitions
           RANK_BUCKET: "all"
           GECKO_MCAP_BUCKET: "categories"
 
