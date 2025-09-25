@@ -2,29 +2,33 @@ name: dq-repair
 
 on:
   schedule:
-    - cron: "20 3 */2 * *" # 03:20 UTC every other day
+    - cron: "20 3 */2 * *" # 03:20 UTC every 2 days
   workflow_dispatch:
     inputs:
       DRY_RUN:
-        {
-          description: "Dry run (no writes) 0/1",
-          required: false,
-          default: "0",
-        }
+        description: "Dry run (no writes) 0/1"
+        required: false
+        default: "0"
       VERBOSE:
-        { description: "Verbose logs 0/1", required: false, default: "0" }
+        description: "Verbose logs 0/1"
+        required: false
+        default: "0"
       BACKFILL_DAILY_FROM_API:
-        { description: "Use API backfill 0/1", required: false, default: "1" }
+        description: "Use API to fill missing daily 0/1"
+        required: false
+        default: "1"
       SEED_10M_FROM_DAILY:
-        {
-          description: "Seed 10m from daily 0/1",
-          required: false,
-          default: "0",
-        }
+        description: "Seed synthetic 10m from daily 0/1"
+        required: false
+        default: "0"
       TOP_N_DQ:
-        { description: "Max coins to scan", required: false, default: "" }
-      DQ_MAX_API_COINS_RUN:
-        { description: "API backfills per run", required: false, default: "20" }
+        description: "Max coins to scan (blank=default)"
+        required: false
+        default: ""
+      DQ_MAX_API_COINS_PER_RUN:
+        description: "API backfills per run (cap)"
+        required: false
+        default: "20"
 
 permissions:
   contents: read
@@ -42,7 +46,6 @@ jobs:
       PYTHONUNBUFFERED: "1"
       PYTHONUTF8: "1"
       PYTHONWARNINGS: "ignore::DeprecationWarning"
-      PYTHONPATH: ${{ github.workspace }}/backend
     steps:
       - uses: actions/checkout@v4
 
@@ -56,17 +59,18 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          else
-            pip install "cassandra-driver==3.29.0" requests python-dotenv tzdata
-          fi
+          pip install "cassandra-driver==3.29.0" requests python-dotenv tzdata
+          # Or: pip install -r requirements.txt
+
+      - name: Export PYTHONPATH (repo root)
+        run: echo "PYTHONPATH=." >> "$GITHUB_ENV"
 
       - name: Write Astra secure connect bundle
         run: |
           set -euo pipefail
           echo "${{ secrets.ASTRA_BUNDLE_BASE64 }}" | base64 -d > secure-connect.zip
-          test -s secure-connect.zip
+          test -s secure-connect.zip || { echo "secure-connect.zip missing/empty"; exit 1; }
+          ls -lh secure-connect.zip
 
       - name: Data Quality & Repair
         timeout-minutes: 25
@@ -78,8 +82,8 @@ jobs:
           TABLE_LIVE: "gecko_prices_live"
           TEN_MIN_TABLE: "gecko_prices_10m_7d"
           DAILY_TABLE: "gecko_candles_daily_contin"
-          TABLE_ROLLING: "gecko_prices_live_rolling"
           HOURLY_TABLE: "gecko_candles_hourly_30d"
+          TABLE_ROLLING: "gecko_prices_live_rolling"
 
           TOP_N_DQ: ${{ github.event.inputs.TOP_N_DQ != '' && github.event.inputs.TOP_N_DQ || '110' }}
           DQ_MAX_COINS: "210"
@@ -92,11 +96,9 @@ jobs:
           SEED_10M_FROM_DAILY: ${{ github.event.inputs.SEED_10M_FROM_DAILY || '0' }}
           DQ_DRY_RUN: ${{ github.event.inputs.DRY_RUN || '0' }}
 
-          DAILY_API_REQ_BUDGET: "150"
-          DQ_MAX_API_COINS_RUN: ${{ github.event.inputs.DQ_MAX_API_COINS_RUN || '20' }}
-
-          COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
-          COINGECKO_API_TIER: ${{ secrets.COINGECKO_API_TIER }}
+          DQ_MAX_API_COINS_PER_RUN: ${{ github.event.inputs.DQ_MAX_API_COINS_PER_RUN || '20' }}
+          DAILY_API_MAX_RANGE_DAYS: "90"
+          DAILY_API_PAD_DAYS: "1"
 
           DQ_REQUEST_TIMEOUT_SEC: "30"
           DQ_CONNECT_TIMEOUT_SEC: "15"
