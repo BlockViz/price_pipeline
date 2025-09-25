@@ -1,4 +1,4 @@
-# astra_connect.py
+# astra_connect/connect.py
 import os
 import sys
 import pathlib
@@ -16,31 +16,57 @@ from cassandra.policies import RoundRobinPolicy
 
 # ----------------------------- Repo / .env -----------------------------
 def _find_repo_root(start: Optional[pathlib.Path] = None) -> pathlib.Path:
-    """Walk upward from `start` (or CWD) until a project marker is found."""
+    """
+    Walk upward from `start` (or CWD) until a project marker is found.
+    Fallback to the package's parent (i.e., the directory containing `astra_connect/`),
+    NOT the drive root.
+    """
     here = (start or pathlib.Path.cwd()).resolve()
     markers = (".env", "pyproject.toml", ".git")
     for p in [here, *here.parents]:
         if any((p / m).exists() for m in markers):
             return p
-    # Fallback: topmost ancestor
-    return here.anchor and pathlib.Path(here.anchor) or here
+    # Fallback: the folder that contains this package (usually .../backend)
+    return pathlib.Path(__file__).resolve().parents[1]
 
 
 def _load_env(override: bool = False) -> pathlib.Path:
     """
-    Load .env from the nearest project root. Returns the root path used.
-    If the shell already has env vars you want the .env to win over, pass override=True.
+    Load .env from (in order):
+      1) DOTENV_FILE (if set),
+      2) repo_root/.env,
+      3) repo_root/backend/.env,
+      4) package_dir/.env,
+      5) find_dotenv(usecwd=True).
+    Returns the directory from which a .env was loaded; if none, returns repo_root.
     """
-    # Prefer python-dotenv's search from CWD; if it misses, use our root finder.
-    path = find_dotenv(usecwd=True)
-    if not path:
-        root = _find_repo_root()
-        path = str(root / ".env")
-    else:
-        root = pathlib.Path(path).resolve().parent
+    # 0) explicit override
+    explicit = os.getenv("DOTENV_FILE")
+    if explicit:
+        c = pathlib.Path(explicit).expanduser()
+        if c.is_file():
+            load_dotenv(dotenv_path=str(c), override=override)
+            return c.parent
 
-    load_dotenv(dotenv_path=path, override=override)
-    return root
+    pkg_dir = pathlib.Path(__file__).resolve().parents[1]   # .../backend
+    repo_root = _find_repo_root()
+    candidates = [
+        repo_root / ".env",
+        repo_root / "backend" / ".env",
+        pkg_dir / ".env",
+    ]
+    for c in candidates:
+        if c.is_file():
+            load_dotenv(dotenv_path=str(c), override=override)
+            return c.parent
+
+    # 5) last resort: search upward from CWD
+    found = find_dotenv(usecwd=True)
+    if found:
+        load_dotenv(dotenv_path=found, override=override)
+        return pathlib.Path(found).resolve().parent
+
+    return repo_root
 
 
 def _norm_path(p: Optional[str]) -> Optional[str]:

@@ -1,0 +1,14 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Backend: backfill",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/backend/prices/onetime_and_config/pull_from_gecko_pro/backfill_daily_candles_cg_pro.py",
+      "cwd": "${workspaceFolder}/backend",
+      "console": "integratedTerminal",
+      "envFile": "${workspaceFolder}/backend/.env"
+    }
+  ]
+}

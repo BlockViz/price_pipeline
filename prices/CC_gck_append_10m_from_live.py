@@ -1,73 +1,67 @@
 #!/usr/bin/env python3
-# prices/02_append_10m_from_live.py
+# prices/CC_gck_append_10m_from_live.py
+#
+# Append 10-minute slots into:
+#   - gecko_prices_10m_7d      (IF NOT EXISTS; from rolling or carry)
+#   - gecko_market_cap_10m_7d  (category aggregates per slot; upsert)
+#
+# Reads from:
+#   - gecko_prices_live         (for the list of assets, incl. category)
+#   - gecko_prices_live_rolling (for latest points per slot / carry)
+#
+# Notes:
+# - Uses shared Astra connector (astra_connect.connect).
+# - Works with .env locally or pure env vars in CI/CD.
+# - “Carry” uses the latest point before the slot if the slot is empty,
+#   capped by ALLOW_CARRY_MAX_SLOTS consecutive slots.
+
 import os, time
 from datetime import datetime, timedelta, timezone
-import sys, pathlib
+from typing import Tuple, List, Dict, Any
 
-# ───────────────────── Repo root & helpers ─────────────────────
-_REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.append(str(_REPO_ROOT))
+# ───────────────────────── Astra connector ─────────────────────────
+from astra_connect.connect import get_session, AstraConfig
 
-try:
-    from paths import rel, chdir_repo_root
-except Exception:
-    def rel(*parts: str) -> pathlib.Path:
-        return _REPO_ROOT.joinpath(*parts)
-    def chdir_repo_root() -> None:
-        os.chdir(_REPO_ROOT)
-
-# Ensure consistent CWD (so relative files like secure-connect.zip work)
-chdir_repo_root()
-
-# ───────────────────────── 3rd-party ─────────────────────────
-from cassandra import OperationTimedOut, ReadTimeout, ReadFailure, WriteTimeout, DriverException
-from cassandra.cluster import Cluster, EXEC_PROFILE_DEFAULT, ExecutionProfile
-from cassandra.auth import PlainTextAuthProvider
-from cassandra.policies import RoundRobinPolicy
-from cassandra.query import SimpleStatement
-from dotenv import load_dotenv
-
-# Load .env from repo root explicitly
-load_dotenv(dotenv_path=rel(".env"))
+# Load env (from .env if present, else process env), validate bundle/token
+AstraConfig.from_env()
 
 # ───────────────────────── Config ─────────────────────────
-BUNDLE         = os.getenv("ASTRA_BUNDLE_PATH", "secure-connect.zip")
-ASTRA_TOKEN    = os.getenv("ASTRA_TOKEN")
-KEYSPACE       = os.getenv("ASTRA_KEYSPACE", "default_keyspace")
-TOP_N          = int(os.getenv("TOP_N", "200"))
+TOP_N              = int(os.getenv("TOP_N", "200"))
 
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT_SEC", "30"))
-CONNECT_TIMEOUT = int(os.getenv("CONNECT_TIMEOUT_SEC", "15"))
-FETCH_SIZE      = int(os.getenv("FETCH_SIZE", "500"))
+REQUEST_TIMEOUT    = int(os.getenv("REQUEST_TIMEOUT_SEC", "30"))
+FETCH_SIZE         = int(os.getenv("FETCH_SIZE", "500"))
 
-SLOT_MINUTES    = int(os.getenv("SLOT_MINUTES", "10"))
-SLOT_DELAY_SEC  = int(os.getenv("SLOT_DELAY_SEC", "120"))
-SLOTS_BACKFILL  = int(os.getenv("SLOTS_BACKFILL", "12"))       # ~2h
+SLOT_MINUTES       = int(os.getenv("SLOT_MINUTES", "10"))
+SLOT_DELAY_SEC     = int(os.getenv("SLOT_DELAY_SEC", "120"))
+SLOTS_BACKFILL     = int(os.getenv("SLOTS_BACKFILL", "12"))            # ~2h
 ALLOW_CARRY_MAX_SLOTS = int(os.getenv("ALLOW_CARRY_MAX_SLOTS", "1"))
 
-# Gecko tables (defaults match your new schema)
-TABLE_LATEST    = os.getenv("TABLE_LATEST", "gecko_prices_live")
-TABLE_ROLLING   = os.getenv("TABLE_ROLLING", "gecko_prices_live_rolling")
-TABLE_OUT       = os.getenv("TABLE_OUT", "gecko_prices_10m_7d")
-TABLE_MCAP_OUT  = os.getenv("TABLE_MCAP_10M", "gecko_market_cap_10m_7d")
+# Tables (defaults match your schema)
+TABLE_LATEST       = os.getenv("TABLE_LATEST", "gecko_prices_live")
+TABLE_ROLLING      = os.getenv("TABLE_ROLLING", "gecko_prices_live_rolling")
+TABLE_OUT          = os.getenv("TABLE_OUT", "gecko_prices_10m_7d")
+TABLE_MCAP_OUT     = os.getenv("TABLE_MCAP_10M", "gecko_market_cap_10m_7d")
 
-if not ASTRA_TOKEN:
-    raise SystemExit("Missing ASTRA_TOKEN")
+def now_str() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-def now_str(): return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+def to_utc(x: datetime) -> datetime:
+    if x.tzinfo is None:
+        return x.replace(tzinfo=timezone.utc)
+    return x.astimezone(timezone.utc)
 
-def floor_slot(dt_utc, minutes=SLOT_MINUTES):
+def floor_slot(dt_utc: datetime, minutes: int = SLOT_MINUTES) -> datetime:
+    dt_utc = to_utc(dt_utc)
     return dt_utc.replace(minute=(dt_utc.minute // minutes) * minutes, second=0, microsecond=0)
 
-def slot_start_now():
+def slot_start_now() -> datetime:
     # slight delay so we don't cut into an actively filling slot
     now_ = datetime.now(timezone.utc) - timedelta(seconds=SLOT_DELAY_SEC)
     return floor_slot(now_)
 
-def last_n_slots_oldest_first(n):
+def last_n_slots_oldest_first(n: int) -> List[Tuple[datetime, datetime]]:
     end = slot_start_now() + timedelta(minutes=SLOT_MINUTES)
-    slots = []
+    slots: List[Tuple[datetime, datetime]] = []
     for _ in range(n):
         start = end - timedelta(minutes=SLOT_MINUTES)
         slots.append((start, end))
@@ -75,186 +69,193 @@ def last_n_slots_oldest_first(n):
     slots.reverse()
     return slots
 
-print(f"[{now_str()}] Booting…")
-print(f"[{now_str()}] Connecting to Astra (bundle='{BUNDLE}', keyspace='{KEYSPACE}')")
+# ───────────────────────── Session & prepared statements ─────────────────────────
+print(f"[{now_str()}] Connecting to Astra…")
+session, cluster = get_session(return_cluster=True)
+print(f"[{now_str()}] Connected. keyspace='{session.keyspace}'")
 
-auth = PlainTextAuthProvider("token", ASTRA_TOKEN)
-exec_profile = ExecutionProfile(load_balancing_policy=RoundRobinPolicy(), request_timeout=REQUEST_TIMEOUT)
+from cassandra.query import SimpleStatement
 
-cluster = Cluster(
-    cloud={"secure_connect_bundle": BUNDLE},
-    auth_provider=auth,
-    execution_profiles={EXEC_PROFILE_DEFAULT: exec_profile},
-    connect_timeout=CONNECT_TIMEOUT,
+# gecko live table uses market_cap_rank and (optionally) category
+SEL_COINS = SimpleStatement(
+    f"SELECT id, symbol, name, market_cap_rank, category FROM {TABLE_LATEST}",
+    fetch_size=FETCH_SIZE
 )
 
-try:
-    s = cluster.connect(KEYSPACE)
-    print(f"[{now_str()}] Connected.")
+# Latest point within the slot (rolling is clustered on last_updated)
+# If your table uses CLUSTERING ORDER BY (last_updated DESC), this LIMIT 1
+# returns the newest in-slot row; otherwise add an ORDER BY if your schema allows.
+SEL_IN_SLOT_PS = session.prepare(
+    f"""
+    SELECT last_updated, price_usd, market_cap, volume_24h,
+           market_cap_rank, circulating_supply, total_supply
+    FROM {TABLE_ROLLING}
+    WHERE id=? AND last_updated>=? AND last_updated<? LIMIT 1
+    """
+)
 
-    # gecko live table uses market_cap_rank
-    SEL_COINS = SimpleStatement(
-        f"SELECT id, symbol, name, market_cap_rank, category FROM {TABLE_LATEST}",
-        fetch_size=FETCH_SIZE
-    )
+# Carry: latest point before the slot start (the row *immediately* before)
+SEL_PREV_PS = session.prepare(
+    f"""
+    SELECT last_updated, price_usd, market_cap, volume_24h,
+           market_cap_rank, circulating_supply, total_supply
+    FROM {TABLE_ROLLING}
+    WHERE id=? AND last_updated<? LIMIT 1
+    """
+)
 
-    # Latest point within the slot (rolling is clustered DESC on last_updated)
-    SEL_IN_SLOT_PS = s.prepare(
-        f"SELECT last_updated, price_usd, market_cap, volume_24h, "
-        f"       market_cap_rank, circulating_supply, total_supply "
-        f"FROM {TABLE_ROLLING} "
-        f"WHERE id=? AND last_updated>=? AND last_updated<? LIMIT 1"
-    )
+# Insert into 10m table — includes symbol & name + new fields
+INS_10M_IF_NOT_EXISTS_PS = session.prepare(
+    f"""
+    INSERT INTO {TABLE_OUT}
+      (id, ts, symbol, name, price_usd, market_cap, volume_24h,
+       market_cap_rank, circulating_supply, total_supply, last_updated)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS
+    """
+)
 
-    # Carry: latest point before the slot start
-    SEL_PREV_PS = s.prepare(
-        f"SELECT last_updated, price_usd, market_cap, volume_24h, "
-        f"       market_cap_rank, circulating_supply, total_supply "
-        f"FROM {TABLE_ROLLING} "
-        f"WHERE id=? AND last_updated<? LIMIT 1"
-    )
+# gecko_market_cap_10m_7d(category, ts, last_updated, market_cap, market_cap_rank, volume_24h)
+INS_MCAP_10M_UPSERT = session.prepare(
+    f"""
+    INSERT INTO {TABLE_MCAP_OUT}
+      (category, ts, last_updated, market_cap, market_cap_rank, volume_24h)
+    VALUES (?, ?, ?, ?, ?, ?)
+    """
+)
 
-    # Insert into 10m table — includes symbol & name + new fields
-    INS_10M_IF_NOT_EXISTS_PS = s.prepare(
-        f"INSERT INTO {TABLE_OUT} "
-        f"(id, ts, symbol, name, price_usd, market_cap, volume_24h, "
-        f" market_cap_rank, circulating_supply, total_supply, last_updated) "
-        f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS"
-    )
+# ───────────────────────── Main logic ─────────────────────────
+def main():
+    # Pick coins
+    coins_rows = list(session.execute(SEL_COINS, timeout=REQUEST_TIMEOUT))
+    # keep only ranked coins with positive rank
+    coins = [r for r in coins_rows if isinstance(r.market_cap_rank, int) and r.market_cap_rank > 0]
+    coins.sort(key=lambda r: r.market_cap_rank)
+    coins = coins[:TOP_N]
+    print(f"[{now_str()}] Processing top {len(coins)} coins from {TABLE_LATEST}")
 
-    # ── UPDATED to match schema: gecko_market_cap_10m_7d(category, ts, last_updated, market_cap, market_cap_rank, volume_24h)
-    INS_MCAP_10M_UPSERT = s.prepare(
-        f"INSERT INTO {TABLE_MCAP_OUT} "
-        f"(category, ts, last_updated, market_cap, market_cap_rank, volume_24h) "
-        f"VALUES (?, ?, ?, ?, ?, ?)"
-    )
+    slots = last_n_slots_oldest_first(SLOTS_BACKFILL)
+    if slots:
+        print(f"[{now_str()}] Slots (oldest→newest): {slots[0][0]} .. {slots[-1][1]} (count={len(slots)})")
 
-    def main():
-        coins_rows = list(s.execute(SEL_COINS, timeout=REQUEST_TIMEOUT))
-        # keep only ranked coins with positive rank
-        coins = [r for r in coins_rows if isinstance(r.market_cap_rank, int) and r.market_cap_rank > 0]
-        coins.sort(key=lambda r: r.market_cap_rank)
-        coins = coins[:TOP_N]
-        print(f"[{now_str()}] Processing top {len(coins)} coins from {TABLE_LATEST}")
+    # slot_totals[(slot_start, category)] = {market_cap, volume_24h, last_updated}
+    slot_totals: Dict[Tuple[datetime, str], Dict[str, Any]] = {}
 
-        slots = last_n_slots_oldest_first(SLOTS_BACKFILL)
-        if slots:
-            print(f"[{now_str()}] Slots (oldest→newest): {slots[0][0]} .. {slots[-1][1]} (count={len(slots)})")
+    def bump_slot_total(slot_start: datetime, category: str, mcap_value: float, vol_value: float, last_upd: datetime) -> None:
+        key = (slot_start, category)
+        entry = slot_totals.setdefault(key, {"market_cap": 0.0, "volume_24h": 0.0, "last_updated": last_upd})
+        entry["market_cap"] += float(mcap_value or 0.0)
+        entry["volume_24h"] += float(vol_value or 0.0)
+        if last_upd and (entry["last_updated"] is None or last_upd > entry["last_updated"]):
+            entry["last_updated"] = last_upd
 
-        slot_totals = {}
+    wrote = skipped = 0
 
-        def bump_slot_total(slot_start, category, mcap_value, vol_value, last_upd) -> None:
-            key = (slot_start, category)
-            entry = slot_totals.setdefault(key, {"market_cap": 0.0, "volume_24h": 0.0, "last_updated": last_upd})
-            entry["market_cap"] += mcap_value
-            entry["volume_24h"] += vol_value
-            if last_upd and (entry["last_updated"] is None or last_upd > entry["last_updated"]):
-                entry["last_updated"] = last_upd
+    for ci, c in enumerate(coins, 1):
+        sym = getattr(c, "symbol", None)
+        name = getattr(c, "name", None)
+        mkr = getattr(c, "market_cap_rank", None)
+        coin_id = getattr(c, "id")
+        print(f"[{now_str()}] → [{ci}/{len(coins)}] {sym} ({coin_id}) rank={mkr}")
+        coin_category = (getattr(c, 'category', None) or 'Other').strip() or 'Other'
+        carry_used = 0
 
-        wrote = skipped = 0
+        for si, (start, end) in enumerate(slots, 1):
+            print(f"    slot {si}/{len(slots)} {start} → {end}")
 
-        for ci, c in enumerate(coins, 1):
-            sym = getattr(c, "symbol", None)
-            name = getattr(c, "name", None)
-            mkr = getattr(c, "market_cap_rank", None)
-            print(f"[{now_str()}] → [{ci}/{len(coins)}] {sym} ({c.id}) rank={mkr}")
-            coin_category = (getattr(c, 'category', None) or 'Other').strip() or 'Other'
-            carry_used = 0
+            # try to read a row *inside* the slot window
+            try:
+                in_slot = session.execute(SEL_IN_SLOT_PS, [coin_id, start, end], timeout=REQUEST_TIMEOUT).one()
+            except Exception as e:
+                print(f"        [READ-ERR] in-slot {sym} {start}→{end}: {e} (skip)"); skipped += 1; continue
 
-            for si, (start, end) in enumerate(slots, 1):
-                print(f"    slot {si}/{len(slots)} {start} → {end}")
-
+            if in_slot and in_slot.price_usd is not None:
+                price = float(in_slot.price_usd)
+                mcap  = float(in_slot.market_cap) if in_slot.market_cap is not None else 0.0
+                vol   = float(in_slot.volume_24h) if in_slot.volume_24h is not None else 0.0
+                rank  = int(in_slot.market_cap_rank) if in_slot.market_cap_rank is not None else None
+                circ  = float(in_slot.circulating_supply) if in_slot.circulating_supply is not None else None
+                totl  = float(in_slot.total_supply) if in_slot.total_supply is not None else None
+                source = "hist-in-slot"
+            else:
+                if carry_used >= ALLOW_CARRY_MAX_SLOTS:
+                    print("        carry cap reached → skip"); skipped += 1; continue
+                # otherwise carry: grab latest point *before* slot start
                 try:
-                    in_slot = s.execute(SEL_IN_SLOT_PS, [c.id, start, end], timeout=REQUEST_TIMEOUT).one()
-                except (OperationTimedOut, ReadTimeout, ReadFailure) as e:
-                    print(f"        [TIMEOUT] in-slot read {sym} {start}→{end}: {e} (skip)"); skipped += 1; continue
-                except DriverException as e:
-                    print(f"        [ERROR] in-slot read {sym} {start}→{end}: {e} (skip)"); skipped += 1; continue
+                    prev = session.execute(SEL_PREV_PS, [coin_id, start], timeout=REQUEST_TIMEOUT).one()
+                except Exception as e:
+                    print(f"        [READ-ERR] prev {sym} < {start}: {e} (skip)"); skipped += 1; continue
 
-                if in_slot and in_slot.price_usd is not None:
-                    price = float(in_slot.price_usd)
-                    mcap  = float(in_slot.market_cap) if in_slot.market_cap is not None else 0.0
-                    vol   = float(in_slot.volume_24h) if in_slot.volume_24h is not None else 0.0
-                    rank  = int(in_slot.market_cap_rank) if in_slot.market_cap_rank is not None else None
-                    circ  = float(in_slot.circulating_supply) if in_slot.circulating_supply is not None else None
-                    totl  = float(in_slot.total_supply) if in_slot.total_supply is not None else None
-                    source = "hist-in-slot"
+                if prev and prev.price_usd is not None:
+                    price = float(prev.price_usd)
+                    mcap  = float(prev.market_cap) if prev.market_cap is not None else 0.0
+                    vol   = float(prev.volume_24h) if prev.volume_24h is not None else 0.0
+                    rank  = int(prev.market_cap_rank) if prev.market_cap_rank is not None else None
+                    circ  = float(prev.circulating_supply) if prev.circulating_supply is not None else None
+                    totl  = float(prev.total_supply) if prev.total_supply is not None else None
+                    source = "hist-carry"
+                    carry_used += 1
                 else:
-                    if carry_used >= ALLOW_CARRY_MAX_SLOTS:
-                        print("        carry cap reached → skip"); skipped += 1; continue
-                    try:
-                        prev = s.execute(SEL_PREV_PS, [c.id, start], timeout=REQUEST_TIMEOUT).one()
-                    except (OperationTimedOut, ReadTimeout, ReadFailure) as e:
-                        print(f"        [TIMEOUT] prev read {sym} < {start}: {e} (skip)"); skipped += 1; continue
-                    except DriverException as e:
-                        print(f"        [ERROR] prev read {sym} < {start}: {e} (skip)"); skipped += 1; continue
+                    print("        no history for slot (and no previous) → skip")
+                    skipped += 1
+                    continue
 
-                    if prev and prev.price_usd is not None:
-                        price = float(prev.price_usd)
-                        mcap  = float(prev.market_cap) if prev.market_cap is not None else 0.0
-                        vol   = float(prev.volume_24h) if prev.volume_24h is not None else 0.0
-                        rank  = int(prev.market_cap_rank) if prev.market_cap_rank is not None else None
-                        circ  = float(prev.circulating_supply) if prev.circulating_supply is not None else None
-                        totl  = float(prev.total_supply) if prev.total_supply is not None else None
-                        source = "hist-carry"
-                        carry_used += 1
-                    else:
-                        print("        no history for slot (and no previous) → skip")
-                        skipped += 1
-                        continue
+            # clamp last_updated to slot end (represents slot's EoS)
+            slot_last_upd = end - timedelta(seconds=1)
 
-                # clamp last_updated to slot end (represents slot's EoS)
-                slot_last_upd = end - timedelta(seconds=1)
+            try:
+                result = session.execute(
+                    INS_10M_IF_NOT_EXISTS_PS,
+                    [coin_id, start, sym, name, price, mcap, vol, rank, circ, totl, slot_last_upd],
+                    timeout=REQUEST_TIMEOUT
+                ).one()
+                applied = bool(getattr(result, 'applied', True)) if result is not None else True
 
-                try:
-                    result = s.execute(
-                        INS_10M_IF_NOT_EXISTS_PS,
-                        [c.id, start, sym, name, price, mcap, vol, rank, circ, totl, slot_last_upd],
-                        timeout=REQUEST_TIMEOUT
-                    ).one()
-                    applied = bool(getattr(result, 'applied', True)) if result is not None else True
-                    bump_slot_total(start, coin_category, mcap, vol, slot_last_upd)
-                    bump_slot_total(start, 'ALL', mcap, vol, slot_last_upd)
-                    print(f"        insert {'applied' if applied else 'skipped'} "
-                          f"({source}, price={price}, mcap={mcap}, vol={vol}, rank={rank}, circ={circ}, totl={totl}, last_upd={slot_last_upd})")
-                    if applied: wrote += 1
-                    else:       skipped += 1
-                except (WriteTimeout, OperationTimedOut) as e:
-                    print(f"        [TIMEOUT] insert {sym} {start}: {e} (skip)"); skipped += 1
-                except DriverException as e:
-                    print(f"        [ERROR] insert {sym} {start}: {e} (skip)"); skipped += 1
+                bump_slot_total(start, coin_category, mcap, vol, slot_last_upd)
+                bump_slot_total(start, 'ALL', mcap, vol, slot_last_upd)
 
-        if slot_totals:
-            print(f"[{now_str()}] [mcap-10m] writing {len(slot_totals)} aggregates into {TABLE_MCAP_OUT}")
-            agg_written = 0
-            for (slot_start, category), totals in sorted(slot_totals.items(), key=lambda kv: (kv[0][0], 0 if kv[0][1] == 'ALL' else 1, kv[0][1].lower())):
-                last_upd = totals.get('last_updated') or (slot_start + timedelta(minutes=SLOT_MINUTES) - timedelta(seconds=1))
-                rank_value = 0 if category == 'ALL' else None
-                try:
-                    s.execute(
-                        INS_MCAP_10M_UPSERT,
-                        [category, slot_start, last_upd, totals['market_cap'], rank_value, totals['volume_24h']],
-                        timeout=REQUEST_TIMEOUT
-                    )
-                    agg_written += 1
-                except (WriteTimeout, OperationTimedOut, DriverException) as e:
-                    print(f"        [mcap-10m] insert failed for category='{category}' slot={slot_start}: {e}")
-            print(f"[{now_str()}] [mcap-10m] rows_written={agg_written}")
-        else:
-            print(f"[{now_str()}] [mcap-10m] no aggregates captured (coins={len(coins)})")
+                print(f"        insert {'applied' if applied else 'skipped'} "
+                      f"({source}, price={price}, mcap={mcap}, vol={vol}, rank={rank}, circ={circ}, totl={totl}, last_upd={slot_last_upd})")
 
-        print(f"[{now_str()}] [10m] wrote={wrote} skipped={skipped}")
+                if applied: wrote += 1
+                else:       skipped += 1
 
-    if __name__ == "__main__":
-        try:
-            main()
-        except KeyboardInterrupt:
-            print(f"\n[{now_str()}] KeyboardInterrupt received. Cleaning up…")
+            except Exception as e:
+                print(f"        [WRITE-ERR] insert {sym} {start}: {e} (skip)"); skipped += 1
 
-finally:
-    print(f"[{now_str()}] Shutting down Cassandra connection…")
+    # Write category aggregates
+    if slot_totals:
+        print(f"[{now_str()}] [mcap-10m] writing {len(slot_totals)} aggregates into {TABLE_MCAP_OUT}")
+        agg_written = 0
+        # sort by slot_start, then 'ALL' first, then alpha by category
+        for (slot_start, category), totals in sorted(
+            slot_totals.items(),
+            key=lambda kv: (kv[0][0], 0 if kv[0][1] == 'ALL' else 1, kv[0][1].lower())
+        ):
+            last_upd = totals.get('last_updated') or (slot_start + timedelta(minutes=SLOT_MINUTES) - timedelta(seconds=1))
+            rank_value = 0 if category == 'ALL' else None
+            try:
+                session.execute(
+                    INS_MCAP_10M_UPSERT,
+                    [category, slot_start, last_upd, float(totals['market_cap']), rank_value, float(totals['volume_24h'])],
+                    timeout=REQUEST_TIMEOUT
+                )
+                agg_written += 1
+            except Exception as e:
+                print(f"        [mcap-10m] insert failed for category='{category}' slot={slot_start}: {e}")
+        print(f"[{now_str()}] [mcap-10m] rows_written={agg_written}")
+    else:
+        print(f"[{now_str()}] [mcap-10m] no aggregates captured (coins={len(coins)})")
+
+    print(f"[{now_str()}] [10m] wrote={wrote} skipped={skipped}")
+
+# ───────────────────────── Entrypoint ─────────────────────────
+if __name__ == "__main__":
     try:
-        cluster.shutdown()
-    except Exception as e:
-        print(f"[{now_str()}] Error during shutdown: {e}")
-    print(f"[{now_str()}] Done.")
+        main()
+    finally:
+        print(f"[{now_str()}] Shutting down…")
+        try:
+            cluster.shutdown()
+        except Exception as e:
+            print(f"[{now_str()}] Error during shutdown: {e}")
+        print(f"[{now_str()}] Done.")

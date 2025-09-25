@@ -1,43 +1,25 @@
 #!/usr/bin/env python3
-# prices/DD_create_hourly_from_10m.py
+# prices/DD_gck_create_hourly_from_10m.py
+#
+# Build hourly OHLC candles from 10m slots:
+#   - Reads 10m rows from gecko_prices_10m_7d (and previous row for carry)
+#   - Writes hourly candles into gecko_candles_hourly_30d (UPSERT)
+#   - Writes hourly category aggregates into gecko_market_cap_hourly_30d
+#
+# Uses shared Astra connector (astra_connect.connect) so it works with
+# local .env or plain environment vars in CI.
+
 import os, time
 from datetime import datetime, timedelta, timezone
-import sys, pathlib
+from typing import List, Tuple, Dict, Any
 
-# ───────────────────── Repo root & helpers ─────────────────────
-_REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.append(str(_REPO_ROOT))
-
-try:
-    from paths import rel, chdir_repo_root
-except Exception:
-    def rel(*parts: str) -> pathlib.Path:
-        return _REPO_ROOT.joinpath(*parts)
-    def chdir_repo_root() -> None:
-        os.chdir(_REPO_ROOT)
-
-chdir_repo_root()
-
-# ───────────────────────── 3rd-party ─────────────────────────
-from cassandra import OperationTimedOut, ReadTimeout, ReadFailure, WriteTimeout, DriverException
-from cassandra.cluster import Cluster, EXEC_PROFILE_DEFAULT, ExecutionProfile
-from cassandra.auth import PlainTextAuthProvider
-from cassandra.policies import RoundRobinPolicy
-from cassandra.query import SimpleStatement
-from dotenv import load_dotenv
-
-# Load .env from repo root explicitly
-load_dotenv(dotenv_path=rel(".env"))
+# ───────────────────────── Astra connector ─────────────────────────
+from astra_connect.connect import get_session, AstraConfig
+AstraConfig.from_env()  # load .env if present, otherwise use process env
 
 # ───────────────────────── Config ─────────────────────────
-BUNDLE              = os.getenv("ASTRA_BUNDLE_PATH", "secure-connect.zip")
-ASTRA_TOKEN         = os.getenv("ASTRA_TOKEN")
-KEYSPACE            = os.getenv("ASTRA_KEYSPACE", "default_keyspace")
-
 TOP_N               = int(os.getenv("TOP_N", "200"))
 REQUEST_TIMEOUT     = int(os.getenv("REQUEST_TIMEOUT_SEC", "30"))
-CONNECT_TIMEOUT_SEC = int(os.getenv("CONNECT_TIMEOUT_SEC", "15"))
 FETCH_SIZE          = int(os.getenv("FETCH_SIZE", "500"))
 
 # Behavior
@@ -47,19 +29,17 @@ PROGRESS_EVERY      = int(os.getenv("PROGRESS_EVERY", "20"))
 VERBOSE_MODE        = os.getenv("VERBOSE_MODE", "0") == "1"
 MIN_10M_POINTS_FOR_FINAL = int(os.getenv("MIN_10M_POINTS_FOR_FINAL", "2"))  # require ≥2 points to finalize
 
-# Table names (new Gecko pipeline)
+# Table names (Gecko pipeline)
 TEN_MIN_TABLE       = os.getenv("TEN_MIN_TABLE", "gecko_prices_10m_7d")
 HOURLY_TABLE        = os.getenv("HOURLY_TABLE", "gecko_candles_hourly_30d")
 TABLE_LIVE          = os.getenv("TABLE_LIVE", "gecko_prices_live")           # for coin list
 TABLE_MCAP_HOURLY   = os.getenv("TABLE_MCAP_HOURLY", "gecko_market_cap_hourly_30d")
 
-if not ASTRA_TOKEN:
-    raise SystemExit("Missing ASTRA_TOKEN")
-
 def now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 def floor_10m(dt_utc: datetime) -> datetime:
+    dt_utc = dt_utc if dt_utc.tzinfo else dt_utc.replace(tzinfo=timezone.utc)
     return dt_utc.replace(minute=(dt_utc.minute // 10) * 10, second=0, microsecond=0)
 
 def sanitize_num(x, fallback=None):
@@ -79,21 +59,12 @@ def equalish(a, b):
     except Exception:
         return False
 
-print(f"[{now_str()}] Connecting to Astra (bundle='{BUNDLE}', keyspace='{KEYSPACE}')")
-auth = PlainTextAuthProvider("token", ASTRA_TOKEN)
+# ───────────────────────── Session & prepared statements ─────────────────────────
+print(f"[{now_str()}] Connecting to Astra…")
+session, cluster = get_session(return_cluster=True)
+print(f"[{now_str()}] Connected. keyspace='{session.keyspace}'")
 
-exec_profile = ExecutionProfile(
-    load_balancing_policy=RoundRobinPolicy(),
-    request_timeout=REQUEST_TIMEOUT,
-)
-cluster = Cluster(
-    cloud={"secure_connect_bundle": BUNDLE},
-    auth_provider=auth,
-    execution_profiles={EXEC_PROFILE_DEFAULT: exec_profile},
-    connect_timeout=CONNECT_TIMEOUT_SEC,
-)
-s = cluster.connect(KEYSPACE)
-print(f"[{now_str()}] Connected.")
+from cassandra.query import SimpleStatement
 
 # Live coins (use CoinGecko rank field)
 SEL_LIVE = SimpleStatement(
@@ -101,7 +72,7 @@ SEL_LIVE = SimpleStatement(
     fetch_size=FETCH_SIZE
 )
 
-def plan_windows():
+def plan_windows() -> List[Tuple[datetime, datetime, bool, str]]:
     """
     Returns a list of (start, end, is_final, label) to process:
       - Previous hour (closed) as final, if enabled
@@ -116,7 +87,7 @@ def plan_windows():
     prev_start = curr_start - timedelta(hours=1)
     prev_end   = curr_start
 
-    windows = []
+    windows: List[Tuple[datetime, datetime, bool, str]] = []
     if FINALIZE_PREV:
         windows.append((prev_start, prev_end, True,  "prev_final"))
     if curr_eff_end > curr_start:
@@ -128,33 +99,32 @@ def main():
     # Prepare statements
     print(f"[{now_str()}] Preparing statements…")
     t0 = time.time()
-    SEL_10M_RANGE = s.prepare(f"""
+    SEL_10M_RANGE = session.prepare(f"""
       SELECT ts, price_usd, market_cap, volume_24h,
              market_cap_rank, circulating_supply, total_supply, last_updated
       FROM {TEN_MIN_TABLE}
       WHERE id=? AND ts>=? AND ts<? ORDER BY ts ASC
     """)
-    SEL_10M_PREV = s.prepare(f"""
+    SEL_10M_PREV = session.prepare(f"""
       SELECT ts, price_usd, market_cap, volume_24h,
              market_cap_rank, circulating_supply, total_supply, last_updated
       FROM {TEN_MIN_TABLE}
       WHERE id=? AND ts<? LIMIT 1
     """)
-    SEL_HOURLY_ONE = s.prepare(f"""
+    SEL_HOURLY_ONE = session.prepare(f"""
       SELECT symbol, name, open, high, low, close, price_usd, market_cap, volume_24h,
              market_cap_rank, circulating_supply, total_supply, candle_source
       FROM {HOURLY_TABLE} WHERE id=? AND ts=? LIMIT 1
     """)
     # Cassandra INSERT is an upsert; use intentionally.
-    INS_UPSERT = s.prepare(f"""
+    INS_UPSERT = session.prepare(f"""
       INSERT INTO {HOURLY_TABLE}
         (id, ts, symbol, name, open, high, low, close, price_usd,
          market_cap, volume_24h, market_cap_rank, circulating_supply, total_supply,
          candle_source, last_updated)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """)
-
-    INS_MCAP_HOURLY = s.prepare(f"""
+    INS_MCAP_HOURLY = session.prepare(f"""
       INSERT INTO {TABLE_MCAP_HOURLY}
         (category, ts, last_updated, market_cap, market_cap_rank, volume_24h)
       VALUES (?, ?, ?, ?, ?, ?)
@@ -172,7 +142,7 @@ def main():
     # Load coins
     print(f"[{now_str()}] Loading top coins…")
     t0 = time.time()
-    coins = list(s.execute(SEL_LIVE, timeout=REQUEST_TIMEOUT))
+    coins = list(session.execute(SEL_LIVE, timeout=REQUEST_TIMEOUT))
     print(f"[{now_str()}] Loaded {len(coins)} live rows in {time.time()-t0:.2f}s")
 
     coins = [c for c in coins if isinstance(c.market_cap_rank, int) and c.market_cap_rank > 0]
@@ -180,13 +150,13 @@ def main():
     coins = coins[:TOP_N]
     print(f"[{now_str()}] Processing top {len(coins)} coins (TOP_N={TOP_N})")
 
-    hour_totals = {}
+    hour_totals: Dict[Tuple[datetime, str], Dict[str, Any]] = {}
 
-    def bump_hour_total(slot_start, category, mcap_value, vol_value, last_upd) -> None:
+    def bump_hour_total(slot_start: datetime, category: str, mcap_value, vol_value, last_upd: datetime) -> None:
         key = (slot_start, category)
         entry = hour_totals.setdefault(key, {"market_cap": 0.0, "volume_24h": 0.0, "last_updated": last_upd})
-        entry["market_cap"] += mcap_value
-        entry["volume_24h"] += vol_value
+        entry["market_cap"] += float(mcap_value or 0.0)
+        entry["volume_24h"] += float(vol_value or 0.0)
         if last_upd and (entry["last_updated"] is None or last_upd > entry["last_updated"]):
             entry["last_updated"] = last_upd
 
@@ -203,10 +173,10 @@ def main():
             try:
                 bound = SEL_10M_RANGE.bind([c.id, start, end]); bound.fetch_size = 64
                 t_read = time.time()
-                pts = list(s.execute(bound, timeout=REQUEST_TIMEOUT))
+                pts = list(session.execute(bound, timeout=REQUEST_TIMEOUT))
                 if VERBOSE_MODE:
                     print(f"[{now_str()}]    {c.symbol} {start}→{end} got {len(pts)} pts in {time.time()-t_read:.2f}s")
-            except (OperationTimedOut, ReadTimeout, ReadFailure, DriverException) as e:
+            except Exception as e:
                 errors += 1
                 print(f"[{now_str()}] [READ-ERR] {c.symbol} {start}→{end}: {e}")
                 skipped += 1
@@ -237,8 +207,8 @@ def main():
                 # Try to carry price (and extras) from the most recent 10m before start (only for partial hour)
                 if not is_final:
                     try:
-                        prev = s.execute(SEL_10M_PREV, [c.id, start], timeout=REQUEST_TIMEOUT).one()
-                    except (OperationTimedOut, ReadTimeout, ReadFailure, DriverException) as e:
+                        prev = session.execute(SEL_10M_PREV, [c.id, start], timeout=REQUEST_TIMEOUT).one()
+                    except Exception as e:
                         prev = None
                         if VERBOSE_MODE:
                             print(f"[{now_str()}] [PREV-ERR] {c.symbol} < {start}: {e}")
@@ -277,8 +247,8 @@ def main():
 
             # Fallback to existing row for mcap/vol/rank/supplies (avoid nulling established values)
             try:
-                existing = s.execute(SEL_HOURLY_ONE, [c.id, start], timeout=REQUEST_TIMEOUT).one()
-            except (OperationTimedOut, ReadTimeout, DriverException) as e:
+                existing = session.execute(SEL_HOURLY_ONE, [c.id, start], timeout=REQUEST_TIMEOUT).one()
+            except Exception as e:
                 existing = None
                 if VERBOSE_MODE:
                     print(f"[{now_str()}] [EXIST-ERR] {c.symbol} {start}: {e} (treat as no row)")
@@ -344,7 +314,7 @@ def main():
 
             # UPSERT the hourly row
             try:
-                s.execute(
+                session.execute(
                     INS_UPSERT,
                     [c.id, start, c.symbol, c.name,
                      o, h, l, cl, cl,
@@ -358,11 +328,12 @@ def main():
                     print(f"[{now_str()}]    UPSERT {c.symbol} {start} ({candle_source}) "
                           f"O={o} H={h} L={l} C={cl} M={mcap} V={vol} R={rank} CS={circ} TS={tot}")
                 wrote += 1
-            except (WriteTimeout, OperationTimedOut, DriverException) as e:
+            except Exception as e:
                 errors += 1
                 print(f"[{now_str()}] [WRITE-ERR] {c.symbol} {start}: {e}")
                 skipped += 1
 
+    # Write category aggregates
     if hour_totals:
         print(f"[{now_str()}] [mcap-hourly] writing {len(hour_totals)} aggregates into {TABLE_MCAP_HOURLY}")
         agg_written = 0
@@ -371,26 +342,15 @@ def main():
             key=lambda kv: (kv[0][0], 0 if kv[0][1] == 'ALL' else 1, kv[0][1].lower())
         ):
             last_upd = totals.get('last_updated') or (slot_start + timedelta(hours=1) - timedelta(seconds=1))
-            cat_id = f"CATEGORY::{category}"
-            display_name = 'All Categories' if category == 'ALL' else category
-            symbol_val = 'ALL' if category == 'ALL' else category.upper().replace(' ', '_')
             rank_value = 0 if category == 'ALL' else None
             try:
-                s.execute(
+                session.execute(
                     INS_MCAP_HOURLY,
-                    [
-                        category,
-                        slot_start,
-                        last_upd,
-                        totals['market_cap'],
-                        rank_value,
-                        totals['volume_24h'],
-                    ],
-                    
+                    [category, slot_start, last_upd, float(totals['market_cap']), rank_value, float(totals['volume_24h'])],
                     timeout=REQUEST_TIMEOUT
                 )
                 agg_written += 1
-            except (WriteTimeout, OperationTimedOut, DriverException) as e:
+            except Exception as e:
                 print(f"[{now_str()}] [mcap-hourly] failed for category='{category}' slot={slot_start}: {e}")
         print(f"[{now_str()}] [mcap-hourly] rows_written={agg_written}")
     else:
@@ -399,6 +359,7 @@ def main():
     print(f"[{now_str()}] [hourly-from-10m] wrote={wrote} skipped={skipped} empty={empty} "
           f"errors={errors} already_final_identical={finalized_skips} partial_unchanged_skips={unchanged_skips}")
 
+# ───────────────────────── Entrypoint ─────────────────────────
 if __name__ == "__main__":
     try:
         main()

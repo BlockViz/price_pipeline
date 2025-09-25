@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# backend/prices/AA_gck_load_prices_live.py
+# backend/prices/AA_gck_load_prices_all.py
 # One-pass loader that refreshes 4 tables:
 #   - gecko_prices_live                  (TRUNCATE → repopulate)
 #   - gecko_prices_live_ranked           (DELETE bucket → repopulate from live buffer)
@@ -12,24 +12,47 @@
 # - Safe refresh: only truncate/clear once we have enough fresh rows buffered.
 
 import os, time, csv, requests
-from collections import deque
+import sys, pathlib
 from datetime import datetime, timezone, timedelta
-from time import perf_counter
-import pathlib
 
-# ───────────────────────── Astra connector ─────────────────────────
-from astra_connect.connect import get_session, AstraConfig
+# ───────────────────── Repo root & helpers ─────────────────────
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.append(str(_REPO_ROOT))
 
-# Load env (from .env if present, else process env), validate bundle/token
-AstraConfig.from_env()
+try:
+    from paths import rel, chdir_repo_root
+except Exception:
+    def rel(*parts: str) -> pathlib.Path:
+        return _REPO_ROOT.joinpath(*parts)
+    def chdir_repo_root() -> None:
+        os.chdir(_REPO_ROOT)
+
+chdir_repo_root()
+
+# ───────────────────────── 3rd-party ─────────────────────────
+from cassandra import OperationTimedOut, DriverException, WriteTimeout
+from cassandra.cluster import Cluster, EXEC_PROFILE_DEFAULT, ExecutionProfile
+from cassandra.auth import PlainTextAuthProvider
+from cassandra.policies import RoundRobinPolicy
+from cassandra.query import BatchStatement, ConsistencyLevel, SimpleStatement
+from dotenv import load_dotenv
+
+# Load .env from repo root explicitly
+load_dotenv(dotenv_path=rel(".env"))
 
 # ───────────────────────── Config ─────────────────────────
+BUNDLE       = os.getenv("ASTRA_BUNDLE_PATH", "secure-connect.zip")
+ASTRA_TOKEN  = os.getenv("ASTRA_TOKEN")
+KEYSPACE     = os.getenv("ASTRA_KEYSPACE", "default_keyspace")
+
 TOP_N        = int(os.getenv("TOP_N", "200"))
 RETRIES      = int(os.getenv("RETRIES", "3"))
 BACKOFF_MIN  = int(os.getenv("BACKOFF_MIN", "5"))
 MAX_BACKOFF  = int(os.getenv("MAX_BACKOFF_MIN", "30"))
 
 REQUEST_TIMEOUT_SEC   = int(os.getenv("REQUEST_TIMEOUT_SEC", "60"))
+CONNECT_TIMEOUT_SEC   = int(os.getenv("CONNECT_TIMEOUT_SEC", "15"))
 BATCH_FLUSH_EVERY     = int(os.getenv("BATCH_FLUSH_EVERY", "40"))
 VERBOSE_MODE          = os.getenv("VERBOSE_MODE", "0") == "1"
 
@@ -49,10 +72,8 @@ TABLE_MCAP_LIVE       = os.getenv("TABLE_GECKO_MCAP_LIVE", "gecko_market_cap_liv
 RANK_BUCKET           = os.getenv("RANK_BUCKET", "all")
 RANK_TOP_N            = int(os.getenv("RANK_TOP_N", str(TOP_N)))
 
-# categories (Symbol -> Category; default path resolved relative to this file)
-_THIS_DIR = pathlib.Path(__file__).resolve().parent
-_DEFAULT_CATEGORY_FILE = _THIS_DIR / "category_mapping.csv"
-CATEGORY_FILE = os.getenv("CATEGORY_FILE", str(_DEFAULT_CATEGORY_FILE))
+# categories (Symbol -> Category; live only)
+CATEGORY_FILE = os.getenv("CATEGORY_FILE", str(rel("prices", "category_mapping.csv")))
 
 # CoinGecko
 API_TIER   = (os.getenv("COINGECKO_API_TIER") or "demo").strip().lower()  # "demo" | "pro"
@@ -67,17 +88,14 @@ BASE = os.getenv(
 HDR  = "x-cg-demo-api-key" if API_TIER == "demo" else "x-cg-pro-api-key"
 QS   = "x_cg_demo_api_key" if API_TIER == "demo" else "x_cg_pro_api_key"
 
-# polite rate-limiting (keeps you out of trouble on free/pro tiers)
-CG_REQ_INTERVAL_S = float(os.getenv("CG_REQUEST_INTERVAL_S", "1.0" if API_TIER == "demo" else "0.25"))
-CG_MAX_RPM        = int(os.getenv("CG_MAX_RPM", "50" if API_TIER == "demo" else "120"))
-_req_times = deque()  # timestamps of last requests (seconds)
-
+if not BUNDLE or not ASTRA_TOKEN or not KEYSPACE:
+    raise SystemExit("Missing ASTRA_BUNDLE_PATH / ASTRA_TOKEN / ASTRA_KEYSPACE")
 if not API_KEY:
     raise SystemExit("Missing COINGECKO_API_KEY")
 
 def now_str(): return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-# ─────────────── Category mapping (file may live next to this script) ───────────────
+# ─────────────── Category mapping (repo-relative) ───────────────
 def load_category_map(path: str) -> dict:
     m = {}
     try:
@@ -107,10 +125,19 @@ def load_category_map(path: str) -> dict:
 CATEGORY_MAP = load_category_map(CATEGORY_FILE)
 def category_for(sym: str) -> str: return CATEGORY_MAP.get((sym or "").upper(), "Other")
 
-# ───────────────────────── Connect via shared helper ─────────────────────────
-print(f"[{now_str()}] Connecting to Astra…")
-session, cluster = get_session(return_cluster=True)
-print(f"[{now_str()}] Connected. keyspace='{session.keyspace}'")
+# ───────────────────────── Connect ─────────────────────────
+print(f"[{now_str()}] Connecting to Astra (bundle='{BUNDLE}', keyspace='{KEYSPACE}')")
+auth = PlainTextAuthProvider(username="token", password=ASTRA_TOKEN)
+exec_profile = ExecutionProfile(load_balancing_policy=RoundRobinPolicy(),
+                                request_timeout=REQUEST_TIMEOUT_SEC)
+cluster = Cluster(
+    cloud={"secure_connect_bundle": BUNDLE},
+    auth_provider=auth,
+    execution_profiles={EXEC_PROFILE_DEFAULT: exec_profile},
+    connect_timeout=CONNECT_TIMEOUT_SEC,
+)
+session = cluster.connect(KEYSPACE)
+print(f"[{now_str()}] Connected.")
 
 # ───────────────────────── Helpers ─────────────────────────
 def f(x):
@@ -137,61 +164,26 @@ def price_ago_from_pct(now_price, pct):
     except Exception:
         return None
 
-# ─────────── polite throttle + robust GET with backoff / Retry-After ───────────
-def _throttle():
-    now = time.time()
-    # spacing between requests
-    if _req_times and (now - _req_times[-1]) < CG_REQ_INTERVAL_S:
-        time.sleep(CG_REQ_INTERVAL_S - (now - _req_times[-1]))
-        now = time.time()
-    # enforce per-minute cap
-    cutoff = now - 60.0
-    while _req_times and _req_times[0] < cutoff:
-        _req_times.popleft()
-    if len(_req_times) >= CG_MAX_RPM:
-        sleep_for = 60.0 - (now - _req_times[0]) + 0.01
-        time.sleep(max(0.0, sleep_for))
-
 def http_get(path, params=None):
     url = f"{BASE}{path}"
     params = dict(params or {})
     headers = {HDR: API_KEY}
     params[QS] = API_KEY
-    last_err = None
     for attempt in range(1, RETRIES + 1):
-        _throttle()
-        t0 = perf_counter()
         try:
-            r = requests.get(url, params=params, headers=headers, timeout=REQUEST_TIMEOUT_SEC)
-            # handle rate/backpressure classes explicitly
-            if r.status_code in (402, 429, 500, 502, 503, 504):
-                ra = r.headers.get("Retry-After")
-                if ra:
-                    try:
-                        wait_s = float(ra)
-                    except Exception:
-                        wait_s = min(MAX_BACKOFF, BACKOFF_MIN * (2 ** (attempt - 1)))
-                else:
-                    wait_s = min(MAX_BACKOFF, BACKOFF_MIN * (2 ** (attempt - 1)))
-                print(f"[{now_str()}] [fetch] {path} → {r.status_code}; sleeping {wait_s:.1f}s (retry {attempt}/{RETRIES})")
-                time.sleep(wait_s)
-                last_err = requests.HTTPError(f"{r.status_code} {r.reason}", response=r)
-                continue
-
+            r = requests.get(url, params=params, headers=headers, timeout=30)
+            if r.status_code in (402, 429) or 500 <= r.status_code < 600:
+                raise requests.HTTPError(f"{r.status_code} from CoinGecko", response=r)
             r.raise_for_status()
-            dt_sec = perf_counter() - t0
-            if VERBOSE_MODE:
-                print(f"[{now_str()}] [fetch] OK {path} in {dt_sec:.2f}s")
-            _req_times.append(time.time())
             return r.json()
-
-        except (requests.ConnectionError, requests.Timeout) as e:
-            last_err = e
-            wait_s = min(MAX_BACKOFF, BACKOFF_MIN * (2 ** (attempt - 1)))
-            print(f"[{now_str()}] [fetch] {path} conn/timeout: {e} — backoff {wait_s:.1f}s")
-            time.sleep(wait_s)
-
-    raise RuntimeError(f"CoinGecko failed: {url} :: {last_err}")
+        except (requests.HTTPError, requests.ConnectionError, requests.Timeout) as e:
+            if attempt < RETRIES:
+                wait_s = min(BACKOFF_MIN * (2 ** (attempt - 1)), MAX_BACKOFF)
+                print(f"[{now_str()}] [fetch] error: {e}. Retrying in ~{wait_s}s…")
+                time.sleep(wait_s)
+            else:
+                print(f"[{now_str()}] [fetch] giving up after {attempt} attempts.")
+                raise
 
 def fmt_rank(r):
     try:
@@ -200,9 +192,6 @@ def fmt_rank(r):
         return "r=?"
 
 # ───────────────────────── Statements ─────────────────────────
-from cassandra import OperationTimedOut, DriverException, WriteTimeout
-from cassandra.query import BatchStatement, ConsistencyLevel, SimpleStatement
-
 LIVE_COLS = [
     "id","symbol","name","category",
     "market_cap_rank",
@@ -250,7 +239,7 @@ DEL_PRICES_LIVE_RANKED_BUCKET = session.prepare(
     f"DELETE FROM {TABLE_LIVE_RANKED} WHERE bucket=?"
 )
 
-# Market-cap live
+# Market-cap live (no ranked table anymore)
 INS_MCAP_LIVE_UPSERT = session.prepare(
     f"INSERT INTO {TABLE_MCAP_LIVE} (category,last_updated,market_cap,market_cap_rank,volume_24h) VALUES (?,?,?,?,?)"
 )
@@ -351,7 +340,7 @@ def run_once():
         cat = category_for(sym)
 
         mcap_total = float(mcap) if mcap is not None else 0.0
-        vol_total  = float(vol)  if vol  is not None else 0.0
+        vol_total = float(vol) if vol is not None else 0.0
         bump_total(cat, mcap_total, vol_total, lu)
         bump_total("ALL", mcap_total, vol_total, lu)
 

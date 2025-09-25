@@ -1,65 +1,36 @@
 #!/usr/bin/env python3
-# backend/prices/EE_create_daily_from_10m.py
+# backend/prices/EE_gck_create_daily_from_10m.py
+
 import os, time
 from datetime import datetime, timedelta, timezone, date
-import sys, pathlib
+from typing import Dict, Tuple, Any
 
-# ───────────────────── Repo root & helpers ─────────────────────
-_REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.append(str(_REPO_ROOT))
-
-try:
-    from paths import rel, chdir_repo_root
-except Exception:
-    def rel(*parts: str) -> pathlib.Path:
-        return _REPO_ROOT.joinpath(*parts)
-    def chdir_repo_root() -> None:
-        os.chdir(_REPO_ROOT)
-
-chdir_repo_root()
-
-# ───────────────────────── 3rd-party ─────────────────────────
-from cassandra import OperationTimedOut, ReadTimeout, ReadFailure, WriteTimeout, DriverException
-from cassandra.cluster import Cluster, EXEC_PROFILE_DEFAULT, ExecutionProfile
-from cassandra.auth import PlainTextAuthProvider
-from cassandra.policies import RoundRobinPolicy
-from cassandra.query import SimpleStatement
-from dotenv import load_dotenv
-
-# Load .env from repo root explicitly
-load_dotenv(dotenv_path=rel(".env"))
+# ───────────────────────── Astra connector ─────────────────────────
+from astra_connect.connect import get_session, AstraConfig
+AstraConfig.from_env()  # loads .env if present, otherwise uses process env
 
 # ───────────────────────── Config ─────────────────────────
-BUNDLE              = os.getenv("ASTRA_BUNDLE_PATH", "secure-connect.zip")
-ASTRA_TOKEN         = os.getenv("ASTRA_TOKEN")
-KEYSPACE            = os.getenv("ASTRA_KEYSPACE", "default_keyspace")
-
 TOP_N               = int(os.getenv("TOP_N", "200"))
 REQUEST_TIMEOUT     = int(os.getenv("REQUEST_TIMEOUT_SEC", "30"))
-CONNECT_TIMEOUT_SEC = int(os.getenv("CONNECT_TIMEOUT_SEC", "15"))
 FETCH_SIZE          = int(os.getenv("FETCH_SIZE", "500"))
 
 # Behavior
 SLOT_DELAY_SEC      = int(os.getenv("SLOT_DELAY_SEC", "120"))     # guard against too-fresh 10m slot
 PROGRESS_EVERY      = int(os.getenv("PROGRESS_EVERY", "20"))      # coin progress interval
 VERBOSE_MODE        = os.getenv("VERBOSE_MODE", "0") == "1"       # extra per-coin logs
+MIN_10M_POINTS_FOR_FINAL = int(os.getenv("MIN_10M_POINTS_FOR_FINAL", "2"))  # require ≥2 points to finalize a closed day
 
 TEN_MIN_TABLE       = os.getenv("TEN_MIN_TABLE", "gecko_prices_10m_7d")
 DAILY_TABLE         = os.getenv("DAILY_TABLE", "gecko_candles_daily_contin")
 TABLE_LIVE          = os.getenv("TABLE_LIVE", "gecko_prices_live")
 TABLE_MCAP_DAILY    = os.getenv("TABLE_MCAP_DAILY", "gecko_market_cap_daily_contin")
 
-# require ≥2 ten-minute points to finalize a closed day
-MIN_10M_POINTS_FOR_FINAL = int(os.getenv("MIN_10M_POINTS_FOR_FINAL", "2"))
-
-if not ASTRA_TOKEN:
-    raise SystemExit("Missing ASTRA_TOKEN")
-
 def now_str():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 def floor_10m(dt_utc: datetime) -> datetime:
+    if dt_utc.tzinfo is None:
+        dt_utc = dt_utc.replace(tzinfo=timezone.utc)
     return dt_utc.replace(minute=(dt_utc.minute // 10) * 10, second=0, microsecond=0)
 
 def sanitize_num(x, fallback=None):
@@ -83,47 +54,41 @@ def day_bounds_utc(d: date):
     end_excl = start + timedelta(days=1)
     return start, end_excl
 
-print(f"[{now_str()}] Connecting to Astra (bundle='{BUNDLE}', keyspace='{KEYSPACE}')")
-auth = PlainTextAuthProvider("token", ASTRA_TOKEN)
-exec_profile = ExecutionProfile(load_balancing_policy=RoundRobinPolicy(), request_timeout=REQUEST_TIMEOUT)
-cluster = Cluster(
-    cloud={"secure_connect_bundle": BUNDLE},
-    auth_provider=auth,
-    execution_profiles={EXEC_PROFILE_DEFAULT: exec_profile},
-    connect_timeout=CONNECT_TIMEOUT_SEC,
-)
-s = cluster.connect(KEYSPACE)
-print(f"[{now_str()}] Connected.")
+# ───────────────────────── Session & statements ─────────────────────────
+print(f"[{now_str()}] Connecting to Astra…")
+session, cluster = get_session(return_cluster=True)
+print(f"[{now_str()}] Connected. keyspace='{session.keyspace}'")
 
-# ───────────────────────── Statements ─────────────────────────
+from cassandra.query import SimpleStatement
+
 SEL_LIVE = SimpleStatement(f"""
   SELECT id, symbol, name, market_cap_rank, price_usd, market_cap, volume_24h, last_updated, category
   FROM {TABLE_LIVE}
 """, fetch_size=FETCH_SIZE)
 
 # Order ASC so we can take first/last deterministically
-SEL_10M_RANGE = s.prepare(f"""
+SEL_10M_RANGE = session.prepare(f"""
   SELECT ts, price_usd, market_cap, volume_24h,
          market_cap_rank, circulating_supply, total_supply, last_updated
   FROM {TEN_MIN_TABLE}
   WHERE id=? AND ts>=? AND ts<? ORDER BY ts ASC
 """)
 
-SEL_10M_PREV = s.prepare(f"""
+SEL_10M_PREV = session.prepare(f"""
   SELECT ts, price_usd, market_cap, volume_24h,
          market_cap_rank, circulating_supply, total_supply, last_updated
   FROM {TEN_MIN_TABLE}
   WHERE id=? AND ts<? LIMIT 1
 """)
 
-SEL_DAILY_ONE = s.prepare(f"""
+SEL_DAILY_ONE = session.prepare(f"""
   SELECT symbol, name, open, high, low, close, price_usd, market_cap, volume_24h,
          market_cap_rank, circulating_supply, total_supply, candle_source, last_updated
   FROM {DAILY_TABLE}
   WHERE id=? AND date=? LIMIT 1
 """)
 
-INS_UPSERT = s.prepare(f"""
+INS_UPSERT = session.prepare(f"""
   INSERT INTO {DAILY_TABLE}
     (id, date, symbol, name,
      open, high, low, close, price_usd,
@@ -133,8 +98,8 @@ INS_UPSERT = s.prepare(f"""
   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """)
 
-# ── UPDATED to match schema: gecko_market_cap_daily_contin(category, date, last_updated, market_cap, market_cap_rank, volume_24h)
-INS_MCAP_DAILY = s.prepare(f"""
+# gecko_market_cap_daily_contin(category, date, last_updated, market_cap, market_cap_rank, volume_24h)
+INS_MCAP_DAILY = session.prepare(f"""
   INSERT INTO {TABLE_MCAP_DAILY}
     (category, date, last_updated, market_cap, market_cap_rank, volume_24h)
   VALUES (?, ?, ?, ?, ?, ?)
@@ -146,8 +111,7 @@ def compute_daily_from_10m(rows, allow_finalize: bool):
     Given 10m rows (ASC), build daily aggregates and ancillary fields.
     Returns dict or None:
       { 'open','high','low','close','price_usd','market_cap','volume_24h',
-        'market_cap_rank','circulating_supply','total_supply',
-        'last_updated' }
+        'market_cap_rank','circulating_supply','total_supply','last_updated' }
     """
     prices, mcaps, vols = [], [], []
     ranks, circs, tots = [], [], []
@@ -193,9 +157,9 @@ def write_daily_row(coin, d: date, agg: dict, candle_source: str):
     # read existing to avoid nulling fields and to skip unchanged
     existing = None
     try:
-        existing = s.execute(SEL_DAILY_ONE, [coin.id, d], timeout=REQUEST_TIMEOUT).one()
-    except (OperationTimedOut, ReadTimeout, DriverException):
-        pass
+        existing = session.execute(SEL_DAILY_ONE, [coin.id, d], timeout=REQUEST_TIMEOUT).one()
+    except Exception:
+        existing = None
 
     o = agg.get("open")
     h = agg.get("high")
@@ -247,7 +211,7 @@ def write_daily_row(coin, d: date, agg: dict, candle_source: str):
 
     # upsert
     try:
-        s.execute(
+        session.execute(
             INS_UPSERT,
             [
                 coin.id, d, coin.symbol, coin.name,
@@ -262,7 +226,7 @@ def write_daily_row(coin, d: date, agg: dict, candle_source: str):
             print(f"[{now_str()}]    UPSERT {coin.symbol} {d} "
                   f"O={o} H={h} L={l} C={c} M={mcap} V={vol} R={rnk} CS={circ} TS={tot} src={candle_source}")
         return True
-    except (WriteTimeout, OperationTimedOut, DriverException) as e:
+    except Exception as e:
         print(f"[{now_str()}] [WRITE-ERR] {coin.symbol} {d}: {e}")
         return False
 
@@ -285,7 +249,7 @@ def main():
     # Load coins
     print(f"[{now_str()}] Loading top coins (timeout={REQUEST_TIMEOUT}s)…")
     t0 = time.time()
-    coins = list(s.execute(SEL_LIVE, timeout=REQUEST_TIMEOUT))
+    coins = list(session.execute(SEL_LIVE, timeout=REQUEST_TIMEOUT))
     print(f"[{now_str()}] Loaded {len(coins)} rows from {TABLE_LIVE} in {time.time()-t0:.2f}s")
 
     coins = [r for r in coins if isinstance(r.market_cap_rank, int) and r.market_cap_rank > 0]
@@ -293,13 +257,13 @@ def main():
     coins = coins[:TOP_N]
     print(f"[{now_str()}] Processing top {len(coins)} coins (TOP_N={TOP_N})")
 
-    day_totals = {}
+    day_totals: Dict[Tuple[date, str], Dict[str, Any]] = {}
 
-    def bump_day_total(day_key, category, mcap_value, vol_value, last_upd) -> None:
+    def bump_day_total(day_key: date, category: str, mcap_value, vol_value, last_upd) -> None:
         key = (day_key, category)
         entry = day_totals.setdefault(key, {"market_cap": 0.0, "volume_24h": 0.0, "last_updated": last_upd})
-        entry["market_cap"] += mcap_value
-        entry["volume_24h"] += vol_value
+        entry["market_cap"] += float(mcap_value or 0.0)
+        entry["volume_24h"] += float(vol_value or 0.0)
         if last_upd and (entry["last_updated"] is None or last_upd > entry["last_updated"]):
             entry["last_updated"] = last_upd
 
@@ -314,8 +278,8 @@ def main():
         # 1) Finalize yesterday (require enough 10m points)
         y0, y1 = day_bounds_utc(yesterday)
         try:
-            pts = list(s.execute(SEL_10M_RANGE, [c.id, y0, y1], timeout=REQUEST_TIMEOUT))
-        except (OperationTimedOut, ReadTimeout, ReadFailure, DriverException) as e:
+            pts = list(session.execute(SEL_10M_RANGE, [c.id, y0, y1], timeout=REQUEST_TIMEOUT))
+        except Exception as e:
             errors += 1
             print(f"[{now_str()}] [READ-ERR] {c.symbol} yesterday 10m: {e}")
             pts = []
@@ -335,8 +299,8 @@ def main():
         # 2) Today (partial up to safe boundary)
         if today_effective_end > today_start:
             try:
-                pts = list(s.execute(SEL_10M_RANGE, [c.id, today_start, today_effective_end], timeout=REQUEST_TIMEOUT))
-            except (OperationTimedOut, ReadTimeout, ReadFailure, DriverException) as e:
+                pts = list(session.execute(SEL_10M_RANGE, [c.id, today_start, today_effective_end], timeout=REQUEST_TIMEOUT))
+            except Exception as e:
                 errors += 1
                 print(f"[{now_str()}] [READ-ERR] {c.symbol} today 10m: {e}")
                 pts = []
@@ -355,11 +319,10 @@ def main():
                     unchanged += 1
             else:
                 # No 10m yet today: make a prev-close style stub using live price
-                # Find yesterday close from daily table
                 prev_row = None
                 try:
-                    prev_row = s.execute(SEL_DAILY_ONE, [c.id, yesterday], timeout=REQUEST_TIMEOUT).one()
-                except (OperationTimedOut, ReadTimeout, DriverException):
+                    prev_row = session.execute(SEL_DAILY_ONE, [c.id, yesterday], timeout=REQUEST_TIMEOUT).one()
+                except Exception:
                     prev_row = None
 
                 live_close = sanitize_num(getattr(c, "price_usd", None), 0.0)
@@ -390,21 +353,24 @@ def main():
                 if not ok:
                     unchanged += 1
 
+    # Write category aggregates
     if day_totals:
         print(f"[{now_str()}] [mcap-daily] writing {len(day_totals)} aggregates into {TABLE_MCAP_DAILY}")
         agg_written = 0
-        for (day_key, category), totals in sorted(day_totals.items(), key=lambda kv: (kv[0][0], 0 if kv[0][1] == 'ALL' else 1, kv[0][1].lower())):
+        for (day_key, category), totals in sorted(
+            day_totals.items(), key=lambda kv: (kv[0][0], 0 if kv[0][1] == 'ALL' else 1, kv[0][1].lower())
+        ):
             day_end = day_bounds_utc(day_key)[1]
             last_upd = totals.get('last_updated') or (day_end - timedelta(seconds=1))
             rank_value = 0 if category == 'ALL' else None
             try:
-                s.execute(
+                session.execute(
                     INS_MCAP_DAILY,
-                    [category, day_key, last_upd, totals['market_cap'], rank_value, totals['volume_24h']],
+                    [category, day_key, last_upd, float(totals['market_cap']), rank_value, float(totals['volume_24h'])],
                     timeout=REQUEST_TIMEOUT
                 )
                 agg_written += 1
-            except (WriteTimeout, OperationTimedOut, DriverException) as e:
+            except Exception as e:
                 print(f"[{now_str()}] [mcap-daily] failed for category='{category}' day={day_key}: {e}")
         print(f"[{now_str()}] [mcap-daily] rows_written={agg_written}")
     else:
@@ -412,6 +378,7 @@ def main():
 
     print(f"[{now_str()}] [daily-from-10m] wrote≈{wrote} unchanged≈{unchanged} errors={errors}")
 
+# ───────────────────────── Entrypoint ─────────────────────────
 if __name__ == "__main__":
     try:
         main()

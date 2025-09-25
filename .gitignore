@@ -17,5 +17,7 @@ venv/
 # docs folder
 **/docs/** 
 
+data/
+
 # Artifacts created by workflows or local runs
 secure-connect.zip
