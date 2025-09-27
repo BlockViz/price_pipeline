@@ -2,6 +2,7 @@
 # FF_gck_dq_repair_timeseries.py
 # Plan-first API ranges, hourly repair + tz fix + rate limit + neg-cache
 # Enhanced: include coins that fall in/out of Top-N and use astra_connect connector.
+# Added: final summary of API call counts and fix counts (coins + data points).
 
 import os, time, random, requests, datetime as dt
 from datetime import timezone
@@ -52,9 +53,12 @@ VERBOSE     = os.getenv("DQ_VERBOSE", "0") == "1"
 TIME_API    = os.getenv("DQ_TIME_API", "1") == "1"
 DRY_RUN     = os.getenv("DQ_DRY_RUN", "0") == "1"
 
+# Soft run budget (stop before the platform hard-kills at 25m)
+SOFT_BUDGET_SEC = int(os.getenv("DQ_SOFT_BUDGET_SEC", str(24*60)))  # default 24 minutes
+
 # CoinGecko API tier
 API_TIER = (os.getenv("COINGECKO_API_TIER") or "demo").strip().lower()
-API_KEY  = (os.getenv("COINGECKO_API_KEY") or "").strip()
+API_KEY  = (os.getenv("COINGECKO_API_KEY") or "pro").strip()
 if API_KEY.lower().startswith("api key:"):
     API_KEY = API_KEY.split(":", 1)[1].strip()
 BASE = os.getenv(
@@ -79,6 +83,20 @@ INTERP_MAX_HOURS = int(os.getenv("INTERP_MAX_HOURS", "168"))
 CG_REQ_INTERVAL_S = float(os.getenv("CG_REQUEST_INTERVAL_S", "1.0" if API_TIER == "demo" else "0.25"))
 CG_MAX_RPM        = int(os.getenv("CG_MAX_RPM", "50" if API_TIER == "demo" else "120"))
 _req_times = deque()
+
+# ---------- Metrics ----------
+metrics = {
+    "cg_calls_total": 0,         # total HTTP attempts sent to CoinGecko
+    "cg_calls_ok": 0,            # 2xx
+    "cg_calls_429": 0,           # rate limited responses
+    "cg_calls_deferred": 0,      # times we deferred due to long Retry-After
+    "cg_calls_5xx": 0,           # transient server errors
+    "cg_calls_other_http": 0,    # other HTTP errors (e.g., 4xx other than 429)
+    "points_daily": 0,           # daily rows written (from 10m + API)
+    "points_hourly": 0,          # hourly rows written
+    "points_10m": 0,             # 10m rows seeded from daily
+}
+coin_fix_counts = defaultdict(int)  # id -> total rows written across all tables
 
 # Negative cache for coins with no data
 NEG_CACHE_PATH = os.getenv("COINGECKO_NEG_CACHE_PATH", "tmp/coingecko_no_market.ids")
@@ -128,10 +146,20 @@ def hour_seq(start_dt: dt.datetime, end_excl: dt.datetime):
         yield cur; cur += dt.timedelta(hours=1)
 
 # ---------- HTTP with rate limiting ----------
+class RateLimitDefer(Exception):
+    """Raised to signal we should defer this request instead of sleeping for a long Retry-After."""
+    def __init__(self, status_code: int, retry_after: float | None, url: str):
+        super().__init__(f"Rate limited {status_code}, retry_after={retry_after}, url={url}")
+        self.status_code = status_code
+        self.retry_after = retry_after
+        self.url = url
+
 def _throttle():
     now = time.time()
+    # simple per-request spacing
     if _req_times and (now - _req_times[-1]) < CG_REQ_INTERVAL_S:
         time.sleep(CG_REQ_INTERVAL_S - (now - _req_times[-1])); now = time.time()
+    # sliding window RPM
     cutoff = now - 60.0
     while _req_times and _req_times[0] < cutoff: _req_times.popleft()
     if len(_req_times) >= CG_MAX_RPM:
@@ -144,20 +172,54 @@ def http_get(path, params=None):
     if API_KEY: params[QS] = API_KEY
     last = None
     for i in range(RETRIES):
-        _throttle(); t0 = perf_counter()
+        _throttle()
+        _req_times.append(time.time())                 # count this ATTEMPT
+        metrics["cg_calls_total"] += 1
+        t0 = perf_counter()
         try:
             r = requests.get(url, params=params, headers=headers, timeout=REQUEST_TIMEOUT)
-            if r.status_code in (402,429,500,502,503,504):
-                ra = r.headers.get("Retry-After"); 
-                wait_s = float(ra) if ra and ra.replace('.','',1).isdigit() else BACKOFF_S*(i+1)
-                print(f"[{ts()}] API {path} error {r.status_code} — sleep {wait_s:.1f}s (retry {i+1}/{RETRIES})")
+            # 429/402 (rate/plan)
+            if r.status_code in (429, 402):
+                metrics["cg_calls_429"] += 1
+                ra = r.headers.get("Retry-After")
+                try:
+                    ra_val = float(ra) if ra and ra.replace('.','',1).isdigit() else None
+                except Exception:
+                    ra_val = None
+                if (i + 1) < RETRIES and (ra_val is None or ra_val <= 5.0):
+                    wait_s = (ra_val if ra_val is not None else BACKOFF_S*(i+1))
+                    print(f"[{ts()}] API {path} 429 — short backoff {wait_s:.1f}s (retry {i+1}/{RETRIES})")
+                    time.sleep(wait_s + random.uniform(0,0.5)); last = requests.HTTPError(f"{r.status_code}", response=r); continue
+                print(f"[{ts()}] API {path} 429 — deferring (Retry-After={ra_val})")
+                metrics["cg_calls_deferred"] += 1
+                raise RateLimitDefer(r.status_code, ra_val, url)
+            # 5xx transient
+            if r.status_code in (500,502,503,504):
+                metrics["cg_calls_5xx"] += 1
+                wait_s = min(5.0, BACKOFF_S*(i+1))
+                print(f"[{ts()}] API {path} error {r.status_code} — backoff {wait_s:.1f}s (retry {i+1}/{RETRIES})")
                 time.sleep(wait_s + random.uniform(0,0.5)); last = requests.HTTPError(f"{r.status_code}", response=r); continue
+
             r.raise_for_status()
             if TIME_API: print(f"[{ts()}] API OK {path} took {tdur(t0)}")
-            _req_times.append(time.time()); return r.json()
+            metrics["cg_calls_ok"] += 1
+            return r.json()
+        except RateLimitDefer:
+            raise
         except (requests.ConnectionError, requests.Timeout) as e:
-            last = e; sleep_for = BACKOFF_S*(i+1)
-            print(f"[{ts()}] API {path} error: {e} — backoff {sleep_for}s"); time.sleep(sleep_for + random.uniform(0,0.5))
+            last = e
+            wait_s = min(5.0, BACKOFF_S*(i+1))
+            print(f"[{ts()}] API {path} error: {e} — backoff {wait_s:.1f}s (retry {i+1}/{RETRIES})")
+            time.sleep(wait_s + random.uniform(0,0.5))
+        except requests.HTTPError as e:
+            # Other HTTP errors (e.g., 404)
+            try:
+                sc = e.response.status_code if e.response is not None else None
+            except Exception:
+                sc = None
+            if sc and sc != 429 and sc < 500:
+                metrics["cg_calls_other_http"] += 1
+            last = e
     raise RuntimeError(f"CoinGecko failed: {url} :: {last}")
 
 # ---------- Bucket helpers ----------
@@ -236,7 +298,7 @@ def interpolate_hourly_series(hours, values_map, max_gap_hours=None):
     return out
 
 # ---------- Prepared statements ----------
-from cassandra import ConsistencyLevel, OperationTimedOut, ReadTimeout, DriverException
+from cassandra import ConsistencyLevel
 from cassandra.query import SimpleStatement, BatchStatement
 
 SEL_LIVE = SimpleStatement(
@@ -335,9 +397,15 @@ def top_assets(limit: int):
     try:
         ss = SimpleStatement("SELECT id, first_day, last_day FROM coin_daily_availability", fetch_size=FETCH_SIZE)
         for row in session.execute(ss, timeout=REQUEST_TIMEOUT):
-            fid = getattr(row, "first_day", None)
-            lid = getattr(row, "last_day", None)
-            if not fid or not lid:
+            fid_raw = getattr(row, "first_day", None)
+            lid_raw = getattr(row, "last_day", None)
+            if not fid_raw or not lid_raw:
+                continue
+            # Normalize types to Python date to avoid 'Date' vs 'datetime.date' comparisons
+            try:
+                fid = _to_pydate(fid_raw)
+                lid = _to_pydate(lid_raw)
+            except Exception:
                 continue
             # include if its span overlaps our daily DQ window
             if (lid >= start_daily_date) and (fid <= last_inclusive):
@@ -505,6 +573,9 @@ def backfill_daily_from_api_ranges(coin, need_daily: set[dt.date], dt_ranges: li
                 f"/coins/{coin['id']}/market_chart/range",
                 params={"vs_currency":"usd","from":int(to_utc(start_dt).timestamp()),"to":int(to_utc(end_dt).timestamp())}
             )
+        except RateLimitDefer as e:
+            print(f"[{ts()}]      · window {start_dt.date()}→{end_dt.date()} rate-limited; deferring")
+            continue
         except Exception as e:
             print(f"[{ts()}]      · window {start_dt.date()}→{end_dt.date()} failed: {e}")
             continue
@@ -606,7 +677,11 @@ def repair_hourly_from_api_or_interp(coin, missing_hours: set[dt.datetime]) -> i
     end_dt   = floor_to_hour_utc(hours_sorted[-1] + dt.timedelta(hours=7))
     p_map = mc_map = v_map = {}
     if FILL_HOURLY_FROM_API:
-        try: p_map, mc_map, v_map = fetch_hourly_from_api(coin["id"], start_dt, end_dt)
+        try:
+            p_map, mc_map, v_map = fetch_hourly_from_api(coin["id"], start_dt, end_dt)
+        except RateLimitDefer:
+            print(f"[{ts()}]  · hourly API fetch rate-limited for {coin['symbol']} — deferring")
+            if not INTERPOLATE_IF_API_MISS: return 0
         except Exception as e:
             print(f"[{ts()}]  · hourly API fetch failed for {coin['symbol']}: {e}")
             if not INTERPOLATE_IF_API_MISS: return 0
@@ -715,6 +790,22 @@ def add_to_neg_cache(coin_id: str):
     except Exception as e:
         print(f"[{ts()}] [WARN] could not update neg cache: {e}")
 
+# Helpers for contiguous ranges
+def group_contiguous_dates(dates: set[dt.date]) -> list[tuple[dt.date, dt.date]]:
+    if not dates: return []
+    sdates = sorted(dates); runs = []; run_start = run_end = sdates[0]
+    for d in sdates[1:]:
+        if d == run_end + dt.timedelta(days=1): run_end = d
+        else: runs.append((run_start, run_end)); run_start = run_end = d
+    runs.append((run_start, run_end)); return runs
+
+def clamp_date_range(s: dt.date, e: dt.date, max_days: int):
+    out = []; cur = s
+    while cur <= e:
+        end = min(e, cur + dt.timedelta(days=max_days-1))
+        out.append((cur, end)); cur = end + dt.timedelta(days=1)
+    return out
+
 # ---------- Main ----------
 def main():
     now = utcnow()
@@ -750,9 +841,11 @@ def main():
     print(f"[{ts()}] Universe size: {len(coins)} (top {len(live)} + daily extras {len(universe_ids)-len(live)})")
 
     fixedD_local = fixed10_seeded = fixedD_api = 0
+    fixedH_total = 0
     t_all = perf_counter()
     neg_cache = load_neg_cache()
     api_plans = []
+    deadline = perf_counter() + SOFT_BUDGET_SEC
 
     for i, coin in enumerate(coins, 1):
         t_coin = perf_counter()
@@ -778,10 +871,18 @@ def main():
                   f"daily_total:{len(need_daily_all)} (10m_eligible:{len(need_daily_local)}, api:{len(need_daily_api)})")
 
             if need_daily_local and FIX_DAILY_FROM_10M:
-                fixed = repair_daily_from_10m(coin, need_daily_local); fixedD_local += fixed
+                fixed = repair_daily_from_10m(coin, need_daily_local)
+                fixedD_local += fixed
+                if fixed > 0:
+                    metrics["points_daily"] += fixed
+                    coin_fix_counts[coin["id"]] += fixed
 
             if need_10m and SEED_10M_FROM_DAILY:
-                fixed = seed_10m_from_daily(coin, need_10m); fixed10_seeded += fixed
+                fixed = seed_10m_from_daily(coin, need_10m)
+                fixed10_seeded += fixed
+                if fixed > 0:
+                    metrics["points_10m"] += fixed
+                    coin_fix_counts[coin["id"]] += fixed
 
             # Hourly repair
             if FILL_HOURLY:
@@ -795,6 +896,12 @@ def main():
                     try:
                         wroteH = repair_hourly_from_api_or_interp(coin, need_hours)
                         print(f"[{ts()}]    hourly_repair → wrote {wroteH} rows")
+                        fixedH_total += wroteH
+                        if wroteH > 0:
+                            metrics["points_hourly"] += wroteH
+                            coin_fix_counts[coin["id"]] += wroteH
+                    except RateLimitDefer:
+                        print(f"[{ts()}]    [WARN] hourly repair deferred due to rate limit for {coin['symbol']}")
                     except Exception as e:
                         print(f"[{ts()}]    [WARN] hourly repair failed for {coin['symbol']}: {e}")
 
@@ -820,12 +927,16 @@ def main():
             if (i % LOG_EVERY == 0) or VERBOSE:
                 print(f"[{ts()}] ← Done {coin['symbol']} in {elapsed_coin:.2f}s  (progress {i}/{len(coins)})")
 
+            # Respect soft budget
+            if perf_counter() >= deadline:
+                print(f"[{ts()}] [WARN] Time budget exhausted at {i}/{len(coins)}; stopping early.")
+                break
+
         except Exception as e:
             print(f"[{ts()}] [WARN] coin {coin.get('symbol')} ({coin.get('id')}) failed: {e}")
             continue
 
     # Execute API plan under request budget
-    fixedD_api = 0
     if BACKFILL_DAILY_FROM_API and api_plans:
         def _plan_reqs(p): return len(p["ranges"])
         api_plans.sort(key=_plan_reqs)  # cheapest first
@@ -838,7 +949,13 @@ def main():
                 ranges.append(r); reqs_left -= 1
             if not ranges: break
             try:
-                fixedD_api += backfill_daily_from_api_ranges(coin, plan["need_days"], ranges); coins_done += 1
+                wrote_api = backfill_daily_from_api_ranges(coin, plan["need_days"], ranges)
+                fixedD_api += wrote_api; coins_done += 1
+                if wrote_api > 0:
+                    metrics["points_daily"] += wrote_api
+                    coin_fix_counts[coin["id"]] += wrote_api
+            except RateLimitDefer:
+                print(f"[{ts()}]  · API repair deferred for {coin['symbol']} due to rate limit")
             except Exception as e:
                 print(f"[{ts()}]  · API repair failed for {coin['symbol']}: {e}")
             sleep(PAUSE_S)
@@ -847,25 +964,22 @@ def main():
     else:
         print(f"[{ts()}] No API pass needed or disabled.")
 
+    # Existing overall line
     print(f"[{ts()}] DONE in {tdur(t_all)} | Local fixes → daily_from_10m:{fixedD_local} "
           f"{'(10m_seeded:'+str(fixed10_seeded)+')' if SEED_10M_FROM_DAILY else ''} "
-          f"| API fixes → daily:{fixedD_api} | Universe size: {len(coins)}")
+          f"| API fixes → daily:{fixedD_api} | hourly:{fixedH_total} | Universe size: {len(coins)}")
 
-# Helpers for contiguous ranges (used above)
-def group_contiguous_dates(dates: set[dt.date]) -> list[tuple[dt.date, dt.date]]:
-    if not dates: return []
-    sdates = sorted(dates); runs = []; run_start = run_end = sdates[0]
-    for d in sdates[1:]:
-        if d == run_end + dt.timedelta(days=1): run_end = d
-        else: runs.append((run_start, run_end)); run_start = run_end = d
-    runs.append((run_start, run_end)); return runs
-
-def clamp_date_range(s: dt.date, e: dt.date, max_days: int):
-    out = []; cur = s
-    while cur <= e:
-        end = min(e, cur + dt.timedelta(days=max_days-1))
-        out.append((cur, end)); cur = end + dt.timedelta(days=1)
-    return out
+    # ---------- Final Summary ----------
+    coins_fixed_count = sum(1 for _id, n in coin_fix_counts.items() if n > 0)
+    points_total = metrics["points_daily"] + metrics["points_hourly"] + metrics["points_10m"]
+    print(f"[{ts()}] FINAL SUMMARY → "
+          f"CG calls: total={metrics['cg_calls_total']} ok={metrics['cg_calls_ok']} "
+          f"429={metrics['cg_calls_429']} deferred={metrics['cg_calls_deferred']} "
+          f"5xx={metrics['cg_calls_5xx']} other_http={metrics['cg_calls_other_http']} | "
+          f"coins_fixed={coins_fixed_count}/{len(coins)} | "
+          f"data_points_fixed: daily={metrics['points_daily']} "
+          f"hourly={metrics['points_hourly']} 10m={metrics['points_10m']} "
+          f"total={points_total}")
 
 if __name__ == "__main__":
     try:
