@@ -57,8 +57,8 @@ DRY_RUN     = os.getenv("DQ_DRY_RUN", "0") == "1"
 SOFT_BUDGET_SEC = int(os.getenv("DQ_SOFT_BUDGET_SEC", str(24*60)))  # default 24 minutes
 
 # CoinGecko API tier
-API_TIER = (os.getenv("COINGECKO_API_TIER") or "demo").strip().lower()
-API_KEY  = (os.getenv("COINGECKO_API_KEY") or "pro").strip()
+API_TIER = (os.getenv("COINGECKO_API_TIER") or "pro").strip().lower()
+API_KEY  = (os.getenv("COINGECKO_API_KEY") or "").strip()
 if API_KEY.lower().startswith("api key:"):
     API_KEY = API_KEY.split(":", 1)[1].strip()
 BASE = os.getenv(
@@ -145,6 +145,12 @@ def hour_seq(start_dt: dt.datetime, end_excl: dt.datetime):
     while cur < end_excl:
         yield cur; cur += dt.timedelta(hours=1)
 
+def _cg_preflight():
+    try:
+        http_get("/ping")  # cheap endpoint
+    except Exception as e:
+        raise SystemExit(f"[FATAL] CoinGecko preflight failed: {e}")
+
 # ---------- HTTP with rate limiting ----------
 class RateLimitDefer(Exception):
     """Raised to signal we should defer this request instead of sleeping for a long Retry-After."""
@@ -168,7 +174,18 @@ def _throttle():
 
 def http_get(path, params=None):
     url = f"{BASE}{path}"; params = dict(params or {})
-    headers = {HDR: API_KEY} if API_KEY else {}
+    headers = {}
+    params = dict(params or {})
+
+    if API_TIER == "demo":
+        if not API_KEY:
+            raise RuntimeError("COINGECKO_API_KEY missing for demo tier.")
+        params["x_cg_demo_api_key"] = API_KEY
+    else:
+        if not API_KEY:
+            raise RuntimeError("COINGECKO_API_KEY missing for pro tier.")
+        headers["x-cg-pro-api-key"] = API_KEY
+
     if API_KEY: params[QS] = API_KEY
     last = None
     for i in range(RETRIES):
@@ -178,21 +195,11 @@ def http_get(path, params=None):
         t0 = perf_counter()
         try:
             r = requests.get(url, params=params, headers=headers, timeout=REQUEST_TIMEOUT)
-            # 429/402 (rate/plan)
-            if r.status_code in (429, 402):
-                metrics["cg_calls_429"] += 1
-                ra = r.headers.get("Retry-After")
-                try:
-                    ra_val = float(ra) if ra and ra.replace('.','',1).isdigit() else None
-                except Exception:
-                    ra_val = None
-                if (i + 1) < RETRIES and (ra_val is None or ra_val <= 5.0):
-                    wait_s = (ra_val if ra_val is not None else BACKOFF_S*(i+1))
-                    print(f"[{ts()}] API {path} 429 — short backoff {wait_s:.1f}s (retry {i+1}/{RETRIES})")
-                    time.sleep(wait_s + random.uniform(0,0.5)); last = requests.HTTPError(f"{r.status_code}", response=r); continue
-                print(f"[{ts()}] API {path} 429 — deferring (Retry-After={ra_val})")
-                metrics["cg_calls_deferred"] += 1
-                raise RateLimitDefer(r.status_code, ra_val, url)
+            if r.status_code in (401, 403):
+                metrics["cg_calls_other_http"] += 1
+                raise RuntimeError(f"CoinGecko auth failed ({r.status_code}). "
+                                f"Check COINGECKO_API_KEY and tier/base URL.")
+
             # 5xx transient
             if r.status_code in (500,502,503,504):
                 metrics["cg_calls_5xx"] += 1
@@ -808,6 +815,7 @@ def clamp_date_range(s: dt.date, e: dt.date, max_days: int):
 
 # ---------- Main ----------
 def main():
+    _cg_preflight()
     now = utcnow()
     end_excl = dt.datetime(now.year,now.month,now.day,tzinfo=timezone.utc) + dt.timedelta(days=1)
     global start_daily_date, last_inclusive  # used by top_assets()
