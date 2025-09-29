@@ -68,6 +68,31 @@ BASE = os.getenv(
 HDR = "x-cg-demo-api-key" if API_TIER == "demo" else "x-cg-pro-api-key"
 QS  = "x_cg_demo_api_key" if API_TIER == "demo" else "x_cg_pro_api_key"
 
+### DEBUG START ###
+import hashlib
+
+def _mask_tail(s, n=4):
+    if not s:
+        return ""
+    return ("*" * max(0, len(s) - n)) + s[-n:]
+
+def _short_sha(s):
+    return hashlib.sha256(s.encode()).hexdigest()[:8] if s else ""
+
+def _dbg_env(name):
+    raw = os.getenv(name)
+    val = (raw or "").strip()
+    print(
+        f"[CFG] {name}: present={'yes' if raw is not None else 'no'} | "
+        f"len={len(val)} | tail={_mask_tail(val)} | sha256_8={_short_sha(val)} | raw_repr={repr(raw)}"
+    )
+
+print(f"[CFG] COINGECKO_BASE_URL resolves to: {BASE}")
+_dbg_env("COINGECKO_API_TIER")
+_dbg_env("COINGECKO_API_KEY")
+
+### DEBUG END ###
+
 # Request budget for daily API backfill
 DAILY_API_REQ_BUDGET = int(os.getenv("DAILY_API_REQ_BUDGET", "150"))
 PAD_DAYS             = int(os.getenv("DAILY_API_PAD_DAYS", "1"))
