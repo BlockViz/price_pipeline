@@ -78,6 +78,8 @@ jobs:
           ASTRA_BUNDLE_PATH: secure-connect.zip
           ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
           ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
+          COINGECKO_API_TIER: ${{ secrets.COINGECKO_API_TIER != '' && secrets.COINGECKO_API_TIER || 'pro' }}
+          COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
 
           TABLE_LIVE: "gecko_prices_live"
           TEN_MIN_TABLE: "gecko_prices_10m_7d"
