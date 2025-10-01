@@ -2,7 +2,10 @@ name: dq-repair
 
 on:
   schedule:
-    - cron: "20 3 */2 * *" # 03:20 UTC every 2 days
+    # Incremental every 2 days @ 03:20 UTC
+    - cron: "20 3 */2 * *"
+    # Monthly full pass on the 1st @ 04:15 UTC
+    - cron: "15 4 1 * *"
   workflow_dispatch:
     inputs:
       DRY_RUN:
@@ -29,6 +32,31 @@ on:
         description: "API backfills per run (cap)"
         required: false
         default: "20"
+      # NEW toggles you might want to flip via UI
+      FULL_MODE:
+        description: "Full aggregate recompute 0/1"
+        required: false
+        default: "0"
+      TRUNCATE_AGGREGATES_IN_FULL:
+        description: "TRUNCATE agg tables before full recompute 0/1"
+        required: false
+        default: "1"
+      RECOMPUTE_MCAP_10M:
+        description: "Recompute 10m aggregates 0/1"
+        required: false
+        default: "1"
+      RECOMPUTE_MCAP_HOURLY:
+        description: "Recompute hourly aggregates 0/1"
+        required: false
+        default: "1"
+      RECOMPUTE_MCAP_DAILY:
+        description: "Recompute daily aggregates 0/1"
+        required: false
+        default: "1"
+      FULL_DAILY_ALL:
+        description: "Full-table daily aggregate (2013→now) 0/1 (use for one-time rebuild)"
+        required: false
+        default: "0"
 
 permissions:
   contents: read
@@ -60,7 +88,8 @@ jobs:
           set -euo pipefail
           python -m pip install --upgrade pip
           pip install "cassandra-driver==3.29.0" requests python-dotenv tzdata
-          # Or: pip install -r requirements.txt
+          # If you keep astra_connect as a local module, PYTHONPATH=.
+          # If it's a package on PyPI/private index, install it here instead.
 
       - name: Export PYTHONPATH (repo root)
         run: echo "PYTHONPATH=." >> "$GITHUB_ENV"
@@ -72,7 +101,7 @@ jobs:
           test -s secure-connect.zip || { echo "secure-connect.zip missing/empty"; exit 1; }
           ls -lh secure-connect.zip
 
-      - name: Data Quality & Repair
+      - name: Data Quality & Repair (incremental vs full decided by schedule)
         timeout-minutes: 25
         env:
           ASTRA_BUNDLE_PATH: secure-connect.zip
@@ -81,18 +110,26 @@ jobs:
           COINGECKO_API_TIER: ${{ secrets.COINGECKO_API_TIER != '' && secrets.COINGECKO_API_TIER || 'pro' }}
           COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
 
+          # Source tables
           TABLE_LIVE: "gecko_prices_live"
           TEN_MIN_TABLE: "gecko_prices_10m_7d"
           DAILY_TABLE: "gecko_candles_daily_contin"
           HOURLY_TABLE: "gecko_candles_hourly_30d"
           TABLE_ROLLING: "gecko_prices_live_rolling"
 
+          # Aggregate target tables (defaults already match these names; keep for clarity)
+          MCAP_10M_TABLE: "gecko_market_cap_10m_7d"
+          MCAP_HOURLY_TABLE: "gecko_market_cap_hourly_30d"
+          MCAP_DAILY_TABLE: "gecko_market_cap_daily_contin"
+
+          # Universe + windows
           TOP_N_DQ: ${{ github.event.inputs.TOP_N_DQ != '' && github.event.inputs.TOP_N_DQ || '110' }}
           DQ_MAX_COINS: "210"
           DQ_WINDOW_10M_DAYS: "7"
           DQ_WINDOW_DAILY_DAYS: "365"
           DQ_WINDOW_HOURLY_DAYS: "30"
 
+          # Existing repair knobs
           FIX_DAILY_FROM_10M: "1"
           BACKFILL_DAILY_FROM_API: ${{ github.event.inputs.BACKFILL_DAILY_FROM_API || '1' }}
           SEED_10M_FROM_DAILY: ${{ github.event.inputs.SEED_10M_FROM_DAILY || '0' }}
@@ -102,6 +139,7 @@ jobs:
           DAILY_API_MAX_RANGE_DAYS: "90"
           DAILY_API_PAD_DAYS: "1"
 
+          # Timeouts, pacing
           DQ_REQUEST_TIMEOUT_SEC: "30"
           DQ_CONNECT_TIMEOUT_SEC: "15"
           DQ_FETCH_SIZE: "500"
@@ -109,7 +147,32 @@ jobs:
           DQ_BACKOFF_SEC: "4"
           DQ_PAUSE_PER_COIN: "0.2"
 
+          # Logging (NEW: richer heartbeats/slow-query warnings)
+          DQ_LOG_HEARTBEAT_SEC: "15"
+          DQ_LOG_EVERY_TS: "10"
+          DQ_LOG_EVERY_COIN: "25"
+          DQ_LOG_FETCH_EVERY_ROWS: "5000"
+          DQ_SLOW_QUERY_WARN_SEC: "5"
+
           DQ_LOG_EVERY: "10"
           DQ_VERBOSE: ${{ github.event.inputs.VERBOSE || '0' }}
           DQ_TIME_API: "1"
-        run: python prices/FF_gck_dq_repair_timeseries.py
+
+          # Aggregate recompute toggles
+          # Decide FULL vs INCREMENTAL based on schedule: monthly full, otherwise incremental.
+          FULL_MODE: ${{ (github.event_name == 'schedule' && startsWith(github.event.schedule, '15 4 1')) && '1' || (github.event.inputs.FULL_MODE || '0') }}
+          TRUNCATE_AGGREGATES_IN_FULL: ${{ github.event.inputs.TRUNCATE_AGGREGATES_IN_FULL || '1' }}
+          RECOMPUTE_MCAP_10M: ${{ github.event.inputs.RECOMPUTE_MCAP_10M || '1' }}
+          RECOMPUTE_MCAP_HOURLY: ${{ github.event.inputs.RECOMPUTE_MCAP_HOURLY || '1' }}
+          RECOMPUTE_MCAP_DAILY: ${{ github.event.inputs.RECOMPUTE_MCAP_DAILY || '1' }}
+
+          # Daily full-table rebuild (ONE-TIME or manual)
+          # Leave "0" for normal monthly runs; trigger with workflow_dispatch to run one-time.
+          FULL_DAILY_ALL: ${{ github.event.inputs.FULL_DAILY_ALL || '0' }}
+
+          # Soft budget to fit in the job timeout
+          DQ_SOFT_BUDGET_SEC: "1500" # 25 minutes
+
+        run: |
+          set -euo pipefail
+          python prices/FF_gck_dq_repair_timeseries.py

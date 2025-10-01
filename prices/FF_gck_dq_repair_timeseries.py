@@ -3,11 +3,26 @@
 # Plan-first API ranges, hourly repair + tz fix + rate limit + neg-cache
 # Enhanced: include coins that fall in/out of Top-N and use astra_connect connector.
 # Added: final summary of API call counts and fix counts (coins + data points).
+# NEW: Robust recompute of market-cap aggregate tables (10m/hourly/daily)
+#      - FULL_MODE: recompute full windows (with optional TRUNCATE)
+#      - INCREMENTAL: recompute only affected timestamps (sum across full coin universe)
+#      - Category from gecko_prices_live.category, fallback "Other"
+#
+# Tables (sources)
+#   gecko_prices_10m_7d
+#   gecko_candles_hourly_30d
+#   gecko_candles_daily_contin
+#
+# Tables (aggregates written)
+#   gecko_market_cap_10m_7d
+#   gecko_market_cap_hourly_30d
+#   gecko_market_cap_daily_contin
 
 import os, time, random, requests, datetime as dt
 from datetime import timezone
 from collections import defaultdict, deque
 from time import perf_counter, sleep
+import math
 
 # ───────────────────── Connector (no path/env hacks) ─────────────────────
 from astra_connect.connect import get_session
@@ -22,18 +37,31 @@ DAILY_TABLE     = os.getenv("DAILY_TABLE", "gecko_candles_daily_contin")
 TABLE_ROLLING   = os.getenv("TABLE_ROLLING", "gecko_prices_live_rolling")
 HOURLY_TABLE    = os.getenv("HOURLY_TABLE", "gecko_candles_hourly_30d")
 
+# Aggregate targets
+MCAP_10M_TABLE   = os.getenv("MCAP_10M_TABLE",   "gecko_market_cap_10m_7d")
+MCAP_HOURLY_TABLE= os.getenv("MCAP_HOURLY_TABLE","gecko_market_cap_hourly_30d")
+MCAP_DAILY_TABLE = os.getenv("MCAP_DAILY_TABLE", "gecko_market_cap_daily_contin")
+
 # Repair windows
-DAYS_10M   = int(os.getenv("DQ_WINDOW_10M_DAYS", "7"))
-DAYS_DAILY = int(os.getenv("DQ_WINDOW_DAILY_DAYS", "365"))
+DAYS_10M    = int(os.getenv("DQ_WINDOW_10M_DAYS", "7"))
+DAYS_DAILY  = int(os.getenv("DQ_WINDOW_DAILY_DAYS", "365"))
 DAYS_HOURLY = int(os.getenv("DQ_WINDOW_HOURLY_DAYS", "30"))
 
-# What to run
+# What to run (existing)
 FIX_DAILY_FROM_10M      = os.getenv("FIX_DAILY_FROM_10M", "1") == "1"
 SEED_10M_FROM_DAILY     = os.getenv("SEED_10M_FROM_DAILY", "0") == "1"
 FILL_HOURLY             = os.getenv("FILL_HOURLY", "1") == "1"
 FILL_HOURLY_FROM_API    = os.getenv("FILL_HOURLY_FROM_API", "1") == "1"
 INTERPOLATE_IF_API_MISS = os.getenv("INTERPOLATE_IF_API_MISS", "1") == "1"
 BACKFILL_DAILY_FROM_API = os.getenv("BACKFILL_DAILY_FROM_API", "1") == "1"
+FULL_DAILY_ALL          = os.getenv("FULL_DAILY_ALL", "1") == "1"  # one-time: recompute daily across entire history
+
+# NEW: Aggregate recompute toggles
+FULL_MODE = os.getenv("FULL_MODE", "1") == "1"  # monthly: recompute entire windows
+TRUNCATE_AGGREGATES_IN_FULL = os.getenv("TRUNCATE_AGGREGATES_IN_FULL", "1") == "1"
+RECOMPUTE_MCAP_10M    = os.getenv("RECOMPUTE_MCAP_10M", "1") == "1"
+RECOMPUTE_MCAP_HOURLY = os.getenv("RECOMPUTE_MCAP_HOURLY", "1") == "1"
+RECOMPUTE_MCAP_DAILY  = os.getenv("RECOMPUTE_MCAP_DAILY", "1") == "1"
 
 # Top-N and universe expansion
 TOP_N_DQ              = int(os.getenv("TOP_N_DQ", "210"))
@@ -47,6 +75,12 @@ FETCH_SIZE      = int(os.getenv("DQ_FETCH_SIZE", "500"))
 RETRIES         = int(os.getenv("DQ_RETRIES", "3"))
 BACKOFF_S       = int(os.getenv("DQ_BACKOFF_SEC", "4"))
 PAUSE_S         = float(os.getenv("DQ_PAUSE_PER_COIN", "0.05"))
+# ─── Logging & safety knobs ───
+LOG_HEARTBEAT_SEC       = float(os.getenv("DQ_LOG_HEARTBEAT_SEC", "15"))   # print heartbeat if no log in N sec
+LOG_EVERY_TS            = int(os.getenv("DQ_LOG_EVERY_TS", "10"))          # log every N timestamps (outer loop)
+LOG_EVERY_COIN          = int(os.getenv("DQ_LOG_EVERY_COIN", "25"))        # log every N coins (inner loop)
+LOG_FETCH_EVERY_ROWS    = int(os.getenv("DQ_LOG_FETCH_EVERY_ROWS", "5000"))# log after every N rows seen
+SLOW_QUERY_WARN_SEC     = float(os.getenv("DQ_SLOW_QUERY_WARN_SEC", "5"))  # warn if a single execute() > N sec
 
 LOG_EVERY   = int(os.getenv("DQ_LOG_EVERY", "10"))
 VERBOSE     = os.getenv("DQ_VERBOSE", "0") == "1"
@@ -68,31 +102,6 @@ BASE = os.getenv(
 HDR = "x-cg-demo-api-key" if API_TIER == "demo" else "x-cg-pro-api-key"
 QS  = "x_cg_demo_api_key" if API_TIER == "demo" else "x_cg_pro_api_key"
 
-### DEBUG START ###
-# import hashlib
-
-# def _mask_tail(s, n=4):
-#     if not s:
-#         return ""
-#     return ("*" * max(0, len(s) - n)) + s[-n:]
-
-# def _short_sha(s):
-#     return hashlib.sha256(s.encode()).hexdigest()[:8] if s else ""
-
-# def _dbg_env(name):
-#     raw = os.getenv(name)
-#     val = (raw or "").strip()
-#     print(
-#         f"[CFG] {name}: present={'yes' if raw is not None else 'no'} | "
-#         f"len={len(val)} | tail={_mask_tail(val)} | sha256_8={_short_sha(val)} | raw_repr={repr(raw)}"
-#     )
-
-# print(f"[CFG] COINGECKO_BASE_URL resolves to: {BASE}")
-# _dbg_env("COINGECKO_API_TIER")
-# _dbg_env("COINGECKO_API_KEY")
-
-# ### DEBUG END ###
-
 # Request budget for daily API backfill
 DAILY_API_REQ_BUDGET = int(os.getenv("DAILY_API_REQ_BUDGET", "150"))
 PAD_DAYS             = int(os.getenv("DAILY_API_PAD_DAYS", "1"))
@@ -111,15 +120,19 @@ _req_times = deque()
 
 # ---------- Metrics ----------
 metrics = {
-    "cg_calls_total": 0,         # total HTTP attempts sent to CoinGecko
-    "cg_calls_ok": 0,            # 2xx
-    "cg_calls_429": 0,           # rate limited responses
-    "cg_calls_deferred": 0,      # times we deferred due to long Retry-After
-    "cg_calls_5xx": 0,           # transient server errors
-    "cg_calls_other_http": 0,    # other HTTP errors (e.g., 4xx other than 429)
-    "points_daily": 0,           # daily rows written (from 10m + API)
-    "points_hourly": 0,          # hourly rows written
-    "points_10m": 0,             # 10m rows seeded from daily
+    "cg_calls_total": 0,
+    "cg_calls_ok": 0,
+    "cg_calls_429": 0,
+    "cg_calls_deferred": 0,
+    "cg_calls_5xx": 0,
+    "cg_calls_other_http": 0,
+    "points_daily": 0,
+    "points_hourly": 0,
+    "points_10m": 0,
+    # NEW: aggregate writes
+    "agg_rows_10m": 0,
+    "agg_rows_hourly": 0,
+    "agg_rows_daily": 0,
 }
 coin_fix_counts = defaultdict(int)  # id -> total rows written across all tables
 
@@ -137,7 +150,7 @@ def to_utc(x: dt.datetime | None) -> dt.datetime | None:
     if x.tzinfo is None: return x.replace(tzinfo=timezone.utc)
     return x.astimezone(timezone.utc)
 
-def floor_to_hour_utc(x: dt.datetime) -> dt.datetime:
+def floor_to_hour_utc(x: dt.datetime):
     x = to_utc(x)
     return x.replace(minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
 
@@ -176,9 +189,55 @@ def _cg_preflight():
     except Exception as e:
         raise SystemExit(f"[FATAL] CoinGecko preflight failed: {e}")
 
+_last_log_time = [0.0]  # list so we can mutate in nested scopes
+
+def _now_str():  # fast ts string for logs
+    return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def _since(t0):  # seconds string
+    return f"{(perf_counter()-t0):.2f}s"
+
+def _maybe_heartbeat(tag: str):
+    now = perf_counter()
+    if (now - _last_log_time[0]) >= LOG_HEARTBEAT_SEC:
+        _last_log_time[0] = now
+        print(f"[{_now_str()}] [hb] {tag} … still working")
+
+def execute_timed(session, statement, params, *, label: str, timeout: int | None = None, fetch_size: int | None = None):
+    """Executes a C* statement and logs slow queries with full context."""
+    try:
+        if hasattr(statement, "bind"):  # prepared
+            bound = statement.bind(params)
+            if fetch_size is not None:
+                try: bound.fetch_size = fetch_size
+                except Exception: pass
+            tq = perf_counter()
+            rs = session.execute(bound, timeout=timeout or REQUEST_TIMEOUT)
+            dtq = perf_counter() - tq
+            if dtq >= SLOW_QUERY_WARN_SEC:
+                print(f"[{_now_str()}] [slowq] {label} took {dtq:.2f}s  timeout={timeout or REQUEST_TIMEOUT} fetch_size={getattr(bound,'fetch_size',None)}")
+            return rs
+        else:
+            tq = perf_counter()
+            rs = session.execute(statement, parameters=params, timeout=timeout or REQUEST_TIMEOUT)
+            dtq = perf_counter() - tq
+            if dtq >= SLOW_QUERY_WARN_SEC:
+                print(f"[{_now_str()}] [slowq] {label} took {dtq:.2f}s (simple)")
+            return rs
+    except Exception as e:
+        print(f"[{_now_str()}] [query-err] label={label} params={params} err={e}")
+        raise
+
+def _fmt_eta(done, total, start_t):
+    if done == 0: return "ETA: n/a"
+    rate = done / max(1e-9, (perf_counter() - start_t))
+    remain = max(0, total - done)
+    eta_s = remain / max(1e-9, rate)
+    return f"ETA ~{int(eta_s//60)}m{int(eta_s%60)}s (rate {rate:.1f}/s)"
+
+
 # ---------- HTTP with rate limiting ----------
 class RateLimitDefer(Exception):
-    """Raised to signal we should defer this request instead of sleeping for a long Retry-After."""
     def __init__(self, status_code: int, retry_after: float | None, url: str):
         super().__init__(f"Rate limited {status_code}, retry_after={retry_after}, url={url}")
         self.status_code = status_code
@@ -187,10 +246,8 @@ class RateLimitDefer(Exception):
 
 def _throttle():
     now = time.time()
-    # simple per-request spacing
     if _req_times and (now - _req_times[-1]) < CG_REQ_INTERVAL_S:
         time.sleep(CG_REQ_INTERVAL_S - (now - _req_times[-1])); now = time.time()
-    # sliding window RPM
     cutoff = now - 60.0
     while _req_times and _req_times[0] < cutoff: _req_times.popleft()
     if len(_req_times) >= CG_MAX_RPM:
@@ -215,17 +272,15 @@ def http_get(path, params=None):
     last = None
     for i in range(RETRIES):
         _throttle()
-        _req_times.append(time.time())                 # count this ATTEMPT
+        _req_times.append(time.time())
         metrics["cg_calls_total"] += 1
         t0 = perf_counter()
         try:
             r = requests.get(url, params=params, headers=headers, timeout=REQUEST_TIMEOUT)
             if r.status_code in (401, 403):
                 metrics["cg_calls_other_http"] += 1
-                raise RuntimeError(f"CoinGecko auth failed ({r.status_code}). "
-                                f"Check COINGECKO_API_KEY and tier/base URL.")
+                raise RuntimeError(f"CoinGecko auth failed ({r.status_code}). Check COINGECKO_API_KEY and tier/base URL.")
 
-            # 5xx transient
             if r.status_code in (500,502,503,504):
                 metrics["cg_calls_5xx"] += 1
                 wait_s = min(5.0, BACKOFF_S*(i+1))
@@ -244,7 +299,6 @@ def http_get(path, params=None):
             print(f"[{ts()}] API {path} error: {e} — backoff {wait_s:.1f}s (retry {i+1}/{RETRIES})")
             time.sleep(wait_s + random.uniform(0,0.5))
         except requests.HTTPError as e:
-            # Other HTTP errors (e.g., 404)
             try:
                 sc = e.response.status_code if e.response is not None else None
             except Exception:
@@ -256,7 +310,8 @@ def http_get(path, params=None):
 
 # ---------- Bucket helpers ----------
 def bucket_daily_ohlc(prices_ms_values, start_d: dt.date, end_d: dt.date):
-    per_day = defaultdict(list)
+    from collections import defaultdict as _dd
+    per_day = _dd(list)
     for ms, price in prices_ms_values or []:
         ts_ = dt.datetime.fromtimestamp(ms/1000.0, tz=timezone.utc)
         per_day[ts_.date()].append((ts_, float(price)))
@@ -271,7 +326,8 @@ def bucket_daily_ohlc(prices_ms_values, start_d: dt.date, end_d: dt.date):
     return out
 
 def bucket_daily_last(values_ms_values, start_d: dt.date, end_d: dt.date):
-    per_day = defaultdict(list)
+    from collections import defaultdict as _dd
+    per_day = _dd(list)
     for ms, val in values_ms_values or []:
         ts_ = dt.datetime.fromtimestamp(ms/1000.0, tz=timezone.utc)
         v = float(val) if val is not None else None
@@ -333,8 +389,9 @@ def interpolate_hourly_series(hours, values_map, max_gap_hours=None):
 from cassandra import ConsistencyLevel
 from cassandra.query import SimpleStatement, BatchStatement
 
+# include category from live
 SEL_LIVE = SimpleStatement(
-    f"SELECT id, symbol, name, market_cap_rank FROM {TABLE_LIVE}",
+    f"SELECT id, symbol, name, market_cap_rank, category FROM {TABLE_LIVE}",
     fetch_size=FETCH_SIZE
 )
 
@@ -353,6 +410,12 @@ SEL_10M_RANGE_DAYS = session.prepare(f"""
   SELECT ts FROM {TEN_MIN_TABLE}
   WHERE id = ? AND ts >= ? AND ts < ?
 """)
+SEL_10M_ONE = session.prepare(f"""
+  SELECT last_updated, market_cap, volume_24h
+  FROM {TEN_MIN_TABLE}
+  WHERE id = ? AND ts = ? LIMIT 1
+""")
+
 SEL_DAILY_ONE = session.prepare(f"""
   SELECT date, symbol, name,
          price_usd, market_cap, volume_24h, last_updated,
@@ -365,10 +428,32 @@ SEL_DAILY_RANGE = session.prepare(f"""
   SELECT date FROM {DAILY_TABLE}
   WHERE id = ? AND date >= ? AND date <= ?
 """)
+
+SEL_DAILY_READ_FOR_AGG = session.prepare(f"""
+  SELECT last_updated, market_cap, volume_24h
+  FROM {DAILY_TABLE}
+  WHERE id = ? AND date = ? LIMIT 1
+""")
+
 SEL_DAILY_LAST_META = session.prepare(f"""
   SELECT date, symbol, name FROM {DAILY_TABLE}
   WHERE id = ? ORDER BY date DESC LIMIT 1
 """)
+
+SEL_DAILY_FIRST = session.prepare(f"""
+  SELECT date FROM {DAILY_TABLE}
+  WHERE id = ? ORDER BY date ASC LIMIT 1
+""")
+SEL_DAILY_LAST = session.prepare(f"""
+  SELECT date FROM {DAILY_TABLE}
+  WHERE id = ? ORDER BY date DESC LIMIT 1
+""")
+SEL_DAILY_FOR_ID_RANGE_ALL = session.prepare(f"""
+  SELECT date, last_updated, market_cap, volume_24h
+  FROM {DAILY_TABLE}
+  WHERE id = ? AND date >= ? AND date <= ?
+""")
+
 SEL_ROLLING_RANGE = session.prepare(f"""
   SELECT last_updated, market_cap_rank, circulating_supply, total_supply
   FROM {TABLE_ROLLING}
@@ -377,6 +462,16 @@ SEL_ROLLING_RANGE = session.prepare(f"""
 SEL_HOURLY_RANGE = session.prepare(f"""
   SELECT ts FROM {HOURLY_TABLE}
   WHERE id = ? AND ts >= ? AND ts < ?
+""")
+SEL_HOURLY_META_RANGE = session.prepare(f"""
+  SELECT ts, price_usd, market_cap, volume_24h, candle_source, last_updated
+  FROM {HOURLY_TABLE}
+  WHERE id = ? AND ts >= ? AND ts < ?
+""")
+SEL_HOURLY_ONE = session.prepare(f"""
+  SELECT last_updated, market_cap, volume_24h
+  FROM {HOURLY_TABLE}
+  WHERE id = ? AND ts = ? LIMIT 1
 """)
 SEL_PREV_CLOSE = session.prepare(f"""
   SELECT ts, close FROM {HOURLY_TABLE}
@@ -408,6 +503,28 @@ INS_HOURLY = session.prepare(f"""
   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """)
 
+# Aggregate inserts
+INS_MCAP_10M = session.prepare(f"""
+  INSERT INTO {MCAP_10M_TABLE}
+    (category, ts, last_updated, market_cap, market_cap_rank, volume_24h)
+  VALUES (?, ?, ?, ?, ?, ?)
+""")
+INS_MCAP_HOURLY = session.prepare(f"""
+  INSERT INTO {MCAP_HOURLY_TABLE}
+    (category, ts, last_updated, market_cap, market_cap_rank, volume_24h)
+  VALUES (?, ?, ?, ?, ?, ?)
+""")
+INS_MCAP_DAILY = session.prepare(f"""
+  INSERT INTO {MCAP_DAILY_TABLE}
+    (category, date, last_updated, market_cap, market_cap_rank, volume_24h)
+  VALUES (?, ?, ?, ?, ?, ?)
+""")
+
+# Optional truncates for FULL mode
+TRUNC_10M = SimpleStatement(f"TRUNCATE {MCAP_10M_TABLE}")
+TRUNC_H   = SimpleStatement(f"TRUNCATE {MCAP_HOURLY_TABLE}")
+TRUNC_D   = SimpleStatement(f"TRUNCATE {MCAP_DAILY_TABLE}")
+
 # ---------- Universe selection ----------
 def top_assets(limit: int):
     """
@@ -415,16 +532,19 @@ def top_assets(limit: int):
       - Top-N ranked from live
       - Any ids present in coin_daily_availability overlapping the DQ window
       - Optional INCLUDE_IDS env (comma-separated ids)
-    This avoids DISTINCT-on-clustering errors and still keeps coins that drop out of Top-N.
     """
-    # A) ranked coins from live
     rows = list(session.execute(SEL_LIVE, timeout=REQUEST_TIMEOUT))
     ranked = [r for r in rows if isinstance(getattr(r, "market_cap_rank", None), int) and r.market_cap_rank > 0]
     ranked.sort(key=lambda r: r.market_cap_rank)
     ranked = ranked[:limit]
     by_id = {r.id: r for r in ranked}
 
-    # B) ids from availability summary (scan; id is the partition key there)
+    # id -> category map (fallback handled later)
+    id_to_cat = {}
+    for r in rows:
+        id_to_cat[r.id] = (getattr(r, "category", None) or "Other").strip() or "Other"
+
+    # Availability (optional)
     avail_ids = set()
     try:
         ss = SimpleStatement("SELECT id, first_day, last_day FROM coin_daily_availability", fetch_size=FETCH_SIZE)
@@ -433,43 +553,39 @@ def top_assets(limit: int):
             lid_raw = getattr(row, "last_day", None)
             if not fid_raw or not lid_raw:
                 continue
-            # Normalize types to Python date to avoid 'Date' vs 'datetime.date' comparisons
             try:
                 fid = _to_pydate(fid_raw)
                 lid = _to_pydate(lid_raw)
             except Exception:
                 continue
-            # include if its span overlaps our daily DQ window
             if (lid >= start_daily_date) and (fid <= last_inclusive):
                 avail_ids.add(row.id)
     except Exception as e:
         print(f"[{ts()}] [WARN] availability scan failed (optional): {e}")
 
-    # C) manual includes
     extra_ids = set(x.strip().lower() for x in (os.getenv("INCLUDE_IDS") or "").split(",") if x.strip())
-
     want_ids = set(by_id.keys()) | set(avail_ids) | extra_ids
 
-    # hydrate minimal records for ids not present in live
     def _mk_stub(cid: str):
-        return type("Coin", (), {
+        # Minimal record when not in live
+        rec = type("Coin", (), {
             "id": cid,
             "symbol": (cid or "").upper(),
             "name": cid,
             "market_cap_rank": None
         })()
+        return rec
 
     for cid in want_ids:
         if cid not in by_id:
             by_id[cid] = _mk_stub(cid)
 
     out = list(by_id.values())
-    # stable order: live-ranked first, then stubs
     out.sort(key=lambda r: (0 if (getattr(r, "market_cap_rank", None) is not None) else 1,
                             getattr(r, "market_cap_rank", 10**9),
                             r.id))
     print(f"[{ts()}] Loaded {len(out)} assets for DQ (live_top={len(ranked)}, from_availability={len(avail_ids)}, manual={len(extra_ids)})")
-    return out
+    return out, id_to_cat
 
 def all_daily_ids():
     t0 = perf_counter()
@@ -478,7 +594,6 @@ def all_daily_ids():
     return set(ids)
 
 def lookup_meta_for_id(coin_id: str, live_index: dict):
-    """Return (symbol, name, rank|None) using live first, then latest daily row."""
     live = live_index.get(coin_id)
     if live:
         return live.symbol, live.name, live.market_cap_rank
@@ -506,6 +621,23 @@ def existing_hours_hourly(coin_id: str, start_dt: dt.datetime, end_dt: dt.dateti
         if getattr(row, "ts", None):
             have.add(floor_to_hour_utc(row.ts))
     return have
+
+def bad_hours_hourly(coin_id: str, start_dt: dt.datetime, end_dt: dt.datetime):
+    bad = set()
+    rows = session.execute(SEL_HOURLY_META_RANGE, [coin_id, to_utc(start_dt), to_utc(end_dt)], timeout=REQUEST_TIMEOUT)
+    for r in rows:
+        ts = floor_to_hour_utc(r.ts) if getattr(r, "ts", None) else None
+        if not ts:
+            continue
+        mcap = r.market_cap
+        price = r.price_usd
+        csrc = getattr(r, "candle_source", None) or ""
+        needs_mcap = (mcap is None) or (isinstance(mcap, (int, float)) and mcap <= 0.0)
+        is_interpolated = (csrc in ("hourly_interp",))
+        inconsistent = (price is not None) and (mcap is None or mcap <= 0.0)
+        if needs_mcap or is_interpolated or inconsistent:
+            bad.add(ts)
+    return bad
 
 def _daily_row_equal(existing, o,h,l,c,mcap,vol,source):
     if not existing: return False
@@ -838,6 +970,106 @@ def clamp_date_range(s: dt.date, e: dt.date, max_days: int):
         out.append((cur, end)); cur = end + dt.timedelta(days=1)
     return out
 
+# ---------- Aggregate helpers ----------
+def compute_ranks(entries):
+    # entries: list[(cat, mcap)]
+    non_all = [(cat, m) for (cat, m) in entries if cat != "ALL"]
+    non_all.sort(key=lambda x: (x[1] or 0.0), reverse=True)
+    ranks = {cat: i+1 for i,(cat,_m) in enumerate(non_all)}
+    ranks["ALL"] = 0
+    return ranks
+
+def write_hourly_aggregates_from_map(hour_totals_map):
+    # hour_totals_map: { ts_utc: { cat: (last_updated, mcap_sum, vol_sum) } }
+    batch = BatchStatement(consistency_level=ConsistencyLevel.QUORUM)
+    total = 0
+    for ts_hr, catmap in sorted(hour_totals_map.items()):
+        entries = [(c, catmap[c][1]) for c in catmap]
+        ranks = compute_ranks(entries)
+        for cat, (lu, mc, vol) in catmap.items():
+            rk = ranks.get(cat, None)
+            if DRY_RUN: continue
+            batch.add(INS_MCAP_HOURLY, [cat, ts_hr, lu or (ts_hr + dt.timedelta(hours=1) - dt.timedelta(seconds=1)), float(mc or 0.0), rk, float(vol or 0.0)])
+            total += 1
+            if (total % 100) == 0:
+                session.execute(batch); batch.clear()
+    if not DRY_RUN and len(batch): session.execute(batch)
+    metrics["agg_rows_hourly"] += total
+    print(f"[{ts()}] [mcap_hourly] wrote rows={total}")
+
+def write_daily_aggregates_from_map(day_totals_map):
+    batch = BatchStatement(consistency_level=ConsistencyLevel.QUORUM)
+    total = 0
+    for d, catmap in sorted(day_totals_map.items()):
+        entries = [(c, catmap[c][1]) for c in catmap]
+        ranks = compute_ranks(entries)
+        for cat, (lu, mc, vol) in catmap.items():
+            rk = ranks.get(cat, None)
+            if DRY_RUN: continue
+            batch.add(INS_MCAP_DAILY, [cat, d, lu or (dt.datetime(d.year,d.month,d.day,23,59,59,tzinfo=timezone.utc)), float(mc or 0.0), rk, float(vol or 0.0)])
+            total += 1
+            if (total % 100) == 0:
+                session.execute(batch); batch.clear()
+    if not DRY_RUN and len(batch): session.execute(batch)
+    metrics["agg_rows_daily"] += total
+    print(f"[{ts()}] [mcap_daily] wrote rows={total}")
+
+def write_10m_aggregates_from_map(min10_totals_map):
+    batch = BatchStatement(consistency_level=ConsistencyLevel.QUORUM)
+    total = 0
+    for ts10, catmap in sorted(min10_totals_map.items()):
+        entries = [(c, catmap[c][1]) for c in catmap]
+        ranks = compute_ranks(entries)
+        for cat, (lu, mc, vol) in catmap.items():
+            rk = ranks.get(cat, None)
+            if DRY_RUN: continue
+            # Cassandra UPSERT
+            batch.add(INS_MCAP_10M, [cat, ts10, lu or ts10, float(mc or 0.0), rk, float(vol or 0.0)])
+            total += 1
+            if (total % 200) == 0:
+                session.execute(batch); batch.clear()
+    if not DRY_RUN and len(batch): session.execute(batch)
+    metrics["agg_rows_10m"] += total
+    print(f"[{ts()}] [mcap_10m] wrote rows={total}")
+
+def recompute_daily_full_all(coins, cat_for_id):
+    """
+    Full-table rebuild of gecko_market_cap_daily_contin.
+    For each coin, stream its entire daily range and accumulate per-day by category + ALL.
+    """
+    print(f"[{ts()}] [FULL][daily_all] begin full-table recompute across {len(coins)} coins")
+    acc = {}  # date -> {category: (last_updated, mcap_sum, vol_sum)}
+
+    def add_point(d, cat, lu, mcap, vol):
+        catmap = acc.setdefault(d, {})
+        lu0, m0, v0 = catmap.get(cat, (None, 0.0, 0.0))
+        lu_new = lu if (lu0 is None or (lu and lu > lu0)) else lu0
+        catmap[cat] = (lu_new, m0 + mcap, v0 + vol)
+        alu0, am0, av0 = catmap.get("ALL", (None, 0.0, 0.0))
+        alu_new = lu if (alu0 is None or (lu and lu > alu0)) else alu0
+        catmap["ALL"] = (alu_new, am0 + mcap, av0 + vol)
+
+    for i, c in enumerate(coins, 1):
+        if (i == 1) or (i % 25 == 0) or (i == len(coins)):
+            print(f"[{ts()}] [FULL][daily_all] {i}/{len(coins)}: {c['id']}")
+        # figure out per-coin date span
+        srow = session.execute(SEL_DAILY_FIRST, [c["id"]], timeout=REQUEST_TIMEOUT).one()
+        erow = session.execute(SEL_DAILY_LAST,  [c["id"]], timeout=REQUEST_TIMEOUT).one()
+        if not srow or not erow:
+            continue
+        sdate = _to_pydate(srow.date); edate = _to_pydate(erow.date)
+        # stream all rows for this id
+        rows = session.execute(SEL_DAILY_FOR_ID_RANGE_ALL, [c["id"], sdate, edate], timeout=REQUEST_TIMEOUT)
+        for r in rows:
+            d = _to_pydate(r.date)
+            lu = to_utc(getattr(r, "last_updated", None)) or dt.datetime(d.year, d.month, d.day, 23, 59, 59, tzinfo=timezone.utc)
+            mcap = float(getattr(r, "market_cap", 0.0) or 0.0)
+            vol  = float(getattr(r, "volume_24h", 0.0) or 0.0)
+            cat  = cat_for_id(c["id"])
+            add_point(d, cat, lu, mcap, vol)
+
+    write_daily_aggregates_from_map(acc)
+
 # ---------- Main ----------
 def main():
     _cg_preflight()
@@ -852,7 +1084,7 @@ def main():
     want_daily_days = set(date_seq(last_inclusive, DAYS_DAILY))
 
     # Build coin universe
-    live = top_assets(TOP_N_DQ)
+    live, id_to_cat = top_assets(TOP_N_DQ)
     live_index = {r.id: r for r in live}
     universe_ids = set(r.id for r in live)
 
@@ -870,6 +1102,9 @@ def main():
         symbol, name, rank = lookup_meta_for_id(cid, live_index)
         coins.append({"id": cid, "symbol": symbol or cid, "name": name or cid, "market_cap_rank": rank})
 
+    def cat_for_id(cid: str) -> str:
+        return (id_to_cat.get(cid) or "Other").strip() or "Other"
+
     print(f"[{ts()}] DQ windows → 10m: {start_10m_date}→{last_inclusive} | daily: {start_daily_date}→{last_inclusive}")
     print(f"[{ts()}] Universe size: {len(coins)} (top {len(live)} + daily extras {len(universe_ids)-len(live)})")
 
@@ -879,6 +1114,11 @@ def main():
     neg_cache = load_neg_cache()
     api_plans = []
     deadline = perf_counter() + SOFT_BUDGET_SEC
+
+    # NEW: affected timestamp sets for incremental aggregate recompute
+    affected_hours = set()  # datetime UTC hour
+    affected_days  = set()  # date
+    affected_10m_ts = set() # datetime UTC (10m or 23:59:59 seeded)
 
     for i, coin in enumerate(coins, 1):
         t_coin = perf_counter()
@@ -905,6 +1145,8 @@ def main():
 
             if need_daily_local and FIX_DAILY_FROM_10M:
                 fixed = repair_daily_from_10m(coin, need_daily_local)
+                # mark affected days for incremental aggregate
+                affected_days |= set(sorted(need_daily_local))
                 fixedD_local += fixed
                 if fixed > 0:
                     metrics["points_daily"] += fixed
@@ -912,6 +1154,9 @@ def main():
 
             if need_10m and SEED_10M_FROM_DAILY:
                 fixed = seed_10m_from_daily(coin, need_10m)
+                # approximate: the 10m seed uses 23:59:59 — still aggregate it
+                for d in need_10m:
+                    affected_10m_ts.add(dt.datetime(d.year,d.month,d.day,23,59,59,tzinfo=timezone.utc))
                 fixed10_seeded += fixed
                 if fixed > 0:
                     metrics["points_10m"] += fixed
@@ -923,11 +1168,20 @@ def main():
                 end_hour_dt   = dt.datetime.combine(last_inclusive + dt.timedelta(days=1), dt.time.min, tzinfo=timezone.utc)
                 want_hours = set(hour_seq(start_hour_dt, end_hour_dt))
                 have_hours = existing_hours_hourly(coin["id"], start_hour_dt, end_hour_dt)
-                need_hours = want_hours - have_hours
-                print(f"[{ts()}]    Hourly window: missing_hours={len(need_hours)} over {DAYS_HOURLY}d")
+                missing_hours = want_hours - have_hours
+
+                bad_existing = bad_hours_hourly(coin["id"], start_hour_dt, end_hour_dt)
+
+                need_hours = missing_hours | bad_existing
+
+                print(f"[{ts()}]    Hourly window: missing={len(missing_hours)} bad_existing={len(bad_existing)} "
+                      f"→ to_repair={len(need_hours)} over {DAYS_HOURLY}d")
+
                 if need_hours:
                     try:
                         wroteH = repair_hourly_from_api_or_interp(coin, need_hours)
+                        # mark affected hours for incremental aggregate recompute
+                        affected_hours |= set(need_hours)
                         print(f"[{ts()}]    hourly_repair → wrote {wroteH} rows")
                         fixedH_total += wroteH
                         if wroteH > 0:
@@ -954,13 +1208,14 @@ def main():
                     dt_ranges.append((start_dt3, end_dt3))
                 if dt_ranges:
                     api_plans.append({"coin": coin, "ranges": dt_ranges, "need_days": remaining_daily})
+                    # these days will be written after API pass; mark them now for aggregate recompute
+                    affected_days |= set(remaining_daily)
 
             sleep(PAUSE_S)
             elapsed_coin = perf_counter() - t_coin
             if (i % LOG_EVERY == 0) or VERBOSE:
                 print(f"[{ts()}] ← Done {coin['symbol']} in {elapsed_coin:.2f}s  (progress {i}/{len(coins)})")
 
-            # Respect soft budget
             if perf_counter() >= deadline:
                 print(f"[{ts()}] [WARN] Time budget exhausted at {i}/{len(coins)}; stopping early.")
                 break
@@ -972,7 +1227,7 @@ def main():
     # Execute API plan under request budget
     if BACKFILL_DAILY_FROM_API and api_plans:
         def _plan_reqs(p): return len(p["ranges"])
-        api_plans.sort(key=_plan_reqs)  # cheapest first
+        api_plans.sort(key=_plan_reqs)
         reqs_left = DAILY_API_REQ_BUDGET; coins_done = 0
         for plan in api_plans:
             if reqs_left <= 0: break
@@ -997,6 +1252,185 @@ def main():
     else:
         print(f"[{ts()}] No API pass needed or disabled.")
 
+    # ───────────────────── Aggregate recompute ─────────────────────
+    print(f"[{ts()}] Aggregate recompute: FULL_MODE={FULL_MODE} "
+          f"| recompute 10m={RECOMPUTE_MCAP_10M} hourly={RECOMPUTE_MCAP_HOURLY} daily={RECOMPUTE_MCAP_DAILY}")
+
+    # Helpers to read & sum per timestamp across the universe (for incremental)
+    def recompute_hourly_incremental(hours_set):
+        if not hours_set: return
+        print(f"[{ts()}] [mcap_hourly] incremental timestamps={len(hours_set)} (summing across {len(coins)} coins)")
+        hour_map = {}  # ts -> {cat: (lu, mcap_sum, vol_sum)}
+        for h in sorted(hours_set):
+            catmap = defaultdict(lambda: (None, 0.0, 0.0))
+            # sum across all coins
+            for c in coins:
+                row = session.execute(SEL_HOURLY_ONE, [c["id"], h], timeout=REQUEST_TIMEOUT).one()
+                if not row: continue
+                lu = to_utc(getattr(row, "last_updated", None))
+                mcap = float(getattr(row, "market_cap", 0.0) or 0.0)
+                vol  = float(getattr(row, "volume_24h", 0.0) or 0.0)
+                cat = cat_for_id(c["id"])
+                old_lu, old_m, old_v = catmap[cat]
+                new_lu = lu if (old_lu is None or (lu and lu > old_lu)) else old_lu
+                catmap[cat] = (new_lu, old_m + mcap, old_v + vol)
+                # ALL
+                a_lu, a_m, a_v = catmap["ALL"]
+                a_new_lu = lu if (a_lu is None or (lu and lu > a_lu)) else a_lu
+                catmap["ALL"] = (a_new_lu, a_m + mcap, a_v + vol)
+            hour_map[h] = catmap
+        # write
+        write_hourly_aggregates_from_map(hour_map)
+
+    def recompute_daily_incremental(days_set):
+        if not days_set: return
+        print(f"[{ts()}] [mcap_daily] incremental dates={len(days_set)} (summing across {len(coins)} coins)")
+        day_map = {}
+        for d in sorted(days_set):
+            catmap = defaultdict(lambda: (None, 0.0, 0.0))
+            for c in coins:
+                row = session.execute(SEL_DAILY_READ_FOR_AGG, [c["id"], d], timeout=REQUEST_TIMEOUT).one()
+                if not row: continue
+                lu = to_utc(getattr(row, "last_updated", None))
+                mcap = float(getattr(row, "market_cap", 0.0) or 0.0)
+                vol  = float(getattr(row, "volume_24h", 0.0) or 0.0)
+                cat = cat_for_id(c["id"])
+                old_lu, old_m, old_v = catmap[cat]
+                new_lu = lu if (old_lu is None or (lu and lu > old_lu)) else old_lu
+                catmap[cat] = (new_lu, old_m + mcap, old_v + vol)
+                a_lu, a_m, a_v = catmap["ALL"]
+                a_new_lu = lu if (a_lu is None or (lu and lu > a_lu)) else a_lu
+                catmap["ALL"] = (a_new_lu, a_m + mcap, a_v + vol)
+            day_map[d] = catmap
+        write_daily_aggregates_from_map(day_map)
+
+    def recompute_10m_incremental(ts_set):
+        if not ts_set: return
+        print(f"[{ts()}] [mcap_10m] incremental timestamps={len(ts_set)} (summing across {len(coins)} coins)")
+        min10_map = {}
+        for t10 in sorted(ts_set):
+            catmap = defaultdict(lambda: (None, 0.0, 0.0))
+            for c in coins:
+                row = session.execute(SEL_10M_ONE, [c["id"], t10], timeout=REQUEST_TIMEOUT).one()
+                if not row: continue
+                lu = to_utc(getattr(row, "last_updated", None))
+                mcap = float(getattr(row, "market_cap", 0.0) or 0.0)
+                vol  = float(getattr(row, "volume_24h", 0.0) or 0.0)
+                cat = cat_for_id(c["id"])
+                old_lu, old_m, old_v = catmap[cat]
+                new_lu = lu if (old_lu is None or (lu and lu > old_lu)) else old_lu
+                catmap[cat] = (new_lu, old_m + mcap, old_v + vol)
+                a_lu, a_m, a_v = catmap["ALL"]
+                a_new_lu = lu if (a_lu is None or (lu and lu > a_lu)) else a_lu
+                catmap["ALL"] = (a_new_lu, a_m + mcap, a_v + vol)
+            min10_map[t10] = catmap
+        write_10m_aggregates_from_map(min10_map)
+
+    if FULL_MODE:
+        print(f"[{ts()}] [FULL] recomputing aggregates over full windows 10m={DAYS_10M}d hourly={DAYS_HOURLY}d daily={DAYS_DAILY}d")
+        if TRUNCATE_AGGREGATES_IN_FULL:
+            if RECOMPUTE_MCAP_10M:    session.execute(TRUNC_10M)
+            if RECOMPUTE_MCAP_HOURLY: session.execute(TRUNC_H)
+            if RECOMPUTE_MCAP_DAILY:  session.execute(TRUNC_D)
+            print(f"[{ts()}] [FULL] truncated aggregate tables (as enabled)")
+
+        # FULL recompute scans source tables per ID and accumulates
+        if RECOMPUTE_MCAP_10M:
+            # window: last 7 days up to now (+10m guard kept simple as window end)
+            win_start = dt.datetime.combine(start_10m_date, dt.time.min, tzinfo=timezone.utc)
+            win_end   = dt.datetime.combine(last_inclusive + dt.timedelta(days=1), dt.time.min, tzinfo=timezone.utc)
+            print(f"[{ts()}] [FULL][10m] window {win_start} → {win_end}")
+            acc = {}
+            for idx,c in enumerate(coins,1):
+                if (idx==1) or (idx%25==0) or (idx==len(coins)):
+                    print(f"[{ts()}] [FULL][10m] id {idx}/{len(coins)}: {c['id']}")
+                rows = session.execute(SEL_10M_RANGE_FULL, [c["id"], win_start, win_end], timeout=REQUEST_TIMEOUT)
+                for r in rows:
+                    ts10 = to_utc(getattr(r,"ts",None))
+                    if not ts10: continue
+                    mcap = float(getattr(r,"market_cap",0.0) or 0.0)
+                    vol  = float(getattr(r,"volume_24h",0.0) or 0.0)
+                    lu   = to_utc(getattr(r,"last_updated",None)) or ts10
+                    cat  = cat_for_id(c["id"])
+                    catmap = acc.setdefault(ts10, {})
+                    lu0, m0, v0 = catmap.get(cat, (None, 0.0, 0.0))
+                    lu_new = lu if (lu0 is None or (lu and lu > lu0)) else lu0
+                    catmap[cat] = (lu_new, m0 + mcap, v0 + vol)
+                    alu0, am0, av0 = catmap.get("ALL", (None, 0.0, 0.0))
+                    alu_new = lu if (alu0 is None or (lu and lu > alu0)) else alu0
+                    catmap["ALL"] = (alu_new, am0 + mcap, av0 + vol)
+            write_10m_aggregates_from_map(acc)
+
+        if RECOMPUTE_MCAP_HOURLY:
+            win_start = dt.datetime.combine(last_inclusive - dt.timedelta(days=DAYS_HOURLY-1), dt.time.min, tzinfo=timezone.utc)
+            win_end   = dt.datetime.combine(last_inclusive + dt.timedelta(days=1), dt.time.min, tzinfo=timezone.utc)
+            print(f"[{ts()}] [FULL][hourly] window {win_start} → {win_end}")
+            acc = {}
+            for idx,c in enumerate(coins,1):
+                if (idx==1) or (idx%25==0) or (idx==len(coins)):
+                    print(f"[{ts()}] [FULL][hourly] id {idx}/{len(coins)}: {c['id']}")
+                rows = session.execute(SEL_HOURLY_META_RANGE, [c["id"], win_start, win_end], timeout=REQUEST_TIMEOUT)
+                for r in rows:
+                    ts_hr = floor_to_hour_utc(getattr(r,"ts",None)) if getattr(r,"ts",None) else None
+                    if not ts_hr: continue
+                    mcap = float(getattr(r,"market_cap",0.0) or 0.0)
+                    vol  = float(getattr(r,"volume_24h",0.0) or 0.0)
+                    lu   = to_utc(getattr(r,"last_updated",None)) or (ts_hr + dt.timedelta(hours=1) - dt.timedelta(seconds=1))
+                    cat  = cat_for_id(c["id"])
+                    catmap = acc.setdefault(ts_hr, {})
+                    lu0, m0, v0 = catmap.get(cat, (None, 0.0, 0.0))
+                    lu_new = lu if (lu0 is None or (lu and lu > lu0)) else lu0
+                    catmap[cat] = (lu_new, m0 + mcap, v0 + vol)
+                    alu0, am0, av0 = catmap.get("ALL", (None, 0.0, 0.0))
+                    alu_new = lu if (alu0 is None or (lu and lu > alu0)) else alu0
+                    catmap["ALL"] = (alu_new, am0 + mcap, av0 + vol)
+            write_hourly_aggregates_from_map(acc)
+
+        if RECOMPUTE_MCAP_DAILY:
+            if FULL_DAILY_ALL:
+                if TRUNCATE_AGGREGATES_IN_FULL:
+                    session.execute(TRUNC_D)
+                    print(f"[{ts()}] [FULL][daily_all] truncated {MCAP_DAILY_TABLE}")
+                recompute_daily_full_all(coins, cat_for_id)
+            else:
+                # existing bounded full recompute (DAYS_DAILY window)
+                win_start_d = start_daily_date
+                win_end_d   = last_inclusive
+                print(f"[{ts()}] [FULL][daily] window {win_start_d} → {win_end_d}")
+                acc = {}
+                cur_d = win_start_d
+                all_days = []
+                while cur_d <= win_end_d:
+                    all_days.append(cur_d)
+                    cur_d += dt.timedelta(days=1)
+                for idx,c in enumerate(coins,1):
+                    if (idx==1) or (idx%25==0) or (idx==len(coins)):
+                        print(f"[{ts()}] [FULL][daily] id {idx}/{len(coins)}: {c['id']}")
+                    for d in all_days:
+                        row = session.execute(SEL_DAILY_READ_FOR_AGG, [c["id"], d], timeout=REQUEST_TIMEOUT).one()
+                        if not row: continue
+                        mcap = float(getattr(row,"market_cap",0.0) or 0.0)
+                        vol  = float(getattr(row,"volume_24h",0.0) or 0.0)
+                        lu   = to_utc(getattr(row,"last_updated",None)) or dt.datetime(d.year,d.month,d.day,23,59,59,tzinfo=timezone.utc)
+                        cat  = cat_for_id(c["id"])
+                        catmap = acc.setdefault(d, {})
+                        lu0, m0, v0 = catmap.get(cat, (None, 0.0, 0.0))
+                        lu_new = lu if (lu0 is None or (lu and lu > lu0)) else lu0
+                        catmap[cat] = (lu_new, m0 + mcap, v0 + vol)
+                        alu0, am0, av0 = catmap.get("ALL", (None, 0.0, 0.0))
+                        alu_new = lu if (alu0 is None or (lu and lu > alu0)) else alu0
+                        catmap["ALL"] = (alu_new, am0 + mcap, av0 + vol)
+                write_daily_aggregates_from_map(acc)
+
+    else:
+        # INCREMENTAL recompute only the timestamps we touched
+        if RECOMPUTE_MCAP_HOURLY and affected_hours:
+            recompute_hourly_incremental(affected_hours)
+        if RECOMPUTE_MCAP_DAILY and affected_days:
+            recompute_daily_incremental(affected_days)
+        if RECOMPUTE_MCAP_10M and affected_10m_ts:
+            recompute_10m_incremental(affected_10m_ts)
+
     # Existing overall line
     print(f"[{ts()}] DONE in {tdur(t_all)} | Local fixes → daily_from_10m:{fixedD_local} "
           f"{'(10m_seeded:'+str(fixed10_seeded)+')' if SEED_10M_FROM_DAILY else ''} "
@@ -1012,7 +1446,8 @@ def main():
           f"coins_fixed={coins_fixed_count}/{len(coins)} | "
           f"data_points_fixed: daily={metrics['points_daily']} "
           f"hourly={metrics['points_hourly']} 10m={metrics['points_10m']} "
-          f"total={points_total}")
+          f"→ agg_rows: 10m={metrics['agg_rows_10m']} hourly={metrics['agg_rows_hourly']} daily={metrics['agg_rows_daily']} "
+          f"total_points={points_total}")
 
 if __name__ == "__main__":
     try:

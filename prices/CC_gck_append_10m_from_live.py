@@ -3,7 +3,7 @@
 #
 # Append 10-minute slots into:
 #   - gecko_prices_10m_7d      (IF NOT EXISTS; from rolling or carry)
-#   - gecko_market_cap_10m_7d  (category aggregates per slot; upsert)
+#   - gecko_market_cap_10m_7d  (category aggregates per slot; upsert + ranked)
 #
 # Reads from:
 #   - gecko_prices_live         (for the list of assets, incl. category)
@@ -83,8 +83,6 @@ SEL_COINS = SimpleStatement(
 )
 
 # Latest point within the slot (rolling is clustered on last_updated)
-# If your table uses CLUSTERING ORDER BY (last_updated DESC), this LIMIT 1
-# returns the newest in-slot row; otherwise add an ORDER BY if your schema allows.
 SEL_IN_SLOT_PS = session.prepare(
     f"""
     SELECT last_updated, price_usd, market_cap, volume_24h,
@@ -94,7 +92,7 @@ SEL_IN_SLOT_PS = session.prepare(
     """
 )
 
-# Carry: latest point before the slot start (the row *immediately* before)
+# Carry: latest point before the slot start (immediately before)
 SEL_PREV_PS = session.prepare(
     f"""
     SELECT last_updated, price_usd, market_cap, volume_24h,
@@ -104,7 +102,7 @@ SEL_PREV_PS = session.prepare(
     """
 )
 
-# Insert into 10m table — includes symbol & name + new fields
+# Insert into 10m table — includes symbol & name + fields
 INS_10M_IF_NOT_EXISTS_PS = session.prepare(
     f"""
     INSERT INTO {TABLE_OUT}
@@ -123,6 +121,18 @@ INS_MCAP_10M_UPSERT = session.prepare(
     """
 )
 
+# ───────────────────────── Helpers ─────────────────────────
+def compute_ranks_for_slot(cat_to_mcap: Dict[str, float]) -> Dict[str, int]:
+    """
+    Return category -> rank mapping for a single slot.
+    ALL is always 0; other categories ranked 1..N by market_cap DESC.
+    """
+    items = [(cat, cat_to_mcap.get(cat, 0.0)) for cat in cat_to_mcap.keys() if cat != "ALL"]
+    items.sort(key=lambda x: (x[1] or 0.0), reverse=True)
+    ranks: Dict[str, int] = {cat: i + 1 for i, (cat, _m) in enumerate(items)}
+    ranks["ALL"] = 0
+    return ranks
+
 # ───────────────────────── Main logic ─────────────────────────
 def main():
     # Pick coins
@@ -137,12 +147,12 @@ def main():
     if slots:
         print(f"[{now_str()}] Slots (oldest→newest): {slots[0][0]} .. {slots[-1][1]} (count={len(slots)})")
 
-    # slot_totals[(slot_start, category)] = {market_cap, volume_24h, last_updated}
-    slot_totals: Dict[Tuple[datetime, str], Dict[str, Any]] = {}
+    # slot_totals[slot_start][category] = {"market_cap": float, "volume_24h": float, "last_updated": dt}
+    slot_totals: Dict[datetime, Dict[str, Dict[str, Any]]] = {}
 
     def bump_slot_total(slot_start: datetime, category: str, mcap_value: float, vol_value: float, last_upd: datetime) -> None:
-        key = (slot_start, category)
-        entry = slot_totals.setdefault(key, {"market_cap": 0.0, "volume_24h": 0.0, "last_updated": last_upd})
+        cmap = slot_totals.setdefault(slot_start, {})
+        entry = cmap.setdefault(category, {"market_cap": 0.0, "volume_24h": 0.0, "last_updated": last_upd})
         entry["market_cap"] += float(mcap_value or 0.0)
         entry["volume_24h"] += float(vol_value or 0.0)
         if last_upd and (entry["last_updated"] is None or last_upd > entry["last_updated"]):
@@ -210,8 +220,9 @@ def main():
                 ).one()
                 applied = bool(getattr(result, 'applied', True)) if result is not None else True
 
+                # accumulate per-category + ALL for this slot
                 bump_slot_total(start, coin_category, mcap, vol, slot_last_upd)
-                bump_slot_total(start, 'ALL', mcap, vol, slot_last_upd)
+                bump_slot_total(start, 'ALL',          mcap, vol, slot_last_upd)
 
                 print(f"        insert {'applied' if applied else 'skipped'} "
                       f"({source}, price={price}, mcap={mcap}, vol={vol}, rank={rank}, circ={circ}, totl={totl}, last_upd={slot_last_upd})")
@@ -222,26 +233,48 @@ def main():
             except Exception as e:
                 print(f"        [WRITE-ERR] insert {sym} {start}: {e} (skip)"); skipped += 1
 
-    # Write category aggregates
+    # Write category aggregates with proper ranking
+        # Write category aggregates WITH RANKS
     if slot_totals:
         print(f"[{now_str()}] [mcap-10m] writing {len(slot_totals)} aggregates into {TABLE_MCAP_OUT}")
+
+        # Reindex: slot_start -> { category: {market_cap, volume_24h, last_updated} }
+        by_slot: Dict[datetime, Dict[str, Dict[str, Any]]] = {}
+        for (slot_start, category), totals in slot_totals.items():
+            by_slot.setdefault(slot_start, {})[category] = totals
+
+        def compute_ranks_per_slot(cat_totals: Dict[str, Dict[str, Any]]) -> Dict[str, int]:
+            # exclude ALL from ranking; ALL = 0; others 1..N by market_cap DESC
+            items = [(cat, float(v.get("market_cap") or 0.0))
+                     for cat, v in cat_totals.items() if cat != "ALL"]
+            items.sort(key=lambda x: x[1], reverse=True)
+            ranks = {cat: i + 1 for i, (cat, _m) in enumerate(items)}
+            ranks["ALL"] = 0
+            return ranks
+
         agg_written = 0
-        # sort by slot_start, then 'ALL' first, then alpha by category
-        for (slot_start, category), totals in sorted(
-            slot_totals.items(),
-            key=lambda kv: (kv[0][0], 0 if kv[0][1] == 'ALL' else 1, kv[0][1].lower())
-        ):
-            last_upd = totals.get('last_updated') or (slot_start + timedelta(minutes=SLOT_MINUTES) - timedelta(seconds=1))
-            rank_value = 0 if category == 'ALL' else None
-            try:
-                session.execute(
-                    INS_MCAP_10M_UPSERT,
-                    [category, slot_start, last_upd, float(totals['market_cap']), rank_value, float(totals['volume_24h'])],
-                    timeout=REQUEST_TIMEOUT
+        for slot_start in sorted(by_slot.keys()):
+            cat_totals = by_slot[slot_start]
+            ranks = compute_ranks_per_slot(cat_totals)
+
+            # Write ALL first (purely cosmetic for logs)
+            for category in sorted(cat_totals.keys(), key=lambda c: (0 if c == "ALL" else 1, c.lower())):
+                totals = cat_totals[category]
+                last_upd = totals.get("last_updated") or (
+                    slot_start + timedelta(minutes=SLOT_MINUTES) - timedelta(seconds=1)
                 )
-                agg_written += 1
-            except Exception as e:
-                print(f"        [mcap-10m] insert failed for category='{category}' slot={slot_start}: {e}")
+                rank_value = ranks.get(category, None)
+                try:
+                    session.execute(
+                        INS_MCAP_10M_UPSERT,
+                        [category, slot_start, last_upd,
+                         float(totals["market_cap"]), rank_value, float(totals["volume_24h"])],
+                        timeout=REQUEST_TIMEOUT
+                    )
+                    agg_written += 1
+                except Exception as e:
+                    print(f"        [mcap-10m] insert failed for category='{category}' slot={slot_start}: {e}")
+
         print(f"[{now_str()}] [mcap-10m] rows_written={agg_written}")
     else:
         print(f"[{now_str()}] [mcap-10m] no aggregates captured (coins={len(coins)})")
