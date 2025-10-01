@@ -1,8 +1,8 @@
-name: dq-repair
+name: dq-repair-full
 
 on:
   schedule:
-    - cron: "20 3 */2 * *" # 03:20 UTC every 2 days
+    - cron: "30 4 1 * *" # 04:30 UTC on the 1st of every month
   workflow_dispatch:
     inputs:
       DRY_RUN:
@@ -13,34 +13,18 @@ on:
         description: "Verbose logs 0/1"
         required: false
         default: "0"
-      BACKFILL_DAILY_FROM_API:
-        description: "Use API to fill missing daily 0/1"
-        required: false
-        default: "1"
-      SEED_10M_FROM_DAILY:
-        description: "Seed synthetic 10m from daily 0/1"
-        required: false
-        default: "0"
-      TOP_N_DQ:
-        description: "Max coins to scan (blank=default)"
-        required: false
-        default: ""
-      DQ_MAX_API_COINS_PER_RUN:
-        description: "API backfills per run (cap)"
-        required: false
-        default: "20"
 
 permissions:
   contents: read
 
 concurrency:
-  group: dq-repair
+  group: dq-repair-full
   cancel-in-progress: true
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 120
     env:
       TZ: UTC
       PYTHONUNBUFFERED: "1"
@@ -71,16 +55,17 @@ jobs:
           test -s secure-connect.zip || { echo "secure-connect.zip missing/empty"; exit 1; }
           ls -lh secure-connect.zip
 
-      - name: Data Quality & Repair (incremental)
-        timeout-minutes: 25
+      - name: Data Quality & FULL Rebuild
+        timeout-minutes: 105
         env:
+          # Astra / CoinGecko
           ASTRA_BUNDLE_PATH: secure-connect.zip
           ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
           ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
           COINGECKO_API_TIER: ${{ secrets.COINGECKO_API_TIER != '' && secrets.COINGECKO_API_TIER || 'pro' }}
           COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
 
-          # source/target tables
+          # Source/target tables
           TABLE_LIVE: "gecko_prices_live"
           TEN_MIN_TABLE: "gecko_prices_10m_7d"
           DAILY_TABLE: "gecko_candles_daily_contin"
@@ -90,40 +75,48 @@ jobs:
           MCAP_HOURLY_TABLE: "gecko_market_cap_hourly_30d"
           MCAP_DAILY_TABLE: "gecko_market_cap_daily_contin"
 
-          # windows & universe
-          TOP_N_DQ: ${{ github.event.inputs.TOP_N_DQ != '' && github.event.inputs.TOP_N_DQ || '110' }}
-          DQ_MAX_COINS: "210"
+          # Windows (full windows for rolling sets; daily full history controlled by FULL_DAILY_ALL)
           DQ_WINDOW_10M_DAYS: "7"
-          DQ_WINDOW_DAILY_DAYS: "365"
           DQ_WINDOW_HOURLY_DAYS: "30"
+          DQ_WINDOW_DAILY_DAYS: "365" # ignored for daily when FULL_DAILY_ALL=1
 
-          # repairs
+          # Universe size (use live Top-N + ALL ids seen in daily; raise caps for monthly)
+          TOP_N_DQ: "350"
+          DQ_MAX_COINS: "500000"
+          INCLUDE_ALL_DAILY_IDS: "1"
+
+          # Repair toggles (keep normal repairs on)
           FIX_DAILY_FROM_10M: "1"
-          BACKFILL_DAILY_FROM_API: ${{ github.event.inputs.BACKFILL_DAILY_FROM_API || '1' }}
-          SEED_10M_FROM_DAILY: ${{ github.event.inputs.SEED_10M_FROM_DAILY || '0' }}
-          DQ_DRY_RUN: ${{ github.event.inputs.DRY_RUN || '0' }}
+          BACKFILL_DAILY_FROM_API: "1"
+          SEED_10M_FROM_DAILY: "0"
 
-          # API/backfill
-          DQ_MAX_API_COINS_PER_RUN: ${{ github.event.inputs.DQ_MAX_API_COINS_PER_RUN || '20' }}
+          # API/backfill policy
           DAILY_API_MAX_RANGE_DAYS: "90"
           DAILY_API_PAD_DAYS: "1"
+          DQ_MAX_API_COINS_PER_RUN: "100"
+          CG_REQUEST_INTERVAL_S: "0.25"
+          CG_MAX_RPM: "120"
 
-          # perf/logging
+          # Performance / logging
           DQ_REQUEST_TIMEOUT_SEC: "30"
           DQ_CONNECT_TIMEOUT_SEC: "15"
           DQ_FETCH_SIZE: "500"
           DQ_RETRIES: "3"
           DQ_BACKOFF_SEC: "4"
-          DQ_PAUSE_PER_COIN: "0.2"
-          DQ_LOG_EVERY: "10"
+          DQ_PAUSE_PER_COIN: "0.1"
+          DQ_LOG_EVERY: "20"
           DQ_VERBOSE: ${{ github.event.inputs.VERBOSE || '0' }}
           DQ_TIME_API: "1"
+          DQ_DRY_RUN: ${{ github.event.inputs.DRY_RUN || '0' }}
+          DQ_LOG_HEARTBEAT_SEC: "20"
+          SOFT_BUDGET_SEC: "5400" # 90 minutes soft budget within job limit
 
-          # aggregate recompute (incremental run)
-          FULL_MODE: "0"
-          TRUNCATE_AGGREGATES_IN_FULL: "0"
+          # ── FULL aggregate recompute (this is the big difference) ──
+          FULL_MODE: "1"
+          TRUNCATE_AGGREGATES_IN_FULL: "1"
           RECOMPUTE_MCAP_10M: "1"
           RECOMPUTE_MCAP_HOURLY: "1"
           RECOMPUTE_MCAP_DAILY: "1"
-          FULL_DAILY_ALL: "0"
+          FULL_DAILY_ALL: "1" # rebuild market_cap_daily from 2013 → today
+
         run: python prices/FF_gck_dq_repair_timeseries.py

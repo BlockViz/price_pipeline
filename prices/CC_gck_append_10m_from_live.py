@@ -3,7 +3,7 @@
 #
 # Append 10-minute slots into:
 #   - gecko_prices_10m_7d      (IF NOT EXISTS; from rolling or carry)
-#   - gecko_market_cap_10m_7d  (category aggregates per slot; upsert + ranked)
+#   - gecko_market_cap_10m_7d  (category aggregates per slot; upsert with ranks)
 #
 # Reads from:
 #   - gecko_prices_live         (for the list of assets, incl. category)
@@ -15,14 +15,12 @@
 # - “Carry” uses the latest point before the slot if the slot is empty,
 #   capped by ALLOW_CARRY_MAX_SLOTS consecutive slots.
 
-import os, time
+import os, sys, traceback
 from datetime import datetime, timedelta, timezone
 from typing import Tuple, List, Dict, Any
 
 # ───────────────────────── Astra connector ─────────────────────────
 from astra_connect.connect import get_session, AstraConfig
-
-# Load env (from .env if present, else process env), validate bundle/token
 AstraConfig.from_env()
 
 # ───────────────────────── Config ─────────────────────────
@@ -55,7 +53,6 @@ def floor_slot(dt_utc: datetime, minutes: int = SLOT_MINUTES) -> datetime:
     return dt_utc.replace(minute=(dt_utc.minute // minutes) * minutes, second=0, microsecond=0)
 
 def slot_start_now() -> datetime:
-    # slight delay so we don't cut into an actively filling slot
     now_ = datetime.now(timezone.utc) - timedelta(seconds=SLOT_DELAY_SEC)
     return floor_slot(now_)
 
@@ -76,7 +73,6 @@ print(f"[{now_str()}] Connected. keyspace='{session.keyspace}'")
 
 from cassandra.query import SimpleStatement
 
-# gecko live table uses market_cap_rank and (optionally) category
 SEL_COINS = SimpleStatement(
     f"SELECT id, symbol, name, market_cap_rank, category FROM {TABLE_LATEST}",
     fetch_size=FETCH_SIZE
@@ -92,7 +88,7 @@ SEL_IN_SLOT_PS = session.prepare(
     """
 )
 
-# Carry: latest point before the slot start (immediately before)
+# Carry: latest point before the slot start
 SEL_PREV_PS = session.prepare(
     f"""
     SELECT last_updated, price_usd, market_cap, volume_24h,
@@ -102,7 +98,7 @@ SEL_PREV_PS = session.prepare(
     """
 )
 
-# Insert into 10m table — includes symbol & name + fields
+# Insert into 10m table — IF NOT EXISTS
 INS_10M_IF_NOT_EXISTS_PS = session.prepare(
     f"""
     INSERT INTO {TABLE_OUT}
@@ -112,7 +108,7 @@ INS_10M_IF_NOT_EXISTS_PS = session.prepare(
     """
 )
 
-# gecko_market_cap_10m_7d(category, ts, last_updated, market_cap, market_cap_rank, volume_24h)
+# Aggregates: gecko_market_cap_10m_7d(category, ts, last_updated, market_cap, market_cap_rank, volume_24h)
 INS_MCAP_10M_UPSERT = session.prepare(
     f"""
     INSERT INTO {TABLE_MCAP_OUT}
@@ -121,14 +117,13 @@ INS_MCAP_10M_UPSERT = session.prepare(
     """
 )
 
-# ───────────────────────── Helpers ─────────────────────────
-def compute_ranks_for_slot(cat_to_mcap: Dict[str, float]) -> Dict[str, int]:
+def compute_category_ranks(cat_totals: Dict[str, Dict[str, float]]) -> Dict[str, int]:
     """
-    Return category -> rank mapping for a single slot.
-    ALL is always 0; other categories ranked 1..N by market_cap DESC.
+    Input: cat_totals[category] = {'market_cap': float, 'volume_24h': float, 'last_updated': datetime}
+    Output: ranks per category (ALL=0; others 1..N by market_cap desc; ties stable)
     """
-    items = [(cat, cat_to_mcap.get(cat, 0.0)) for cat in cat_to_mcap.keys() if cat != "ALL"]
-    items.sort(key=lambda x: (x[1] or 0.0), reverse=True)
+    items = [(cat, float(vals.get('market_cap', 0.0))) for cat, vals in cat_totals.items() if cat != "ALL"]
+    items.sort(key=lambda x: x[1], reverse=True)
     ranks: Dict[str, int] = {cat: i + 1 for i, (cat, _m) in enumerate(items)}
     ranks["ALL"] = 0
     return ranks
@@ -137,7 +132,6 @@ def compute_ranks_for_slot(cat_to_mcap: Dict[str, float]) -> Dict[str, int]:
 def main():
     # Pick coins
     coins_rows = list(session.execute(SEL_COINS, timeout=REQUEST_TIMEOUT))
-    # keep only ranked coins with positive rank
     coins = [r for r in coins_rows if isinstance(r.market_cap_rank, int) and r.market_cap_rank > 0]
     coins.sort(key=lambda r: r.market_cap_rank)
     coins = coins[:TOP_N]
@@ -147,12 +141,12 @@ def main():
     if slots:
         print(f"[{now_str()}] Slots (oldest→newest): {slots[0][0]} .. {slots[-1][1]} (count={len(slots)})")
 
-    # slot_totals[slot_start][category] = {"market_cap": float, "volume_24h": float, "last_updated": dt}
+    # slot_totals[slot_start][category] = {'market_cap': float, 'volume_24h': float, 'last_updated': datetime}
     slot_totals: Dict[datetime, Dict[str, Dict[str, Any]]] = {}
 
     def bump_slot_total(slot_start: datetime, category: str, mcap_value: float, vol_value: float, last_upd: datetime) -> None:
-        cmap = slot_totals.setdefault(slot_start, {})
-        entry = cmap.setdefault(category, {"market_cap": 0.0, "volume_24h": 0.0, "last_updated": last_upd})
+        catmap = slot_totals.setdefault(slot_start, {})
+        entry = catmap.setdefault(category, {"market_cap": 0.0, "volume_24h": 0.0, "last_updated": last_upd})
         entry["market_cap"] += float(mcap_value or 0.0)
         entry["volume_24h"] += float(vol_value or 0.0)
         if last_upd and (entry["last_updated"] is None or last_upd > entry["last_updated"]):
@@ -170,6 +164,7 @@ def main():
         carry_used = 0
 
         for si, (start, end) in enumerate(slots, 1):
+            # print each slot with minimal noise
             print(f"    slot {si}/{len(slots)} {start} → {end}")
 
             # try to read a row *inside* the slot window
@@ -220,7 +215,7 @@ def main():
                 ).one()
                 applied = bool(getattr(result, 'applied', True)) if result is not None else True
 
-                # accumulate per-category + ALL for this slot
+                # accumulate aggregates
                 bump_slot_total(start, coin_category, mcap, vol, slot_last_upd)
                 bump_slot_total(start, 'ALL',          mcap, vol, slot_last_upd)
 
@@ -231,50 +226,32 @@ def main():
                 else:       skipped += 1
 
             except Exception as e:
-                print(f"        [WRITE-ERR] insert {sym} {start}: {e} (skip)"); skipped += 1
+                print(f"        [WRITE-ERR] insert {sym} {start}: {e} (skip)")
+                traceback.print_exc()
+                skipped += 1
 
-    # Write category aggregates with proper ranking
-        # Write category aggregates WITH RANKS
+    # Write category aggregates (with ranks)
     if slot_totals:
-        print(f"[{now_str()}] [mcap-10m] writing {len(slot_totals)} aggregates into {TABLE_MCAP_OUT}")
-
-        # Reindex: slot_start -> { category: {market_cap, volume_24h, last_updated} }
-        by_slot: Dict[datetime, Dict[str, Dict[str, Any]]] = {}
-        for (slot_start, category), totals in slot_totals.items():
-            by_slot.setdefault(slot_start, {})[category] = totals
-
-        def compute_ranks_per_slot(cat_totals: Dict[str, Dict[str, Any]]) -> Dict[str, int]:
-            # exclude ALL from ranking; ALL = 0; others 1..N by market_cap DESC
-            items = [(cat, float(v.get("market_cap") or 0.0))
-                     for cat, v in cat_totals.items() if cat != "ALL"]
-            items.sort(key=lambda x: x[1], reverse=True)
-            ranks = {cat: i + 1 for i, (cat, _m) in enumerate(items)}
-            ranks["ALL"] = 0
-            return ranks
-
+        print(f"[{now_str()}] [mcap-10m] writing aggregates for {len(slot_totals)} slots into {TABLE_MCAP_OUT}")
         agg_written = 0
-        for slot_start in sorted(by_slot.keys()):
-            cat_totals = by_slot[slot_start]
-            ranks = compute_ranks_per_slot(cat_totals)
-
-            # Write ALL first (purely cosmetic for logs)
-            for category in sorted(cat_totals.keys(), key=lambda c: (0 if c == "ALL" else 1, c.lower())):
-                totals = cat_totals[category]
-                last_upd = totals.get("last_updated") or (
-                    slot_start + timedelta(minutes=SLOT_MINUTES) - timedelta(seconds=1)
-                )
+        for slot_start in sorted(slot_totals.keys()):
+            catmap = slot_totals[slot_start]  # Dict[str, {market_cap, volume_24h, last_updated}]
+            # compute ranks for this slot (ALL=0; others by market_cap desc)
+            ranks = compute_category_ranks(catmap)
+            # write in defined order: ALL first, then alphabetical for determinism
+            for category in sorted(catmap.keys(), key=lambda c: (0 if c == "ALL" else 1, c.lower())):
+                totals = catmap[category]
+                last_upd = totals.get('last_updated') or (slot_start + timedelta(minutes=SLOT_MINUTES) - timedelta(seconds=1))
                 rank_value = ranks.get(category, None)
                 try:
                     session.execute(
                         INS_MCAP_10M_UPSERT,
-                        [category, slot_start, last_upd,
-                         float(totals["market_cap"]), rank_value, float(totals["volume_24h"])],
+                        [category, slot_start, last_upd, float(totals['market_cap']), rank_value, float(totals['volume_24h'])],
                         timeout=REQUEST_TIMEOUT
                     )
                     agg_written += 1
                 except Exception as e:
                     print(f"        [mcap-10m] insert failed for category='{category}' slot={slot_start}: {e}")
-
         print(f"[{now_str()}] [mcap-10m] rows_written={agg_written}")
     else:
         print(f"[{now_str()}] [mcap-10m] no aggregates captured (coins={len(coins)})")
