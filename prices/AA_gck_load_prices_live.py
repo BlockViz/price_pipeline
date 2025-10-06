@@ -48,6 +48,8 @@ TABLE_MCAP_LIVE       = os.getenv("TABLE_GECKO_MCAP_LIVE", "gecko_market_cap_liv
 # ranked bucket for prices_live_ranked
 RANK_BUCKET           = os.getenv("RANK_BUCKET", "all")
 RANK_TOP_N            = int(os.getenv("RANK_TOP_N", str(TOP_N)))
+# Use a large positive int for ASC clustering; switch to -1 if you use DESC.
+SENTINEL_UNRANKED = 2_000_000_000  # Cassandra int is 32-bit; this fits.
 
 # categories (Symbol -> Category; default path resolved relative to this file)
 _THIS_DIR = pathlib.Path(__file__).resolve().parent
@@ -413,11 +415,13 @@ def run_once():
 
     # ───── Build gecko_prices_live_ranked from the same buffer ─────
     def safe_rank_from_live(vals):
-        r = vals[4]  # market_cap_rank position in live_vals
+        r = vals[4]  # market_cap_rank
         try:
-            return int(r) if r is not None and int(r) > 0 else 10**9
+            r_int = int(r)
+            return r_int if r_int > 0 else SENTINEL_UNRANKED
         except Exception:
-            return 10**9
+            return SENTINEL_UNRANKED
+
 
     rank_source = sorted(live_buffer, key=safe_rank_from_live)[:RANK_TOP_N]
     if len(rank_source) == 0:
@@ -436,8 +440,11 @@ def run_once():
              p1h, p24h, p7d, p30d, p1y,
              _vs) = vals
 
+            rank_for_pk = safe_rank_from_live(vals)  # guaranteed int
+            if rank_for_pk == SENTINEL_UNRANKED and VERBOSE_MODE:
+                print(f"[{now_str()}] [prices_live_ranked] {sym}: null/invalid rank → sentinel {SENTINEL_UNRANKED}")
             batch_ranked.add(INS_PRICES_LIVE_RANKED, [
-                RANK_BUCKET, int(rnk) if rnk is not None else None,
+                RANK_BUCKET, rank_for_pk,
                 gid, sym, name, cat,
                 price, mcap, vol,
                 circ, totl, lu,
