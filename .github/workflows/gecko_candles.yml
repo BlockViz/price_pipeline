@@ -25,12 +25,46 @@ on:
 permissions:
   contents: read
 
+# You had cancel-in-progress: false — keep it if overlapping is safe, or set true.
 concurrency:
   group: gecko-prices-candles-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
+  # Only runs on schedule: decide whether to run or skip (if a recent non-schedule run exists)
+  recent_check:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.decide.outputs.should_run }}
+    steps:
+      - id: decide
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const windowMinutes = 15; // if a non-schedule run started in the last 15m, skip backup
+            const since = new Date(Date.now() - windowMinutes*60*1000).toISOString();
+
+            const runs = await github.rest.actions.listWorkflowRunsForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              per_page: 25,
+              branch: context.ref.replace('refs/heads/',''),
+            });
+
+            const recent = runs.data.workflow_runs.find(r =>
+              r.name === context.workflow &&
+              r.event !== 'schedule' &&
+              new Date(r.run_started_at).toISOString() >= since
+            );
+
+            core.setOutput('should_run', recent ? 'false' : 'true');
+            core.info(`recent non-schedule run since ${since}: ${recent ? 'YES -> skip' : 'NO -> run'}`);
+
   run:
+    # Always run for workflow_dispatch; for schedule only when recent_check says so
+    if: github.event_name != 'schedule' || needs.recent_check.outputs.should_run == 'true'
+    needs: [recent_check]
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
@@ -38,6 +72,18 @@ jobs:
       PYTHONUNBUFFERED: "1"
       PYTHONUTF8: "1"
       PYTHONWARNINGS: default
+
+      # Normalize flags so schedule behaves like dispatch
+      RUN_03: ${{ (github.event_name == 'schedule' && 'true') || (github.event.inputs.run_03 || 'true') }}
+      RUN_04: ${{ (github.event_name == 'schedule' && 'true') || (github.event.inputs.run_04 || 'true') }}
+
+      TOP_N_INPUT:   ${{ github.event.inputs.TOP_N || '' }}
+      VERBOSE_INPUT: ${{ github.event.inputs.VERBOSE_MODE || '0' }}
+
+      # Resolved values (inputs > secrets > defaults)
+      TOP_N_RESOLVED:   ${{ (github.event.inputs.TOP_N != '' && github.event.inputs.TOP_N) || secrets.TOP_N || '200' }}
+      VERBOSE_RESOLVED: ${{ github.event.inputs.VERBOSE_MODE || '0' }}
+
     steps:
       - uses: actions/checkout@v4
 
@@ -51,8 +97,7 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          pip install "cassandra-driver==3.29.0" requests python-dotenv tzdata
-          # Or: pip install -r requirements.txt
+          pip install -r requirements.txt
 
       - name: Export PYTHONPATH (repo root)
         run: echo "PYTHONPATH=." >> "$GITHUB_ENV"
@@ -63,39 +108,41 @@ jobs:
           test -s secure-connect.zip
 
       - name: 03 Update hourly from 10m
-        if: ${{ github.event.inputs.run_03 == 'true' }}
+        if: env.RUN_03 == 'true'
         timeout-minutes: 12
         env:
-          COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
+          COINGECKO_API_KEY:  ${{ secrets.COINGECKO_API_KEY }}
           COINGECKO_API_TIER: ${{ secrets.COINGECKO_API_TIER }}
-          ASTRA_BUNDLE_PATH: secure-connect.zip
-          ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
-          ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
-          TOP_N: ${{ github.event.inputs.TOP_N != '' && github.event.inputs.TOP_N || secrets.TOP_N || '200' }}
-          REQUEST_TIMEOUT_SEC: "40"
-          CONNECT_TIMEOUT_SEC: "15"
-          FETCH_SIZE: "500"
-          SLOT_DELAY_SEC: "120"
-          CURRENT_ONLY: "1"
-          FINALIZE_PREV: "1"
-          PROGRESS_EVERY: "20"
-          VERBOSE_MODE: ${{ github.event.inputs.VERBOSE_MODE || '0' }}
+          ASTRA_BUNDLE_PATH:  secure-connect.zip
+          ASTRA_TOKEN:        ${{ secrets.ASTRA_TOKEN }}
+          ASTRA_KEYSPACE:     ${{ secrets.ASTRA_KEYSPACE }}
+
+          TOP_N:              "${{ env.TOP_N_RESOLVED }}"
+          REQUEST_TIMEOUT_SEC:"40"
+          CONNECT_TIMEOUT_SEC:"15"
+          FETCH_SIZE:         "500"
+          SLOT_DELAY_SEC:     "120"
+          CURRENT_ONLY:       "1"
+          FINALIZE_PREV:      "1"
+          PROGRESS_EVERY:     "20"
+          VERBOSE_MODE:       "${{ env.VERBOSE_RESOLVED }}"
         run: python prices/DD_gck_create_hourly_from_10m.py
 
       - name: 04 Update/close daily from 10m
-        if: ${{ github.event.inputs.run_04 == 'true' }}
+        if: env.RUN_04 == 'true'
         timeout-minutes: 12
         env:
-          COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
+          COINGECKO_API_KEY:  ${{ secrets.COINGECKO_API_KEY }}
           COINGECKO_API_TIER: ${{ secrets.COINGECKO_API_TIER }}
-          ASTRA_BUNDLE_PATH: secure-connect.zip
-          ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
-          ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
-          TOP_N: ${{ github.event.inputs.TOP_N != '' && github.event.inputs.TOP_N || secrets.TOP_N || '200' }}
-          REQUEST_TIMEOUT_SEC: "40"
-          CONNECT_TIMEOUT_SEC: "15"
-          FETCH_SIZE: "500"
-          SLOT_DELAY_SEC: "120"
-          PROGRESS_EVERY: "20"
-          VERBOSE_MODE: ${{ github.event.inputs.VERBOSE_MODE || '0' }}
+          ASTRA_BUNDLE_PATH:  secure-connect.zip
+          ASTRA_TOKEN:        ${{ secrets.ASTRA_TOKEN }}
+          ASTRA_KEYSPACE:     ${{ secrets.ASTRA_KEYSPACE }}
+
+          TOP_N:              "${{ env.TOP_N_RESOLVED }}"
+          REQUEST_TIMEOUT_SEC:"40"
+          CONNECT_TIMEOUT_SEC:"15"
+          FETCH_SIZE:         "500"
+          SLOT_DELAY_SEC:     "120"
+          PROGRESS_EVERY:     "20"
+          VERBOSE_MODE:       "${{ env.VERBOSE_RESOLVED }}"
         run: python prices/EE_gck_create_daily_from_10m.py
