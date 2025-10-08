@@ -19,6 +19,8 @@ on:
         description: "Verbose (0/1)"
         required: false
         default: "0"
+  schedule:
+    - cron: "*/20 * * * *" # backup: every 20 minutes UTC
 
 permissions:
   contents: read

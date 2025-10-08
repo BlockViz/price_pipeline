@@ -23,6 +23,8 @@ on:
         description: "Verbose (0/1)"
         required: false
         default: "0"
+  schedule:
+    - cron: "*/10 * * * *" # backup: every 10 minutes UTC
 
 permissions:
   contents: read
