@@ -25,15 +25,13 @@ on:
 permissions:
   contents: read
 
-# You had cancel-in-progress: false — keep it if overlapping is safe, or set true.
 concurrency:
   group: gecko-prices-candles-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  # Only runs on schedule: decide whether to run or skip (if a recent non-schedule run exists)
+  # Always present so 'needs: recent_check' is valid on every event.
   recent_check:
-    if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
     outputs:
       should_run: ${{ steps.decide.outputs.should_run }}
@@ -42,29 +40,37 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const windowMinutes = 15; // if a non-schedule run started in the last 15m, skip backup
-            const since = new Date(Date.now() - windowMinutes*60*1000).toISOString();
+            // If not a schedule, always run (this covers workflow_dispatch from Cloudflare/manual)
+            if (context.eventName !== 'schedule') {
+              core.setOutput('should_run', 'true');
+              core.info('non-schedule event -> run');
+              return;
+            }
+            // For schedule: skip if a non-schedule run started recently
+            const windowMinutes = 15; // adjust as you like
+            const sinceISO = new Date(Date.now() - windowMinutes*60*1000).toISOString();
 
+            const branch = context.ref.replace('refs/heads/','');
             const runs = await github.rest.actions.listWorkflowRunsForRepo({
               owner: context.repo.owner,
               repo: context.repo.repo,
               per_page: 25,
-              branch: context.ref.replace('refs/heads/',''),
+              branch
             });
 
             const recent = runs.data.workflow_runs.find(r =>
               r.name === context.workflow &&
               r.event !== 'schedule' &&
-              new Date(r.run_started_at).toISOString() >= since
+              new Date(r.run_started_at).toISOString() >= sinceISO
             );
 
-            core.setOutput('should_run', recent ? 'false' : 'true');
-            core.info(`recent non-schedule run since ${since}: ${recent ? 'YES -> skip' : 'NO -> run'}`);
+            const shouldRun = recent ? 'false' : 'true';
+            core.setOutput('should_run', shouldRun);
+            core.info(`schedule event -> recent non-schedule since ${sinceISO}: ${recent ? 'YES (skip)' : 'NO (run)'}`);
 
   run:
-    # Always run for workflow_dispatch; for schedule only when recent_check says so
-    if: github.event_name != 'schedule' || needs.recent_check.outputs.should_run == 'true'
     needs: [recent_check]
+    if: needs.recent_check.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
@@ -73,14 +79,13 @@ jobs:
       PYTHONUTF8: "1"
       PYTHONWARNINGS: default
 
-      # Normalize flags so schedule behaves like dispatch
+      # Normalize so schedule behaves like dispatch
       RUN_03: ${{ (github.event_name == 'schedule' && 'true') || (github.event.inputs.run_03 || 'true') }}
       RUN_04: ${{ (github.event_name == 'schedule' && 'true') || (github.event.inputs.run_04 || 'true') }}
 
       TOP_N_INPUT:   ${{ github.event.inputs.TOP_N || '' }}
       VERBOSE_INPUT: ${{ github.event.inputs.VERBOSE_MODE || '0' }}
 
-      # Resolved values (inputs > secrets > defaults)
       TOP_N_RESOLVED:   ${{ (github.event.inputs.TOP_N != '' && github.event.inputs.TOP_N) || secrets.TOP_N || '200' }}
       VERBOSE_RESOLVED: ${{ github.event.inputs.VERBOSE_MODE || '0' }}
 

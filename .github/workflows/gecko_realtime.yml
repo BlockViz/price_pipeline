@@ -29,15 +29,13 @@ on:
 permissions:
   contents: read
 
-# Prevent overlapping *jobs*. We'll also skip the backup when a recent non-schedule run exists.
 concurrency:
-  group: gecko-prices-realtime-${{ github.ref }}
+  group: gecko_prices-realtime-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  # Only needed when event is "schedule": decide whether to run or skip.
+  # Always present so 'needs:' is valid for every event.
   recent_check:
-    if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
     outputs:
       should_run: ${{ steps.decide.outputs.should_run }}
@@ -46,42 +44,46 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const windowMinutes = 7; // consider CF "fresh" if it ran in the last 7 min
-            const since = new Date(Date.now() - windowMinutes*60*1000).toISOString();
+            // If not a schedule event, always run (covers Cloudflare/manual dispatch)
+            if (context.eventName !== 'schedule') {
+              core.setOutput('should_run', 'true');
+              core.info('non-schedule event -> run');
+              return;
+            }
+            // For schedule: skip if a non-schedule run started recently
+            const windowMinutes = 7; // adjust as you like
+            const sinceISO = new Date(Date.now() - windowMinutes*60*1000).toISOString();
+            const branch = context.ref.replace('refs/heads/','');
 
-            // list the last few runs of THIS workflow on THIS branch
-            const runs = await github.rest.actions.listWorkflowRunsForRepo({
+            const { data } = await github.rest.actions.listWorkflowRunsForRepo({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              per_page: 20,
-              branch: context.ref.replace('refs/heads/',''),
+              per_page: 25,
+              branch
             });
 
-            // Find the most recent non-schedule run that started after 'since'
-            const recent = runs.data.workflow_runs.find(r =>
+            const recent = data.workflow_runs.find(r =>
               r.name === context.workflow &&
-              r.event !== 'schedule' &&                 // Cloudflare dispatch is "workflow_dispatch"
-              new Date(r.run_started_at).toISOString() >= since
+              r.event !== 'schedule' &&
+              new Date(r.run_started_at).toISOString() >= sinceISO
             );
 
             const shouldRun = recent ? 'false' : 'true';
             core.setOutput('should_run', shouldRun);
-            core.info(`recent non-schedule run since ${since}: ${recent ? 'YES -> skip backup' : 'NO -> run backup'}`);
+            core.info(`schedule event -> recent non-schedule since ${sinceISO}: ${recent ? 'YES (skip)' : 'NO (run)'}`);
 
   run:
-    # If it's the backup (schedule), only run when recent_check says so.
-    # For workflow_dispatch runs (Cloudflare/manual) always run.
-    if: github.event_name != 'schedule' || needs.recent_check.outputs.should_run == 'true'
+    needs: [recent_check]
+    if: needs.recent_check.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    needs: [recent_check]
     env:
       TZ: UTC
       PYTHONUNBUFFERED: "1"
       PYTHONUTF8: "1"
       PYTHONWARNINGS: default
 
-      # ---------- Normalize inputs so schedule + dispatch behave the same ----------
+      # Normalize so schedule behaves like dispatch
       RUN_01: ${{ (github.event_name == 'schedule' && 'true') || (github.event.inputs.run_01 || 'true') }}
       RUN_02: ${{ (github.event_name == 'schedule' && 'true') || (github.event.inputs.run_02 || 'true') }}
 
@@ -89,11 +91,10 @@ jobs:
       RANK_TOP_N_INPUT:  ${{ github.event.inputs.RANK_TOP_N || '' }}
       VERBOSE_INPUT:     ${{ github.event.inputs.VERBOSE_MODE || '0' }}
 
-      # Resolved values (inputs take precedence, then secrets, then defaults)
+      # Resolved values (inputs > secrets > defaults)
       TOP_N_RESOLVED:      ${{ (github.event.inputs.TOP_N != '' && github.event.inputs.TOP_N) || secrets.TOP_N || '200' }}
       RANK_TOP_N_RESOLVED: ${{ (github.event.inputs.RANK_TOP_N != '' && github.event.inputs.RANK_TOP_N) || secrets.TOP_N || '200' }}
       VERBOSE_RESOLVED:    ${{ github.event.inputs.VERBOSE_MODE || '0' }}
-      # ---------------------------------------------------------------------------
 
     steps:
       - uses: actions/checkout@v4
@@ -127,8 +128,8 @@ jobs:
           ASTRA_TOKEN:        ${{ secrets.ASTRA_TOKEN }}
           ASTRA_KEYSPACE:     ${{ secrets.ASTRA_KEYSPACE }}
 
-          TOP_N:        ${{ env.TOP_N_RESOLVED }}
-          RANK_TOP_N:   ${{ env.RANK_TOP_N_RESOLVED }}
+          TOP_N:        "${{ env.TOP_N_RESOLVED }}"
+          RANK_TOP_N:   "${{ env.RANK_TOP_N_RESOLVED }}"
 
           STALE_WARN_MINUTES: "10"
           REQUIRED_LIVE_MIN:  "140"
@@ -143,7 +144,7 @@ jobs:
           RANK_BUCKET:        "all"
           GECKO_MCAP_BUCKET:  "categories"
 
-          VERBOSE_MODE: ${{ env.VERBOSE_RESOLVED }}
+          VERBOSE_MODE: "${{ env.VERBOSE_RESOLVED }}"
         run: python prices/AA_gck_load_prices_live.py
 
       - name: 02 Append 10m from live_rolling
@@ -156,12 +157,11 @@ jobs:
           ASTRA_TOKEN:        ${{ secrets.ASTRA_TOKEN }}
           ASTRA_KEYSPACE:     ${{ secrets.ASTRA_KEYSPACE }}
 
-          TOP_N:              ${{ env.TOP_N_RESOLVED }}
+          TOP_N:              "${{ env.TOP_N_RESOLVED }}"
           REQUEST_TIMEOUT_SEC:"60"
           CONNECT_TIMEOUT_SEC:"15"
           FETCH_SIZE:         "500"
           SLOT_DELAY_SEC:     "120"
           SLOTS_BACKFILL:     "2"
-
-          VERBOSE_MODE:       ${{ env.VERBOSE_RESOLVED }}
+          VERBOSE_MODE:       "${{ env.VERBOSE_RESOLVED }}"
         run: python prices/CC_gck_append_10m_from_live.py
