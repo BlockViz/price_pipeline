@@ -30,7 +30,6 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # Always present so 'needs: recent_check' is valid on every event.
   recent_check:
     runs-on: ubuntu-latest
     outputs:
@@ -40,32 +39,30 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            // If not a schedule, always run (this covers workflow_dispatch from Cloudflare/manual)
+            // If not a schedule event, always run
             if (context.eventName !== 'schedule') {
               core.setOutput('should_run', 'true');
               core.info('non-schedule event -> run');
               return;
             }
-            // For schedule: skip if a non-schedule run started recently
             const windowMinutes = 15; // adjust as you like
-            const sinceISO = new Date(Date.now() - windowMinutes*60*1000).toISOString();
+            const sinceISO = new Date(Date.now() - windowMinutes * 60 * 1000).toISOString();
+            const branch = context.ref.replace('refs/heads/', '');
 
-            const branch = context.ref.replace('refs/heads/','');
-            const runs = await github.rest.actions.listWorkflowRunsForRepo({
+            const { data } = await github.rest.actions.listWorkflowRunsForRepo({
               owner: context.repo.owner,
               repo: context.repo.repo,
               per_page: 25,
               branch
             });
 
-            const recent = runs.data.workflow_runs.find(r =>
+            const recent = data.workflow_runs.find(r =>
               r.name === context.workflow &&
               r.event !== 'schedule' &&
               new Date(r.run_started_at).toISOString() >= sinceISO
             );
 
-            const shouldRun = recent ? 'false' : 'true';
-            core.setOutput('should_run', shouldRun);
+            core.setOutput('should_run', recent ? 'false' : 'true');
             core.info(`schedule event -> recent non-schedule since ${sinceISO}: ${recent ? 'YES (skip)' : 'NO (run)'}`);
 
   run:
@@ -79,14 +76,10 @@ jobs:
       PYTHONUTF8: "1"
       PYTHONWARNINGS: default
 
-      # Normalize so schedule behaves like dispatch
       RUN_03: ${{ (github.event_name == 'schedule' && 'true') || (github.event.inputs.run_03 || 'true') }}
       RUN_04: ${{ (github.event_name == 'schedule' && 'true') || (github.event.inputs.run_04 || 'true') }}
 
-      TOP_N_INPUT:   ${{ github.event.inputs.TOP_N || '' }}
-      VERBOSE_INPUT: ${{ github.event.inputs.VERBOSE_MODE || '0' }}
-
-      TOP_N_RESOLVED:   ${{ (github.event.inputs.TOP_N != '' && github.event.inputs.TOP_N) || secrets.TOP_N || '200' }}
+      TOP_N_RESOLVED: ${{ (github.event.inputs.TOP_N != '' && github.event.inputs.TOP_N) || secrets.TOP_N || '200' }}
       VERBOSE_RESOLVED: ${{ github.event.inputs.VERBOSE_MODE || '0' }}
 
     steps:
@@ -116,38 +109,38 @@ jobs:
         if: env.RUN_03 == 'true'
         timeout-minutes: 12
         env:
-          COINGECKO_API_KEY:  ${{ secrets.COINGECKO_API_KEY }}
+          COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
           COINGECKO_API_TIER: ${{ secrets.COINGECKO_API_TIER }}
-          ASTRA_BUNDLE_PATH:  secure-connect.zip
-          ASTRA_TOKEN:        ${{ secrets.ASTRA_TOKEN }}
-          ASTRA_KEYSPACE:     ${{ secrets.ASTRA_KEYSPACE }}
+          ASTRA_BUNDLE_PATH: secure-connect.zip
+          ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
+          ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
 
-          TOP_N:              "${{ env.TOP_N_RESOLVED }}"
-          REQUEST_TIMEOUT_SEC:"40"
-          CONNECT_TIMEOUT_SEC:"15"
-          FETCH_SIZE:         "500"
-          SLOT_DELAY_SEC:     "120"
-          CURRENT_ONLY:       "1"
-          FINALIZE_PREV:      "1"
-          PROGRESS_EVERY:     "20"
-          VERBOSE_MODE:       "${{ env.VERBOSE_RESOLVED }}"
+          TOP_N: "${{ env.TOP_N_RESOLVED }}"
+          REQUEST_TIMEOUT_SEC: "40"
+          CONNECT_TIMEOUT_SEC: "15"
+          FETCH_SIZE: "500"
+          SLOT_DELAY_SEC: "120"
+          CURRENT_ONLY: "1"
+          FINALIZE_PREV: "1"
+          PROGRESS_EVERY: "20"
+          VERBOSE_MODE: "${{ env.VERBOSE_RESOLVED }}"
         run: python prices/DD_gck_create_hourly_from_10m.py
 
       - name: 04 Update/close daily from 10m
         if: env.RUN_04 == 'true'
         timeout-minutes: 12
         env:
-          COINGECKO_API_KEY:  ${{ secrets.COINGECKO_API_KEY }}
+          COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
           COINGECKO_API_TIER: ${{ secrets.COINGECKO_API_TIER }}
-          ASTRA_BUNDLE_PATH:  secure-connect.zip
-          ASTRA_TOKEN:        ${{ secrets.ASTRA_TOKEN }}
-          ASTRA_KEYSPACE:     ${{ secrets.ASTRA_KEYSPACE }}
+          ASTRA_BUNDLE_PATH: secure-connect.zip
+          ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
+          ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
 
-          TOP_N:              "${{ env.TOP_N_RESOLVED }}"
-          REQUEST_TIMEOUT_SEC:"40"
-          CONNECT_TIMEOUT_SEC:"15"
-          FETCH_SIZE:         "500"
-          SLOT_DELAY_SEC:     "120"
-          PROGRESS_EVERY:     "20"
-          VERBOSE_MODE:       "${{ env.VERBOSE_RESOLVED }}"
+          TOP_N: "${{ env.TOP_N_RESOLVED }}"
+          REQUEST_TIMEOUT_SEC: "40"
+          CONNECT_TIMEOUT_SEC: "15"
+          FETCH_SIZE: "500"
+          SLOT_DELAY_SEC: "120"
+          PROGRESS_EVERY: "20"
+          VERBOSE_MODE: "${{ env.VERBOSE_RESOLVED }}"
         run: python prices/EE_gck_create_daily_from_10m.py

@@ -24,7 +24,7 @@ on:
         required: false
         default: "0"
   schedule:
-    - cron: "*/10 * * * *"     # backup: every 10 minutes UTC
+    - cron: "*/10 * * * *" # backup: every 10 minutes UTC
 
 permissions:
   contents: read
@@ -34,7 +34,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Always present so 'needs:' is valid for every event.
   recent_check:
     runs-on: ubuntu-latest
     outputs:
@@ -44,7 +43,7 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            // If not a schedule event, always run (covers Cloudflare/manual dispatch)
+            // If not a schedule event, always run (CFlare/manual dispatch)
             if (context.eventName !== 'schedule') {
               core.setOutput('should_run', 'true');
               core.info('non-schedule event -> run');
@@ -52,8 +51,8 @@ jobs:
             }
             // For schedule: skip if a non-schedule run started recently
             const windowMinutes = 7; // adjust as you like
-            const sinceISO = new Date(Date.now() - windowMinutes*60*1000).toISOString();
-            const branch = context.ref.replace('refs/heads/','');
+            const sinceISO = new Date(Date.now() - windowMinutes * 60 * 1000).toISOString();
+            const branch = context.ref.replace('refs/heads/', '');
 
             const { data } = await github.rest.actions.listWorkflowRunsForRepo({
               owner: context.repo.owner,
@@ -68,8 +67,7 @@ jobs:
               new Date(r.run_started_at).toISOString() >= sinceISO
             );
 
-            const shouldRun = recent ? 'false' : 'true';
-            core.setOutput('should_run', shouldRun);
+            core.setOutput('should_run', recent ? 'false' : 'true');
             core.info(`schedule event -> recent non-schedule since ${sinceISO}: ${recent ? 'YES (skip)' : 'NO (run)'}`);
 
   run:
@@ -87,14 +85,9 @@ jobs:
       RUN_01: ${{ (github.event_name == 'schedule' && 'true') || (github.event.inputs.run_01 || 'true') }}
       RUN_02: ${{ (github.event_name == 'schedule' && 'true') || (github.event.inputs.run_02 || 'true') }}
 
-      TOP_N_INPUT:       ${{ github.event.inputs.TOP_N || '' }}
-      RANK_TOP_N_INPUT:  ${{ github.event.inputs.RANK_TOP_N || '' }}
-      VERBOSE_INPUT:     ${{ github.event.inputs.VERBOSE_MODE || '0' }}
-
-      # Resolved values (inputs > secrets > defaults)
-      TOP_N_RESOLVED:      ${{ (github.event.inputs.TOP_N != '' && github.event.inputs.TOP_N) || secrets.TOP_N || '200' }}
+      TOP_N_RESOLVED: ${{ (github.event.inputs.TOP_N != '' && github.event.inputs.TOP_N) || secrets.TOP_N || '200' }}
       RANK_TOP_N_RESOLVED: ${{ (github.event.inputs.RANK_TOP_N != '' && github.event.inputs.RANK_TOP_N) || secrets.TOP_N || '200' }}
-      VERBOSE_RESOLVED:    ${{ github.event.inputs.VERBOSE_MODE || '0' }}
+      VERBOSE_RESOLVED: ${{ github.event.inputs.VERBOSE_MODE || '0' }}
 
     steps:
       - uses: actions/checkout@v4
@@ -122,27 +115,27 @@ jobs:
         if: env.RUN_01 == 'true'
         timeout-minutes: 10
         env:
-          COINGECKO_API_KEY:  ${{ secrets.COINGECKO_API_KEY }}
+          COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
           COINGECKO_API_TIER: ${{ secrets.COINGECKO_API_TIER }}
-          ASTRA_BUNDLE_PATH:  secure-connect.zip
-          ASTRA_TOKEN:        ${{ secrets.ASTRA_TOKEN }}
-          ASTRA_KEYSPACE:     ${{ secrets.ASTRA_KEYSPACE }}
+          ASTRA_BUNDLE_PATH: secure-connect.zip
+          ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
+          ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
 
-          TOP_N:        "${{ env.TOP_N_RESOLVED }}"
-          RANK_TOP_N:   "${{ env.RANK_TOP_N_RESOLVED }}"
+          TOP_N: "${{ env.TOP_N_RESOLVED }}"
+          RANK_TOP_N: "${{ env.RANK_TOP_N_RESOLVED }}"
 
           STALE_WARN_MINUTES: "10"
-          REQUIRED_LIVE_MIN:  "140"
+          REQUIRED_LIVE_MIN: "140"
 
-          RETRIES:            "3"
-          BACKOFF_MIN:        "5"
-          MAX_BACKOFF_MIN:    "30"
-          REQUEST_TIMEOUT_SEC:"60"
-          CONNECT_TIMEOUT_SEC:"15"
-          BATCH_FLUSH_EVERY:  "40"
+          RETRIES: "3"
+          BACKOFF_MIN: "5"
+          MAX_BACKOFF_MIN: "30"
+          REQUEST_TIMEOUT_SEC: "60"
+          CONNECT_TIMEOUT_SEC: "15"
+          BATCH_FLUSH_EVERY: "40"
 
-          RANK_BUCKET:        "all"
-          GECKO_MCAP_BUCKET:  "categories"
+          RANK_BUCKET: "all"
+          GECKO_MCAP_BUCKET: "categories"
 
           VERBOSE_MODE: "${{ env.VERBOSE_RESOLVED }}"
         run: python prices/AA_gck_load_prices_live.py
@@ -151,17 +144,17 @@ jobs:
         if: env.RUN_02 == 'true'
         timeout-minutes: 7
         env:
-          COINGECKO_API_KEY:  ${{ secrets.COINGECKO_API_KEY }}
+          COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
           COINGECKO_API_TIER: ${{ secrets.COINGECKO_API_TIER }}
-          ASTRA_BUNDLE_PATH:  secure-connect.zip
-          ASTRA_TOKEN:        ${{ secrets.ASTRA_TOKEN }}
-          ASTRA_KEYSPACE:     ${{ secrets.ASTRA_KEYSPACE }}
+          ASTRA_BUNDLE_PATH: secure-connect.zip
+          ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
+          ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
 
-          TOP_N:              "${{ env.TOP_N_RESOLVED }}"
-          REQUEST_TIMEOUT_SEC:"60"
-          CONNECT_TIMEOUT_SEC:"15"
-          FETCH_SIZE:         "500"
-          SLOT_DELAY_SEC:     "120"
-          SLOTS_BACKFILL:     "2"
-          VERBOSE_MODE:       "${{ env.VERBOSE_RESOLVED }}"
+          TOP_N: "${{ env.TOP_N_RESOLVED }}"
+          REQUEST_TIMEOUT_SEC: "60"
+          CONNECT_TIMEOUT_SEC: "15"
+          FETCH_SIZE: "500"
+          SLOT_DELAY_SEC: "120"
+          SLOTS_BACKFILL: "2"
+          VERBOSE_MODE: "${{ env.VERBOSE_RESOLVED }}"
         run: python prices/CC_gck_append_10m_from_live.py
