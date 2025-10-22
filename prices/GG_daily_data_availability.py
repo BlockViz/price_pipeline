@@ -1,76 +1,86 @@
 #!/usr/bin/env python3
 # file: daily_data_availability.py
-# Summarize per-coin daily data availability from gecko_candles_daily_contin
-# into keyspace.coin_daily_availability, with detailed progress logging.
+# Summarize per-coin daily data availability from KEYSPACE.gecko_candles_daily_contin
+# into KEYSPACE.coin_daily_availability, with detailed progress logging.
 # Also pulls `symbol` and `name` from the source and includes them in CSV,
 # and (if the summary table has those columns) writes them there too.
 
-from datetime import datetime, timezone, date as dtdate
-from time import perf_counter, sleep
-import os
-from astra_connect.connect import get_session
+from __future__ import annotations
 
-# ---- config ---------------------------------------------------------------
-KEYSPACE = os.getenv("KEYSPACE", "default_keyspace")
+import os
+import csv
+from time import perf_counter, sleep
+from datetime import datetime, timezone, date as dtdate
+from typing import Iterable, List, Dict, Set, Tuple, Optional
+
+from astra_connect.connect import get_session
+from cassandra import ConsistencyLevel
+
+# ────────────────────────── Config ──────────────────────────
+KEYSPACE = os.getenv("KEYSPACE", "default_keyspace").strip()
 SOURCE_TABLE = f"{KEYSPACE}.gecko_candles_daily_contin"
 SUMMARY_TABLE = f"{KEYSPACE}.coin_daily_availability"
 
-# Verbosity controls (can override via env)
-LOG_EVERY_ROWS = int(os.getenv("LOG_EVERY_ROWS", "10000"))   # log every N rows scanned per coin
-LOG_EVERY_COINS = int(os.getenv("LOG_EVERY_COINS", "25"))    # log every N coins processed
-SHOW_QUERY_TIMES = os.getenv("SHOW_QUERY_TIMES", "1") not in ("0", "false", "False")
-SLEEP_BETWEEN_COINS_SEC = float(os.getenv("SLEEP_BETWEEN_COINS_SEC", "0"))
+# Verbosity / behavior (override via env)
+LOG_EVERY_ROWS: int = int(os.getenv("LOG_EVERY_ROWS", "10000"))   # log every N rows scanned per coin
+LOG_EVERY_COINS: int = int(os.getenv("LOG_EVERY_COINS", "25"))    # log every N coins processed
+SHOW_QUERY_TIMES: bool = os.getenv("SHOW_QUERY_TIMES", "1").lower() not in {"0", "false"}
+SLEEP_BETWEEN_COINS_SEC: float = float(os.getenv("SLEEP_BETWEEN_COINS_SEC", "0"))
+FETCH_SIZE: int = int(os.getenv("FETCH_SIZE", "2000"))            # driver may ignore on prepared, harmless to set
+REQUEST_TIMEOUT_SEC: int = int(os.getenv("REQUEST_TIMEOUT_SEC", "30"))
+WRITE_CSV: bool = os.getenv("WRITE_CSV", "1").lower() not in {"0", "false"}
+CSV_PATH: str = os.getenv("CSV_PATH", "coin_daily_availability.csv")
 
-# "present" rule: treat a field as present iff it's NOT NULL
-is_present_price  = lambda v: v is not None
-is_present_volume = lambda v: v is not None
-is_present_mcap   = lambda v: v is not None
-
-# Optional: write a CSV for quick verification
-WRITE_CSV = os.getenv("WRITE_CSV", "1") not in ("0", "false", "False")
-CSV_PATH = os.getenv("CSV_PATH", "coin_daily_availability.csv")
-# --------------------------------------------------------------------------
-
-
+# ─────────────────────── Utilities ──────────────────────────
 def ts() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
 
 def log(msg: str) -> None:
     print(f"[{ts()}] {msg}", flush=True)
 
-
 def to_pydate(d) -> dtdate:
-    """
-    Normalize Cassandra's Date (or anything date-ish) to a Python datetime.date.
-    Falls back to ISO parsing of str(d) which works for cassandra.util.Date ("YYYY-MM-DD").
-    """
-    if isinstance(d, dtdate):
+    """Normalize Cassandra date-like values → datetime.date (handles datetime, cassandra.util.Date)."""
+    if d is None:
+        raise TypeError("date is None")
+    if isinstance(d, dtdate) and not isinstance(d, datetime):
         return d
+    if isinstance(d, datetime):
+        return d.date()
+    # cassandra.util.Date typically has .date()
     try:
-        return dtdate.fromisoformat(str(d))
+        return d.date()  # type: ignore[attr-defined]
     except Exception:
-        raise TypeError(f"Could not coerce value to date: {d!r} (type={type(d)})")
+        pass
+    return dtdate.fromisoformat(str(d)[:10])
 
+def is_present_price(row) -> bool:
+    """Daily 'price' presence: prefer close, fallback to price_usd."""
+    return (getattr(row, "close", None) is not None) or (getattr(row, "price_usd", None) is not None)
 
-def main():
+# ───────────────────────── Main ─────────────────────────────
+def main() -> None:
     start_all = perf_counter()
     session, cluster = get_session(return_cluster=True)
     try:
-        # Prepared statements
         log(f"Preparing statements (source={SOURCE_TABLE}, summary={SUMMARY_TABLE})")
+
+        # Distinct coin ids (partition keys)
         ps_ids = session.prepare(f"SELECT DISTINCT id FROM {SOURCE_TABLE}")
 
-        # Pull symbol, name in addition to minimal columns; partition-local scan per id
+        # Partition-local scan per id (date + columns we care about + a bit of meta)
         ps_rows_for_id = session.prepare(
             f"""
-            SELECT date, price_usd, volume_24h, market_cap, symbol, name
+            SELECT date, price_usd, volume_24h, market_cap, close, symbol, name
             FROM {SOURCE_TABLE}
             WHERE id = ?
             """
         )
+        try:
+            ps_rows_for_id.fetch_size = FETCH_SIZE  # some drivers ignore on prepared; harmless
+        except Exception:
+            pass
 
-        # Try an UPSERT that includes symbol/name; if the table lacks these columns, fall back.
+        # Try extended summary upsert including symbol/name; else fall back to base schema
         try:
             ps_upsert = session.prepare(
                 f"""
@@ -103,15 +113,16 @@ def main():
             upsert_includes_meta = False
             log("Summary table does not have symbol/name; using base upsert.")
 
-        # 1) list all coins
+        # Get all coin ids
         t0 = perf_counter()
         log("Querying distinct coin ids…")
-        coin_ids = [row.id for row in session.execute(ps_ids)]
+        bound_ids = ps_ids.bind([])
+        bound_ids.consistency_level = ConsistencyLevel.LOCAL_QUORUM
+        coin_ids = [row.id for row in session.execute(bound_ids, timeout=REQUEST_TIMEOUT_SEC)]
         t1 = perf_counter()
         log(f"Found {len(coin_ids)} coin ids (took {(t1 - t0):.2f}s)")
 
-        # Optional CSV
-        rows_for_csv = []
+        rows_for_csv: List[Dict[str, object]] = []
         now_ts = datetime.now(timezone.utc)
 
         total_rows_scanned = 0
@@ -123,18 +134,22 @@ def main():
                 log(f"[{i}/{len(coin_ids)}] Starting {coin_id}…")
 
             coin_start = perf_counter()
-            dates = []
-            have_price = 0
-            have_vol = 0
-            have_mcap = 0
 
-            # capture symbol/name (first non-null seen)
-            symbol = None
-            name = None
+            dates_set: Set[dtdate] = set()
+            price_days: Set[dtdate] = set()
+            vol_days: Set[dtdate] = set()
+            mcap_days: Set[dtdate] = set()
 
+            symbol: Optional[str] = None
+            name: Optional[str] = None
+
+            # Scan partition
             qstart = perf_counter()
-            rs = session.execute(ps_rows_for_id, [coin_id])
-            qtime_first = None
+            b = ps_rows_for_id.bind([coin_id])
+            b.consistency_level = ConsistencyLevel.LOCAL_QUORUM
+            rs = session.execute(b, timeout=REQUEST_TIMEOUT_SEC)
+
+            qtime_first: Optional[float] = None
             row_count = 0
             for row in rs:
                 if qtime_first is None:
@@ -143,7 +158,7 @@ def main():
                         log(f"  {coin_id}: time to first row {qtime_first:.2f}s")
 
                 d = to_pydate(row.date)
-                dates.append(d)
+                dates_set.add(d)
                 row_count += 1
 
                 if symbol is None and getattr(row, "symbol", None):
@@ -151,12 +166,12 @@ def main():
                 if name is None and getattr(row, "name", None):
                     name = row.name
 
-                if is_present_price(row.price_usd):
-                    have_price += 1
-                if is_present_volume(row.volume_24h):
-                    have_vol += 1
-                if is_present_mcap(row.market_cap):
-                    have_mcap += 1
+                if is_present_price(row):
+                    price_days.add(d)
+                if getattr(row, "volume_24h", None) is not None:
+                    vol_days.add(d)
+                if getattr(row, "market_cap", None) is not None:
+                    mcap_days.add(d)
 
                 if LOG_EVERY_ROWS > 0 and (row_count % LOG_EVERY_ROWS == 0):
                     log(f"  {coin_id}: scanned {row_count} rows so far…")
@@ -164,60 +179,58 @@ def main():
             scan_time = perf_counter() - coin_start
             total_rows_scanned += row_count
 
-            if not dates:
+            if not dates_set:
                 log(f"  {coin_id}: no rows (skipping). Scan time {scan_time:.2f}s")
                 if SLEEP_BETWEEN_COINS_SEC:
                     sleep(SLEEP_BETWEEN_COINS_SEC)
                 continue
 
-            first_day = min(dates)
-            last_day  = max(dates)
-            have_any  = len(dates)
-
+            first_day = min(dates_set)
+            last_day = max(dates_set)
+            have_any = len(dates_set)
             expected_days = (last_day - first_day).days + 1
 
-            missing_any    = max(0, expected_days - have_any)
-            missing_price  = max(0, expected_days - have_price)
-            missing_volume = max(0, expected_days - have_vol)
-            missing_mcap   = max(0, expected_days - have_mcap)
+            missing_any = max(0, expected_days - have_any)
+            missing_price = max(0, expected_days - len(price_days))
+            missing_volume = max(0, expected_days - len(vol_days))
+            missing_mcap = max(0, expected_days - len(mcap_days))
 
             total_missing_any += missing_any
 
-            # 3) upsert summary row
+            # Upsert summary with controlled consistency
             ust = perf_counter()
             if upsert_includes_meta:
-                session.execute(
-                    ps_upsert,
-                    [
-                        coin_id,
-                        first_day, last_day, expected_days,
-                        have_any, missing_any,
-                        have_price, missing_price,
-                        have_vol, missing_volume,
-                        have_mcap, missing_mcap,
-                        symbol, name,
-                        now_ts,
-                    ],
-                )
+                bu = ps_upsert.bind([
+                    coin_id,
+                    first_day, last_day, expected_days,
+                    have_any, missing_any,
+                    len(price_days), missing_price,
+                    len(vol_days), missing_volume,
+                    len(mcap_days), missing_mcap,
+                    symbol or "", name or "",
+                    now_ts,
+                ])
             else:
-                session.execute(
-                    ps_upsert,
-                    [
-                        coin_id,
-                        first_day, last_day, expected_days,
-                        have_any, missing_any,
-                        have_price, missing_price,
-                        have_vol, missing_volume,
-                        have_mcap, missing_mcap,
-                        now_ts,
-                    ],
-                )
+                bu = ps_upsert.bind([
+                    coin_id,
+                    first_day, last_day, expected_days,
+                    have_any, missing_any,
+                    len(price_days), missing_price,
+                    len(vol_days), missing_volume,
+                    len(mcap_days), missing_mcap,
+                    now_ts,
+                ])
+            bu.consistency_level = ConsistencyLevel.LOCAL_QUORUM
+            session.execute(bu, timeout=REQUEST_TIMEOUT_SEC)
             upsert_time = perf_counter() - ust
             total_rows_upserted += 1
 
             log(
                 "  {cid}: rows={rows}, span={f}..{l} ({days} days), "
                 "have_any={have_any}, miss_any={miss_any}, "
+                "have_price={hp}, miss_price={mp}, "
+                "have_vol={hv}, miss_vol={mv}, "
+                "have_mcap={hm}, miss_mcap={mm}, "
                 "symbol={sym}, name={nm} | scan={scan:.2f}s, upsert={ins:.2f}s".format(
                     cid=coin_id,
                     rows=row_count,
@@ -226,6 +239,9 @@ def main():
                     days=expected_days,
                     have_any=have_any,
                     miss_any=missing_any,
+                    hp=len(price_days), mp=missing_price,
+                    hv=len(vol_days),   mv=missing_volume,
+                    hm=len(mcap_days),  mm=missing_mcap,
                     sym=symbol or "",
                     nm=name or "",
                     scan=scan_time,
@@ -243,11 +259,11 @@ def main():
                     "expected_days": expected_days,
                     "have_any": have_any,
                     "missing_any": missing_any,
-                    "have_price": have_price,
+                    "have_price": len(price_days),
                     "missing_price": missing_price,
-                    "have_volume": have_vol,
+                    "have_volume": len(vol_days),
                     "missing_volume": missing_volume,
-                    "have_mcap": have_mcap,
+                    "have_mcap": len(mcap_days),
                     "missing_mcap": missing_mcap,
                     "updated_at": now_ts.isoformat(),
                 })
@@ -257,7 +273,6 @@ def main():
 
         # CSV write at the end
         if WRITE_CSV and rows_for_csv:
-            import csv
             try:
                 log(f"Writing CSV ({len(rows_for_csv)} rows) → {CSV_PATH}")
                 with open(CSV_PATH, "w", newline="", encoding="utf-8") as f:
@@ -287,7 +302,6 @@ def main():
             log("Cluster shutdown complete.")
         except Exception as e:
             log(f"Cluster shutdown warning: {e}")
-
 
 if __name__ == "__main__":
     main()
