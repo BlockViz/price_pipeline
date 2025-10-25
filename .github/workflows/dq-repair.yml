@@ -1,8 +1,18 @@
-name: dq-repair-incremental
+name: dq-repair
+
 on:
   schedule:
-    - cron: "20 3 */2 * *"
+    - cron: "15 0 * * *" # 00:15 UTC → INTRADAY
+    - cron: "15 12 * * *" # 12:15 UTC → INTRADAY
+    - cron: "20 3 * * *" # 03:20 UTC → NIGHTLY (daily+aggregates)
   workflow_dispatch:
+    inputs:
+      mode:
+        description: "Select run mode"
+        type: choice
+        required: false
+        default: intraday
+        options: [intraday, nightly]
 
 permissions:
   contents: read
@@ -10,10 +20,11 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
     concurrency:
       group: ${{ github.workflow }}-${{ github.ref }}
       cancel-in-progress: false
+
     steps:
       - uses: actions/checkout@v4
 
@@ -36,14 +47,122 @@ jobs:
         run: |
           set -euo pipefail
           base64 --decode --ignore-garbage <<< "$SECURE_CONNECT_ZIP_B64" > secure-connect.zip
+          echo "ASTRA_BUNDLE_PATH=$PWD/secure-connect.zip" >> "$GITHUB_ENV"
 
-      - name: Run incremental repair
+      - name: Compute DQ_MODE from current UTC time
+        id: when
+        shell: bash
+        run: |
+          if [ -n "${{ github.event.inputs.mode }}" ]; then
+          M="${{ github.event.inputs.mode }}"; M=${M^^}   # to upper
+          echo "DQ_MODE=$M" >> "$GITHUB_ENV"
+          echo "mode set from input: $M"
+          exit 0
+          fi
+          HOUR=$(date -u +%H)
+          if [ "$HOUR" = "03" ]; then
+          echo "DQ_MODE=NIGHTLY" >> "$GITHUB_ENV"
+          else
+          echo "DQ_MODE=INTRADAY" >> "$GITHUB_ENV"
+          fi
+          echo "UTC_HOUR=$HOUR"
+
+      # ─────────── Availability (INTRADAY: intraday bits only) ───────────
+      - name: Update intraday coverage (10m/hourly)
+        if: env.DQ_MODE == 'INTRADAY'
         env:
-          ASTRA_BUNDLE_PATH: secure-connect.zip
+          KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
+          REQUEST_TIMEOUT_SEC: "30"
+          LOG_HEARTBEAT_SEC: "20"
+          AVAIL_RUN_DAILY: "0"
+          AVAIL_RUN_INTRADAY: "1"
+          IDS_SOURCE: "live"
+        run: |
+          python prices/FF_gck_coin_data_availability.py
+
+      # ─────────── Availability (NIGHTLY: daily-only) ───────────
+      - name: Update daily coverage (ranges + summary)
+        if: env.DQ_MODE == 'NIGHTLY'
+        env:
+          KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
+          REQUEST_TIMEOUT_SEC: "30"
+          LOG_HEARTBEAT_SEC: "20"
+          AVAIL_RUN_DAILY: "1"
+          AVAIL_RUN_INTRADAY: "0"
+          IDS_SOURCE: "daily"
+        run: |
+          python prices/FF_gck_coin_data_availability.py
+
+      # -- wait 60 seconds
+      - name: Wait for coverage writes to become visible
+        run: sleep 60
+
+      # ─────────── INTRADAY pass (10m/hourly only) ───────────
+      - name: Intraday repair (10m/hourly only)
+        if: env.DQ_MODE == 'INTRADAY'
+        env:
           ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
           ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
-          COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
-          # If unset/empty, default to "pro"
-          COINGECKO_API_TIER: ${{ secrets.COINGECKO_API_TIER || 'pro' }}
+
+          # Windows
+          DQ_MODE: "INTRADAY"
+          DQ_WINDOW_10M_DAYS: "7"
+          DQ_WINDOW_HOURLY_DAYS: "30"
+          DQ_WINDOW_DAILY_DAYS: "1" # irrelevant here
+
+          # Intraday focus
+          FILL_HOURLY: "1"
+          FILL_HOURLY_FROM_API: "1"
+          INTERPOLATE_IF_API_MISS: "1"
+
+          # Daily work OFF in this pass
+          FIX_DAILY_FROM_10M: "0"
+          BACKFILL_DAILY_FROM_API: "0"
+          SEED_10M_FROM_DAILY: "0"
+
+          # Aggregates: only intraday
           FULL_MODE: "0"
-        run: python prices/FF_gck_dq_repair_timeseries.py
+          RECOMPUTE_MCAP_10M: "1"
+          RECOMPUTE_MCAP_HOURLY: "1"
+          RECOMPUTE_MCAP_DAILY: "0"
+
+          # CoinGecko
+          COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
+          COINGECKO_API_TIER: ${{ secrets.COINGECKO_API_TIER || 'demo' }}
+        run: |
+          python prices/GG_gck_dq_repair_timeseries.py
+
+      # ─────────── NIGHTLY pass (daily + aggregates) ───────────
+      - name: Nightly repair (daily focus + aggregates)
+        if: env.DQ_MODE == 'NIGHTLY'
+        env:
+          ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
+          ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
+
+          # Nightly window → yesterday only
+          DQ_MODE: "NIGHTLY"
+          DQ_WINDOW_DAILY_DAYS: "1"
+          DQ_WINDOW_10M_DAYS: "7"
+          DQ_WINDOW_HOURLY_DAYS: "30"
+
+          # Daily work ON
+          FIX_DAILY_FROM_10M: "1"
+          BACKFILL_DAILY_FROM_API: "1"
+          DAILY_API_REQ_BUDGET: "150"
+          SEED_10M_FROM_DAILY: "0" # keep off unless you really want synthetic 10m
+
+          # Hourly optional at night
+          FILL_HOURLY: "0"
+
+          # Aggregates (daily + optionally intraday if you want)
+          FULL_MODE: "1"
+          TRUNCATE_AGGREGATES_IN_FULL: "1"
+          RECOMPUTE_MCAP_DAILY: "1"
+          RECOMPUTE_MCAP_HOURLY: "0"
+          RECOMPUTE_MCAP_10M: "0"
+
+          # CoinGecko
+          COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
+          COINGECKO_API_TIER: ${{ secrets.COINGECKO_API_TIER || 'demo' }}
+        run: |
+          python prices/GG_gck_dq_repair_timeseries.py
