@@ -40,6 +40,7 @@ jobs:
 
       - run: echo "PYTHONPATH=." >> "$GITHUB_ENV"
 
+      # ───────────────── Astra: secure bundle ─────────────────
       - name: Rehydrate secure-connect.zip
         shell: bash
         env:
@@ -48,22 +49,43 @@ jobs:
           set -euo pipefail
           base64 --decode --ignore-garbage <<< "$SECURE_CONNECT_ZIP_B64" > secure-connect.zip
           echo "ASTRA_BUNDLE_PATH=$PWD/secure-connect.zip" >> "$GITHUB_ENV"
+          echo "ASTRA_SECURE_BUNDLE=$PWD/secure-connect.zip" >> "$GITHUB_ENV"
+
+      # ───────────────── Astra: token (supports plaintext or base64) ─────────────────
+      - name: Export Astra token
+        shell: bash
+        env:
+          ASTRA_TOKEN_PLAINTEXT: ${{ secrets.ASTRA_TOKEN }}
+          ASTRA_TOKEN_B64: ${{ secrets.ASTRA_TOKEN_B64 }}
+        run: |
+          set -euo pipefail
+          if [ -n "${ASTRA_TOKEN_PLAINTEXT}" ]; then
+            echo "ASTRA_TOKEN=${ASTRA_TOKEN_PLAINTEXT}" >> "$GITHUB_ENV"
+            echo "Using plaintext ASTRA_TOKEN secret"
+          elif [ -n "${ASTRA_TOKEN_B64}" ]; then
+            TOK=$(echo "${ASTRA_TOKEN_B64}" | base64 -d)
+            echo "ASTRA_TOKEN=${TOK}" >> "$GITHUB_ENV"
+            echo "Decoded ASTRA_TOKEN from ASTRA_TOKEN_B64"
+          else
+            echo "ERROR: Neither ASTRA_TOKEN nor ASTRA_TOKEN_B64 is set as a secret." >&2
+            exit 1
+          fi
 
       - name: Compute DQ_MODE from current UTC time
         id: when
         shell: bash
         run: |
           if [ -n "${{ github.event.inputs.mode }}" ]; then
-          M="${{ github.event.inputs.mode }}"; M=${M^^}   # to upper
-          echo "DQ_MODE=$M" >> "$GITHUB_ENV"
-          echo "mode set from input: $M"
-          exit 0
+            M="${{ github.event.inputs.mode }}"; M=${M^^}   # to upper
+            echo "DQ_MODE=$M" >> "$GITHUB_ENV"
+            echo "mode set from input: $M"
+            exit 0
           fi
           HOUR=$(date -u +%H)
           if [ "$HOUR" = "03" ]; then
-          echo "DQ_MODE=NIGHTLY" >> "$GITHUB_ENV"
+            echo "DQ_MODE=NIGHTLY" >> "$GITHUB_ENV"
           else
-          echo "DQ_MODE=INTRADAY" >> "$GITHUB_ENV"
+            echo "DQ_MODE=INTRADAY" >> "$GITHUB_ENV"
           fi
           echo "UTC_HOUR=$HOUR"
 
@@ -71,7 +93,8 @@ jobs:
       - name: Update intraday coverage (10m/hourly)
         if: env.DQ_MODE == 'INTRADAY'
         env:
-          KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
+          ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
+          # ASTRA_TOKEN and bundle vars come from $GITHUB_ENV above
           REQUEST_TIMEOUT_SEC: "30"
           LOG_HEARTBEAT_SEC: "20"
           AVAIL_RUN_DAILY: "0"
@@ -84,7 +107,8 @@ jobs:
       - name: Update daily coverage (ranges + summary)
         if: env.DQ_MODE == 'NIGHTLY'
         env:
-          KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
+          ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
+          # ASTRA_TOKEN and bundle vars come from $GITHUB_ENV above
           REQUEST_TIMEOUT_SEC: "30"
           LOG_HEARTBEAT_SEC: "20"
           AVAIL_RUN_DAILY: "1"
@@ -101,8 +125,10 @@ jobs:
       - name: Intraday repair (10m/hourly only)
         if: env.DQ_MODE == 'INTRADAY'
         env:
-          ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
+          ASTRA_TOKEN: ${{ env.ASTRA_TOKEN }}
           ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
+          ASTRA_BUNDLE_PATH: ${{ env.ASTRA_BUNDLE_PATH }}
+          ASTRA_SECURE_BUNDLE: ${{ env.ASTRA_SECURE_BUNDLE }}
 
           # Windows
           DQ_MODE: "INTRADAY"
@@ -136,8 +162,10 @@ jobs:
       - name: Nightly repair (daily focus + aggregates)
         if: env.DQ_MODE == 'NIGHTLY'
         env:
-          ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
+          ASTRA_TOKEN: ${{ env.ASTRA_TOKEN }}
           ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
+          ASTRA_BUNDLE_PATH: ${{ env.ASTRA_BUNDLE_PATH }}
+          ASTRA_SECURE_BUNDLE: ${{ env.ASTRA_SECURE_BUNDLE }}
 
           # Nightly window → yesterday only
           DQ_MODE: "NIGHTLY"
