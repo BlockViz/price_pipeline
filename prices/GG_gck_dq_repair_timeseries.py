@@ -638,10 +638,11 @@ def _daily_row_equal(existing, o,h,l,c,mcap,vol,source):
     )
 
 # ---------- Repairs ----------
-def repair_daily_from_10m(coin, missing_days: set[dt.date]) -> int:
-    if not (FIX_DAILY_FROM_10M and missing_days): return 0
+def repair_daily_from_10m(coin, missing_days: set[dt.date]) -> tuple[int, set[dt.date]]:
+    if not (FIX_DAILY_FROM_10M and missing_days): 
+        return 0, set()
     print(f"[{_now_str()}]    [repair_daily_from_10m] {coin['symbol']}: {len(missing_days)} day(s)")
-    t0 = perf_counter(); cnt = 0
+    t0 = perf_counter(); cnt = 0; days_written: set[dt.date] = set()
     batch = BatchStatement(consistency_level=ConsistencyLevel.QUORUM)
     for day in sorted(missing_days):
         day_start, day_end_excl = day_bounds_utc(day)
@@ -677,16 +678,18 @@ def repair_daily_from_10m(coin, missing_days: set[dt.date]) -> int:
                 "10m_final", last_upd
             ))
         cnt += 1
+        days_written.add(day)
         if (cnt % 100 == 0) and not DRY_RUN:
             session.execute(batch); batch.clear()
     if not DRY_RUN and len(batch): session.execute(batch)
     print(f"[{_now_str()}]    [repair_daily_from_10m] {coin['symbol']} wrote={cnt} ({tdur(t0)})")
-    return cnt
+    return cnt, days_written
 
-def seed_10m_from_daily(coin, missing_days: set[dt.date]) -> int:
-    if not (SEED_10M_FROM_DAILY and missing_days): return 0
+def seed_10m_from_daily(coin, missing_days: set[dt.date]) -> tuple[int, set[dt.datetime]]:
+    if not (SEED_10M_FROM_DAILY and missing_days): 
+        return 0, set()
     print(f"[{_now_str()}]    [seed_10m] {coin['symbol']}: {len(missing_days)} day(s)")
-    t0 = perf_counter(); cnt = 0
+    t0 = perf_counter(); cnt = 0; ts10_written: set[dt.datetime] = set()
     batch = BatchStatement(consistency_level=ConsistencyLevel.QUORUM)
     for day in sorted(missing_days):
         row = session.execute(SEL_DAILY_ONE, [coin["id"], day], timeout=REQUEST_TIMEOUT).one()
@@ -705,11 +708,12 @@ def seed_10m_from_daily(coin, missing_days: set[dt.date]) -> int:
                 rnk, circ, tot, last_updated
             ))
         cnt += 1
+        ts10_written.add(ts_)
         if (cnt % 200 == 0) and not DRY_RUN:
             session.execute(batch); batch.clear()
     if not DRY_RUN and len(batch)>0: session.execute(batch)
     print(f"[{_now_str()}]    [seed_10m] {coin['symbol']} wrote={cnt} ({tdur(t0)})")
-    return cnt
+    return cnt, ts10_written
 
 def backfill_daily_from_api_ranges(coin, need_daily: set[dt.date], dt_ranges: list[tuple[dt.datetime, dt.datetime]]) -> int:
     if not (BACKFILL_DAILY_FROM_API and need_daily and dt_ranges): return 0
@@ -824,12 +828,13 @@ def fetch_hourly_from_api(coin_id: str, start_dt: dt.datetime, end_dt: dt.dateti
         return m
     return to_hour_map(prices_all), to_hour_map(mcaps_all), to_hour_map(vols_all)
 
-def repair_hourly_from_api_or_interp(coin, missing_hours: set[dt.datetime]) -> int:
-    if not (FILL_HOURLY and missing_hours): return 0
+def repair_hourly_from_api_or_interp(coin, missing_hours: set[dt.datetime]) -> tuple[int, set[dt.datetime]]:
+    if not (FILL_HOURLY and missing_hours): 
+        return 0, set()
     hours_sorted = sorted([floor_to_hour_utc(h) for h in missing_hours])
     start_dt = floor_to_hour_utc(hours_sorted[0] - dt.timedelta(hours=6))
     end_dt   = floor_to_hour_utc(hours_sorted[-1] + dt.timedelta(hours=7))
-    p_map = mc_map = v_map = {}
+    p_map, mc_map, v_map = {}, {}, {}
     if FILL_HOURLY_FROM_API:
         try:
             p_map, mc_map, v_map = fetch_hourly_from_api(coin["id"], start_dt, end_dt)
@@ -838,10 +843,12 @@ def repair_hourly_from_api_or_interp(coin, missing_hours: set[dt.datetime]) -> i
             wait_s = (getattr(e, "retry_after", None) or BACKOFF_S) + random.uniform(0.0, 0.25)
             print(f"[{_now_str()}]  · hourly API fetch rate-limited for {coin['symbol']} — sleeping {wait_s:.2f}s then deferring")
             time.sleep(wait_s)
-            if not INTERPOLATE_IF_API_MISS: return 0
+            if not INTERPOLATE_IF_API_MISS: 
+                return 0, set()
         except Exception as e:
             print(f"[{_now_str()}]  · hourly API fetch failed for {coin['symbol']}: {e}")
-            if not INTERPOLATE_IF_API_MISS: return 0
+            if not INTERPOLATE_IF_API_MISS: 
+                return 0, set()
     api_hours = sorted(p_map.keys())
 
     def interp_price(h):
@@ -880,6 +887,7 @@ def repair_hourly_from_api_or_interp(coin, missing_hours: set[dt.datetime]) -> i
 
     batch = BatchStatement(consistency_level=ConsistencyLevel.QUORUM)
     wrote = 0
+    hours_written: set[dt.datetime] = set()
     for h in hours_sorted:
         h = floor_to_hour_utc(h)
         if h in p_map and p_map[h][0] is not None:
@@ -913,11 +921,12 @@ def repair_hourly_from_api_or_interp(coin, missing_hours: set[dt.datetime]) -> i
                 source, last_upd
             ))
         wrote += 1; prev_close = c
+        hours_written.add(h)
         if (wrote % 128 == 0) and not DRY_RUN:
             session.execute(batch); batch.clear()
     if not DRY_RUN and len(batch): session.execute(batch)
     print(f"[{_now_str()}]    [hourly] {coin['symbol']} wrote={wrote}")
-    return wrote
+    return wrote, hours_written
 
 # ---------- Neg cache ----------
 def load_neg_cache():
@@ -960,6 +969,8 @@ def compute_ranks(entries):
 def write_hourly_aggregates_from_map(hour_totals_map):
     batch = BatchStatement(consistency_level=ConsistencyLevel.QUORUM)
     total = 0
+    started = perf_counter()
+    print(f"[{_now_str()}] [mcap_hourly] writing {len(hour_totals_map)} timestamp groups …")
     for ts_hr, catmap in sorted(hour_totals_map.items()):
         entries = [(c, catmap[c][1]) for c in catmap]
         ranks = compute_ranks(entries)
@@ -969,6 +980,8 @@ def write_hourly_aggregates_from_map(hour_totals_map):
             batch.add(INS_MCAP_HOURLY, [cat, ts_hr, lu or (ts_hr + dt.timedelta(hours=1) - dt.timedelta(seconds=1)), float(mc or 0.0), rk, float(vol or 0.0)])
             total += 1
             if (total % 100) == 0: session.execute(batch); batch.clear()
+            if (total % 2000) == 0:
+                print(f"[{_now_str()}] [mcap_hourly] … wrote {total} rows so far ({tdur(started)})")
     if not DRY_RUN and len(batch): session.execute(batch)
     metrics["agg_rows_hourly"] += total
     print(f"[{_now_str()}] [mcap_hourly] wrote rows={total}")
@@ -976,6 +989,8 @@ def write_hourly_aggregates_from_map(hour_totals_map):
 def write_daily_aggregates_from_map(day_totals_map):
     batch = BatchStatement(consistency_level=ConsistencyLevel.QUORUM)
     total = 0
+    started = perf_counter()
+    print(f"[{_now_str()}] [mcap_daily] writing {len(day_totals_map)} date groups …")
     for d, catmap in sorted(day_totals_map.items()):
         entries = [(c, catmap[c][1]) for c in catmap]
         ranks = compute_ranks(entries)
@@ -985,6 +1000,8 @@ def write_daily_aggregates_from_map(day_totals_map):
             batch.add(INS_MCAP_DAILY, [cat, d, lu or (dt.datetime(d.year,d.month,d.day,23,59,59,tzinfo=timezone.utc)), float(mc or 0.0), rk, float(vol or 0.0)])
             total += 1
             if (total % 100) == 0: session.execute(batch); batch.clear()
+            if (total % 2000) == 0:
+                print(f"[{_now_str()}] [mcap_daily] … wrote {total} rows so far ({tdur(started)})")
     if not DRY_RUN and len(batch): session.execute(batch)
     metrics["agg_rows_daily"] += total
     print(f"[{_now_str()}] [mcap_daily] wrote rows={total}")
@@ -992,6 +1009,8 @@ def write_daily_aggregates_from_map(day_totals_map):
 def write_10m_aggregates_from_map(min10_totals_map):
     batch = BatchStatement(consistency_level=ConsistencyLevel.QUORUM)
     total = 0
+    started = perf_counter()
+    print(f"[{_now_str()}] [mcap_10m] writing {len(min10_totals_map)} 10m timestamp groups …")
     for ts10, catmap in sorted(min10_totals_map.items()):
         entries = [(c, catmap[c][1]) for c in catmap]
         ranks = compute_ranks(entries)
@@ -1001,6 +1020,8 @@ def write_10m_aggregates_from_map(min10_totals_map):
             batch.add(INS_MCAP_10M, [cat, ts10, lu or ts10, float(mc or 0.0), rk, float(vol or 0.0)])
             total += 1
             if (total % 200) == 0: session.execute(batch); batch.clear()
+            if (total % 5000) == 0:
+                print(f"[{_now_str()}] [mcap_10m] … wrote {total} rows so far ({tdur(started)})")
     if not DRY_RUN and len(batch): session.execute(batch)
     metrics["agg_rows_10m"] += total
     print(f"[{_now_str()}] [mcap_10m] wrote rows={total}")
@@ -1117,9 +1138,9 @@ def main():
     api_plans = []
     deadline = perf_counter() + SOFT_BUDGET_SEC
 
-    affected_hours = set()
-    affected_days  = set()
-    affected_10m_ts = set()
+    affected_hours: set[dt.datetime] = set()
+    affected_days:  set[dt.date]     = set()
+    affected_10m_ts: set[dt.datetime] = set()
 
     for i, coin in enumerate(coins, 1):
         t_coin = perf_counter()
@@ -1176,8 +1197,8 @@ def main():
 
             # Local daily repair from 10m
             if need_daily_local and FIX_DAILY_FROM_10M:
-                fixed = repair_daily_from_10m(coin, need_daily_local)
-                affected_days |= set(sorted(need_daily_local))
+                fixed, days_written = repair_daily_from_10m(coin, need_daily_local)
+                affected_days |= days_written
                 fixedD_local += fixed
                 if fixed > 0:
                     metrics["points_daily"] += fixed
@@ -1185,9 +1206,8 @@ def main():
 
             # 10m seed from daily (optional)
             if need_10m and SEED_10M_FROM_DAILY:
-                fixed = seed_10m_from_daily(coin, need_10m)
-                for d in need_10m:
-                    affected_10m_ts.add(dt.datetime(d.year, d.month, d.day, 23, 59, 59, tzinfo=timezone.utc))
+                fixed, ts10_written = seed_10m_from_daily(coin, need_10m)
+                affected_10m_ts |= ts10_written
                 fixed10_seeded += fixed
                 if fixed > 0:
                     metrics["points_10m"] += fixed
@@ -1222,8 +1242,8 @@ def main():
 
                 if need_hours:
                     try:
-                        wroteH = repair_hourly_from_api_or_interp(coin, need_hours)
-                        affected_hours |= set(need_hours)
+                        wroteH, hrs_written = repair_hourly_from_api_or_interp(coin, need_hours)
+                        affected_hours |= hrs_written
                         print(f"[{_now_str()}]    hourly_repair → wrote {wroteH} rows")
                         fixedH_total += wroteH
                         if wroteH > 0:
@@ -1252,7 +1272,7 @@ def main():
 
                 if dt_ranges:
                     api_plans.append({"coin": coin, "ranges": dt_ranges, "need_days": remaining_daily})
-                    affected_days |= set(remaining_daily)
+                    # only mark days after successful API write (see below)
 
             sleep(PAUSE_S)
             elapsed_coin = perf_counter() - t_coin
@@ -1290,6 +1310,8 @@ def main():
                 if wrote_api > 0:
                     metrics["points_daily"] += wrote_api
                     coin_fix_counts[coin["id"]] += wrote_api
+                    # Conservatively mark all planned days for this coin (API writes don't return per-day set)
+                    affected_days |= set(plan["need_days"])
             except RateLimitDefer as e:
                 metrics["cg_calls_deferred"] += 1
                 wait_s = (getattr(e, "retry_after", None) or BACKOFF_S) + random.uniform(0.0, 0.25)
@@ -1305,14 +1327,19 @@ def main():
 
     # ───────────────────── Aggregate recompute ─────────────────────
     print(f"[{_now_str()}] Aggregate recompute: FULL_MODE={FULL_MODE} | recompute 10m={RECOMPUTE_MCAP_10M} hourly={RECOMPUTE_MCAP_HOURLY} daily={RECOMPUTE_MCAP_DAILY}")
+    if not FULL_MODE:
+        print(f"[{_now_str()}] Incremental sets → hours={len(affected_hours)} days={len(affected_days)} t10={len(affected_10m_ts)}")
 
     def recompute_hourly_incremental(hours_set):
         if not hours_set: return
-        print(f"[{_now_str()}] [mcap_hourly] incremental timestamps={len(hours_set)} (summing across {len(coins)} coins)")
+        total_ts = len(hours_set)
+        print(f"[{_now_str()}] [mcap_hourly] incremental timestamps={total_ts} (summing across {len(coins)} coins)")
         hour_map = {}
-        for h in sorted(hours_set):
+        started = perf_counter()
+        for idx_h, h in enumerate(sorted(hours_set), 1):
             catmap = defaultdict(lambda: (None, 0.0, 0.0))
-            for c in coins:
+            for idx_c, c in enumerate(coins, 1):
+                if (idx_c % 200) == 0: _maybe_heartbeat(f"agg_hourly coin {idx_c}/{len(coins)} @ {h}")
                 row = session.execute(SEL_HOURLY_ONE, [c["id"], h], timeout=REQUEST_TIMEOUT).one()
                 if not row: continue
                 lu = to_utc(getattr(row, "last_updated", None))
@@ -1326,15 +1353,20 @@ def main():
                 a_new_lu = lu if (a_lu is None or (lu and lu > a_lu)) else a_lu
                 catmap["ALL"] = (a_new_lu, a_m + mcap, a_v + vol)
             hour_map[h] = catmap
+            if (idx_h % 50) == 0 or idx_h == total_ts:
+                print(f"[{_now_str()}] [mcap_hourly] progress {idx_h}/{total_ts} hours ({tdur(started)})")
         write_hourly_aggregates_from_map(hour_map)
 
     def recompute_daily_incremental(days_set):
         if not days_set: return
-        print(f"[{_now_str()}] [mcap_daily] incremental dates={len(days_set)} (summing across {len(coins)} coins)")
+        total_days = len(days_set)
+        print(f"[{_now_str()}] [mcap_daily] incremental dates={total_days} (summing across {len(coins)} coins)")
         day_map = {}
-        for d in sorted(days_set):
+        started = perf_counter()
+        for idx_d, d in enumerate(sorted(days_set), 1):
             catmap = defaultdict(lambda: (None, 0.0, 0.0))
-            for c in coins:
+            for idx_c, c in enumerate(coins, 1):
+                if (idx_c % 200) == 0: _maybe_heartbeat(f"agg_daily coin {idx_c}/{len(coins)} @ {d}")
                 row = session.execute(SEL_DAILY_READ_FOR_AGG, [c["id"], d], timeout=REQUEST_TIMEOUT).one()
                 if not row: continue
                 lu = to_utc(getattr(row, "last_updated", None))
@@ -1348,15 +1380,20 @@ def main():
                 a_new_lu = lu if (a_lu is None or (lu and lu > a_lu)) else a_lu
                 catmap["ALL"] = (a_new_lu, a_m + mcap, a_v + vol)
             day_map[d] = catmap
+            if (idx_d % 25) == 0 or idx_d == total_days:
+                print(f"[{_now_str()}] [mcap_daily] progress {idx_d}/{total_days} days ({tdur(started)})")
         write_daily_aggregates_from_map(day_map)
 
     def recompute_10m_incremental(ts_set):
         if not ts_set: return
-        print(f"[{_now_str()}] [mcap_10m] incremental timestamps={len(ts_set)} (summing across {len(coins)} coins)")
+        total_ts = len(ts_set)
+        print(f"[{_now_str()}] [mcap_10m] incremental timestamps={total_ts} (summing across {len(coins)} coins)")
         min10_map = {}
-        for t10 in sorted(ts_set):
+        started = perf_counter()
+        for idx_t, t10 in enumerate(sorted(ts_set), 1):            
             catmap = defaultdict(lambda: (None, 0.0, 0.0))
-            for c in coins:
+            for idx_c, c in enumerate(coins, 1):
+                if (idx_c % 200) == 0: _maybe_heartbeat(f"agg_10m coin {idx_c}/{len(coins)} @ {t10}")
                 row = session.execute(SEL_10M_ONE, [c["id"], t10], timeout=REQUEST_TIMEOUT).one()
                 if not row: continue
                 lu = to_utc(getattr(row, "last_updated", None))
@@ -1370,6 +1407,8 @@ def main():
                 a_new_lu = lu if (a_lu is None or (lu and lu > a_lu)) else a_lu
                 catmap["ALL"] = (a_new_lu, a_m + mcap, a_v + vol)
             min10_map[t10] = catmap
+            if (idx_t % 200) == 0 or idx_t == total_ts:
+                print(f"[{_now_str()}] [mcap_10m] progress {idx_t}/{total_ts} stamps ({tdur(started)})")
         write_10m_aggregates_from_map(min10_map)
 
     if FULL_MODE:
@@ -1385,11 +1424,14 @@ def main():
             win_end   = dt.datetime.combine(last_inclusive + dt.timedelta(days=1),        dt.time.min, tzinfo=timezone.utc)
             print(f"[{_now_str()}] [FULL][10m] window {win_start} → {win_end}")
             acc = {}
+            rows_seen = 0
+            started = perf_counter()
             for idx,c in enumerate(coins,1):
                 if (idx==1) or (idx%25==0) or (idx==len(coins)):
                     print(f"[{_now_str()}] [FULL][10m] id {idx}/{len(coins)}: {c['id']}")
                 rows = session.execute(SEL_10M_RANGE_FULL, [c["id"], win_start, win_end], timeout=REQUEST_TIMEOUT)
                 for r in rows:
+                    rows_seen += 1
                     ts = to_utc(getattr(r, "ts", None))
                     if ts is None: continue
                     mcap = float(getattr(r, "market_cap", 0.0) or 0.0)
@@ -1403,6 +1445,8 @@ def main():
                     alu0, am0, av0 = catmap.get("ALL", (None, 0.0, 0.0))
                     alu_new = lu if (alu0 is None or (lu and lu > alu0)) else alu0
                     catmap["ALL"] = (alu_new, am0 + mcap, av0 + vol)
+                    if (rows_seen % 100000) == 0:
+                        print(f"[{_now_str()}] [FULL][10m] streamed {rows_seen} rows ({tdur(started)})")
             write_10m_aggregates_from_map(acc)
 
         if RECOMPUTE_MCAP_HOURLY:
@@ -1410,11 +1454,14 @@ def main():
             win_end   = dt.datetime.combine(last_inclusive + dt.timedelta(days=1),          dt.time.min, tzinfo=timezone.utc)
             print(f"[{_now_str()}] [FULL][hourly] window {win_start} → {win_end}")
             acc = {}
+            rows_seen = 0
+            started = perf_counter()
             for idx,c in enumerate(coins,1):
                 if (idx==1) or (idx%25==0) or (idx==len(coins)):
                     print(f"[{_now_str()}] [FULL][hourly] id {idx}/{len(coins)}: {c['id']}")
                 rows = session.execute(SEL_HOURLY_META_RANGE, [c["id"], win_start, win_end], timeout=REQUEST_TIMEOUT)
                 for r in rows:
+                    rows_seen += 1
                     ts_raw = getattr(r, "ts", None)
                     ts = floor_to_hour_utc(ts_raw) if isinstance(ts_raw, dt.datetime) else None
                     if ts is None: continue
@@ -1429,6 +1476,8 @@ def main():
                     alu0, am0, av0 = catmap.get("ALL", (None, 0.0, 0.0))
                     alu_new = lu if (alu0 is None or (lu and lu > alu0)) else lu0
                     catmap["ALL"] = (alu_new, am0 + mcap, av0 + vol)
+                    if (rows_seen % 100000) == 0:
+                        print(f"[{_now_str()}] [FULL][hourly] streamed {rows_seen} rows ({tdur(started)})")
             write_hourly_aggregates_from_map(acc)
 
         if RECOMPUTE_MCAP_DAILY:
@@ -1445,12 +1494,15 @@ def main():
                 cur_d = win_start_d; all_days = []
                 while cur_d <= win_end_d:
                     all_days.append(cur_d); cur_d += dt.timedelta(days=1)
+                rows_seen = 0
+                started = perf_counter()
                 for idx,c in enumerate(coins,1):
                     if (idx==1) or (idx%25==0) or (idx==len(coins)):
                         print(f"[{_now_str()}] [FULL][daily] id {idx}/{len(coins)}: {c['id']}")
                     for d in all_days:
                         row = session.execute(SEL_DAILY_READ_FOR_AGG, [c["id"], d], timeout=REQUEST_TIMEOUT).one()
                         if not row: continue
+                        rows_seen += 1
                         mcap = float(getattr(row,"market_cap",0.0) or 0.0)
                         vol  = float(getattr(row,"volume_24h",0.0) or 0.0)
                         lu   = to_utc(getattr(row,"last_updated",None)) or dt.datetime(d.year,d.month,d.day,23,59,59,tzinfo=timezone.utc)
@@ -1462,6 +1514,8 @@ def main():
                         alu0, am0, av0 = catmap.get("ALL", (None, 0.0, 0.0))
                         alu_new = lu if (alu0 is None or (lu and lu > alu0)) else lu0
                         catmap["ALL"] = (alu_new, am0 + mcap, av0 + vol)
+                        if (rows_seen % 100000) == 0:
+                            print(f"[{_now_str()}] [FULL][daily] streamed {rows_seen} rows ({tdur(started)})")
                 write_daily_aggregates_from_map(acc)
 
     else:
