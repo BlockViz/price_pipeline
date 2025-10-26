@@ -14,7 +14,8 @@ from typing import overload
 import traceback
 
 # ───────────────────── Connector ─────────────────────
-from astra_connect.connect import get_session
+from astra_connect.connect import get_session, AstraConfig
+AstraConfig.from_env()  # ← required to load creds/secure bundle/keyspace
 session, cluster = get_session(return_cluster=True)
 
 # ---------- Config ----------

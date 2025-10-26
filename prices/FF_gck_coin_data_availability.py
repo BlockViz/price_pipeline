@@ -153,6 +153,9 @@ def main() -> None:
     else:
         target_day = (utcnow() - timedelta(days=1)).date()
 
+    from astra_connect.connect import get_session, AstraConfig
+    AstraConfig.from_env()  # ← required to load creds/secure bundle/keyspace
+
     log("Connecting to Astra…")
     session, cluster = get_session(return_cluster=True)
     log("Connected.")
