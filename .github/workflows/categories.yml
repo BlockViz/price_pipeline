@@ -6,7 +6,7 @@ on:
     paths:
       - "prices/category_mapping.csv"
       - "prices/load_categories.py"
-      - "backend/prices/HH_recalculate_mcaps.py"
+      - "prices/HH_recalculate_mcaps.py"
       - ".github/workflows/categories.yml"
   workflow_dispatch: {}
 
@@ -56,4 +56,4 @@ jobs:
           ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
           ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
           CATEGORY_FILE: prices/category_mapping.csv
-        run: python backend/prices/HH_recalculate_mcaps.py
+        run: python prices/HH_recalculate_mcaps.py
