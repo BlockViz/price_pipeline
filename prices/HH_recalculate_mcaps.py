@@ -17,6 +17,7 @@
 import os, sys, pathlib, csv, time
 from datetime import datetime, timezone, timedelta, date
 from collections import defaultdict
+from typing import Dict
 
 # ───────────────────── Repo root & helpers ─────────────────────
 _here = pathlib.Path(__file__).resolve()
@@ -66,7 +67,7 @@ WIN_10M_START = NOW_UTC - timedelta(days=7)
 WIN_10M_END   = NOW_UTC + timedelta(minutes=10)
 WIN_H_START   = NOW_UTC - timedelta(days=30)
 WIN_H_END     = NOW_UTC + timedelta(hours=1)
-WIN_D_START   = (NOW_UTC.date().fromordinal(max(1, NOW_UTC.date().toordinal() - 365)))
+WIN_D_START = date.fromordinal(max(1, NOW_UTC.date().toordinal() - 365))
 WIN_D_END     = NOW_UTC.date() + timedelta(days=1)
 
 SRC_10M    = "gecko_prices_10m_7d"
@@ -79,34 +80,50 @@ DST_DAILY  = "gecko_market_cap_daily_contin"
 
 def now_str(): return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-def load_id_category_map(path: str) -> dict:
-    m = {}
+def load_id_category_map(path: str) -> Dict[str, str]:
+    m: Dict[str, str] = {}
     try:
         with open(path, "r", encoding="utf-8-sig", newline="") as f:
             for delim in [",", ";", "\t", "|"]:
                 f.seek(0)
                 reader = csv.DictReader(f, delimiter=delim)
-                headers = [h.strip().lower() for h in (reader.fieldnames or [])]
+
+                fieldnames = reader.fieldnames
+                if not fieldnames:
+                    # No header found for this delimiter, try the next one
+                    continue
+
+                headers = [h.strip().lower() for h in fieldnames]
+
                 id_col = None
                 cat_col = None
+
                 if "id" in headers:
-                    id_col = reader.fieldnames[headers.index("id")]
+                    id_col = fieldnames[headers.index("id")]
                 elif "symbol" in headers:
-                    id_col = reader.fieldnames[headers.index("symbol")]
+                    id_col = fieldnames[headers.index("symbol")]
+
                 if "category" in headers:
-                    cat_col = reader.fieldnames[headers.index("category")]
+                    cat_col = fieldnames[headers.index("category")]
+
                 if id_col and cat_col:
                     for row in reader:
                         cid = (row.get(id_col) or "").strip().lower()
                         cat = (row.get(cat_col) or "").strip()
                         if cid:
                             m[cid] = cat or "Other"
+
                     prev = ", ".join([f"{k}→{m[k]}" for k in list(m.keys())[:10]])
-                    print(f"[{now_str()}] [category] loaded {len(m)} id→category rows from {path}\n"
-                          f"           preview: {prev}")
+                    print(
+                        f"[{now_str()}] [category] loaded {len(m)} id→category rows from {path}\n"
+                        f"           preview: {prev}"
+                    )
                     break
             else:
-                print(f"[{now_str()}] [category] header not found in {path} (need id/category or symbol/category).")
+                print(
+                    f"[{now_str()}] [category] header not found in {path} "
+                    f"(need id/category or symbol/category)."
+                )
     except FileNotFoundError:
         print(f"[{now_str()}] [category] file not found: {path} — will map missing IDs to 'Other'")
     except Exception as e:
@@ -116,14 +133,6 @@ def load_id_category_map(path: str) -> dict:
 ID_TO_CAT = load_id_category_map(CATEGORY_FILE)
 def cat_for_id(cid: str) -> str:
     return ID_TO_CAT.get((cid or "").lower(), "Other")
-
-def compute_ranks_for_bucket(entries):
-    non_all = [(cat, mcap) for (cat, _lu, mcap, _vol) in entries if cat != "ALL"]
-    non_all.sort(key=lambda x: (x[1] or 0.0), reverse=True)
-    ranks = {cat: idx + 1 for idx, (cat, _m) in enumerate(non_all)}
-    if any(cat == "ALL" for (cat, *_rest) in entries):
-        ranks["ALL"] = 0
-    return ranks
 
 # ───────────────────────── Connect ─────────────────────────
 if not BUNDLE or not ASTRA_TOKEN or not KEYSPACE:
