@@ -46,8 +46,8 @@ SLOT_DELAY_SEC          = int(os.getenv("SLOT_DELAY_SEC", "120"))   # guard agai
 FINALIZE_PREV           = os.getenv("FINALIZE_PREV", "1") == "1"    # finalize previous hour once
 PROGRESS_EVERY          = int(os.getenv("PROGRESS_EVERY", "20"))
 VERBOSE_MODE            = os.getenv("VERBOSE_MODE", "1") == "1"
-MIN_10M_POINTS_FOR_FINAL= int(os.getenv("MIN_10M_POINTS_FOR_FINAL", "2"))  # require ≥2 points to finalize
-BACKFILL_HOURS          = int(os.getenv("BACKFILL_HOURS", "4"))  # 1 = prev hour only (current hour is always included separately)
+MIN_10M_POINTS_FOR_FINAL= int(os.getenv("MIN_10M_POINTS_FOR_FINAL", "1"))  # allow finalize on a single 10m/carry point
+BACKFILL_HOURS          = int(os.getenv("BACKFILL_HOURS", "24"))  # 24h safety window to recover missed runs
 
 # Table names (Gecko pipeline)
 TEN_MIN_TABLE           = os.getenv("TEN_MIN_TABLE", "gecko_prices_10m_7d")
@@ -263,6 +263,29 @@ def main():
             ranks, circs, tots = [], [], []
             last_upd_candidates: List[datetime] = []
 
+            def add_prev_point_if_available() -> bool:
+                """Carry the latest 10m point before the window start when inside-slot data is missing."""
+                try:
+                    prev = session.execute(
+                        SEL_10M_PREV.bind([c.id, to_cassandra_ts(start)]),
+                        timeout=REQUEST_TIMEOUT
+                    ).one()
+                except Exception as e:
+                    vprint(f"[{now_str()}] [PREV-ERR] {c.symbol} < {start.isoformat()}: {e}")
+                    return False
+
+                if prev and prev.price_usd is not None:
+                    prices.append(float(prev.price_usd))
+                    if prev.market_cap  is not None: mcaps.append(float(prev.market_cap))
+                    if prev.volume_24h  is not None: vols.append(float(prev.volume_24h))
+                    if getattr(prev, "market_cap_rank", None)    is not None: ranks.append(int(prev.market_cap_rank))
+                    if getattr(prev, "circulating_supply", None) is not None: circs.append(float(prev.circulating_supply))
+                    if getattr(prev, "total_supply", None)       is not None: tots.append(float(prev.total_supply))
+                    lu_prev = ensure_aware_utc(getattr(prev, "last_updated", None))
+                    if lu_prev is not None: last_upd_candidates.append(lu_prev)
+                    return True
+                return False
+
             for p in pts:
                 # Normalize last_updated from 10m rows to aware UTC
                 lu = ensure_aware_utc(getattr(p, "last_updated", None))
@@ -274,41 +297,26 @@ def main():
                 if getattr(p, "total_supply", None)          is not None: tots.append(float(p.total_supply))
                 if lu is not None: last_upd_candidates.append(lu)
 
-            # For a closed hour, require at least MIN_10M_POINTS_FOR_FINAL points; else leave as partial next run
-            # BUT still include the existing candle (if any) in aggregates to keep sums correct.
+            # For a closed hour, require at least MIN_10M_POINTS_FOR_FINAL points; if empty, try carry; otherwise aggregate existing and skip.
             if is_final and len(prices) < MIN_10M_POINTS_FOR_FINAL:
-                vprint(f"[{now_str()}]    {c.symbol} {start.isoformat()} final: insufficient 10m points ({len(prices)}) → aggregate existing; skip write")
-                if existing:
-                    mcap_exist = sanitize_num(getattr(existing, "market_cap", None), 0.0)
-                    vol_exist  = sanitize_num(getattr(existing, "volume_24h", None), 0.0)
-                    last_upd   = existing_last_upd or (end - timedelta(seconds=1))
-                    bump_hour_total(start, coin_category, mcap_exist, vol_exist, last_upd)
-                    bump_hour_total(start, 'ALL',        mcap_exist, vol_exist, last_upd)
-                skipped += 1
-                continue
+                if not prices:
+                    add_prev_point_if_available()
+                if len(prices) < MIN_10M_POINTS_FOR_FINAL:
+                    vprint(f"[{now_str()}]    {c.symbol} {start.isoformat()} final: insufficient 10m points ({len(prices)}) → aggregate existing; skip write")
+                    if existing:
+                        mcap_exist = sanitize_num(getattr(existing, "market_cap", None), 0.0)
+                        vol_exist  = sanitize_num(getattr(existing, "volume_24h", None), 0.0)
+                        last_upd   = existing_last_upd or (end - timedelta(seconds=1))
+                        bump_hour_total(start, coin_category, mcap_exist, vol_exist, last_upd)
+                        bump_hour_total(start, 'ALL',        mcap_exist, vol_exist, last_upd)
+                    skipped += 1
+                    continue
 
             if not prices:
                 # Try to carry price (and extras) from the most recent 10m before start (only for partial hour)
                 if not is_final:
-                    try:
-                        prev = session.execute(
-                            SEL_10M_PREV.bind([c.id, to_cassandra_ts(start)]),
-                            timeout=REQUEST_TIMEOUT
-                        ).one()
-                    except Exception as e:
-                        prev = None
-                        vprint(f"[{now_str()}] [PREV-ERR] {c.symbol} < {start.isoformat()}: {e}")
-
-                    if prev and prev.price_usd is not None:
-                        prices = [float(prev.price_usd)]
-                        if prev.market_cap  is not None: mcaps.append(float(prev.market_cap))
-                        if prev.volume_24h  is not None: vols.append(float(prev.volume_24h))
-                        if getattr(prev, "market_cap_rank", None)    is not None: ranks.append(int(prev.market_cap_rank))
-                        if getattr(prev, "circulating_supply", None) is not None: circs.append(float(prev.circulating_supply))
-                        if getattr(prev, "total_supply", None)       is not None: tots.append(float(prev.total_supply))
-                        lu_prev = ensure_aware_utc(getattr(prev, "last_updated", None))
-                        if lu_prev is not None: last_upd_candidates.append(lu_prev)
-                    else:
+                    added = add_prev_point_if_available()
+                    if not added:
                         # No 10m and no prev — still include existing candle (if any) in aggregates
                         if existing:
                             mcap_exist = sanitize_num(getattr(existing, "market_cap", None), 0.0)
