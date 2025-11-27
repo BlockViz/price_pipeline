@@ -67,7 +67,8 @@ WIN_10M_START = NOW_UTC - timedelta(days=7)
 WIN_10M_END   = NOW_UTC + timedelta(minutes=10)
 WIN_H_START   = NOW_UTC - timedelta(days=30)
 WIN_H_END     = NOW_UTC + timedelta(hours=1)
-WIN_D_START = date.fromordinal(max(1, NOW_UTC.date().toordinal() - 365))
+# WIN_D_START = date.fromordinal(max(1, NOW_UTC.date().toordinal() - 365))
+WIN_D_START = date(2013, 4, 28)
 WIN_D_END     = NOW_UTC.date() + timedelta(days=1)
 
 SRC_10M    = "gecko_prices_10m_7d"
