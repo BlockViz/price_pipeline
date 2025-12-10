@@ -615,23 +615,17 @@ def bad_hours_hourly(coin_id: str, start_dt: dt.datetime, end_dt: dt.datetime):
         if ts is None:
             continue
 
-        o = getattr(r, "open", None)
-        h = getattr(r, "high", None)
-        l = getattr(r, "low", None)
-        c = getattr(r, "close", None)
         price = getattr(r, "price_usd", None)
-        mcap = getattr(r, "market_cap", None)
-        vol  = getattr(r, "volume_24h", None)
-        csrc = (getattr(r, "candle_source", "") or "").strip()
+        mcap  = getattr(r, "market_cap", None)
+        vol   = getattr(r, "volume_24h", None)
+        csrc  = (getattr(r, "candle_source", "") or "").strip()
 
-        missing_ohlc = any(v is None for v in (o, h, l, c, price))
-        missing_mcap = (mcap is None) or (isinstance(mcap, (int, float)) and mcap <= 0.0)
-        missing_vol  = (vol is None) or (isinstance(vol, (int, float)) and vol < 0.0)
-
-        # Already-interpolated rows should be eligible for upgrade when we have better data
+        needs_mcap = (mcap is None) or (isinstance(mcap, (int, float)) and mcap <= 0.0)
+        inconsistent = (price is not None) and (mcap is None or mcap <= 0.0)
         interpolated = csrc in ("hourly_interp",)
 
-        if missing_ohlc or missing_mcap or missing_vol or interpolated:
+        # This is conservative: missing mcap, inconsistent, or previously interpolated
+        if needs_mcap or inconsistent or interpolated:
             bad.add(ts)
 
     return bad
@@ -983,9 +977,14 @@ def repair_hourly_from_api_or_interp(coin, missing_hours: set[dt.datetime]) -> t
     for h in hours_sorted:
         h = floor_to_hour_utc(h)
 
-        price, ts_src = interp_price(h)
-        source = "hourly_api" if FILL_HOURLY_FROM_API and (h in p_map and p_map[h][0] is not None) else \
-                 ("hourly_interp" if price is not None else None)
+        # 1) If we have a real value at h, use it.
+        if h in p_map and p_map[h][0] is not None:
+            price, ts_src = p_map[h]
+            source = "hourly_api" if FILL_HOURLY_FROM_API else "hourly_existing"
+        else:
+            # 2) Otherwise interpolate between nearest neighbors
+            price, ts_src = interp_price(h)
+            source = "hourly_interp" if price is not None else None
 
         if price is None:
             continue
