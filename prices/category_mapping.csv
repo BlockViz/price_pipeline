@@ -35,7 +35,7 @@ bitget-token,BGB,Exchange Tokens
 uniswap,UNI,Decentralized Finance
 ethena-usde,USDE,Stablecoins
 coinbase-wrapped-btc,CBBTC,Staked or Wrapped
-monero,XMR,Layer 1s
+monero,XMR,Payments
 ethena-staked-usde,SUSDE,Staked or Wrapped
 ethena,ENA,Decentralized Finance
 aave,AAVE,Decentralized Finance
@@ -46,7 +46,7 @@ dai,DAI,Stablecoins
 ethereum-classic,ETC,Decentralized Finance
 bittensor,TAO,"Data, Oracles & Storage"
 aptos,APT,Layer 1s
-ondo-finance,ONDO,RWA & Tokenization
+ondo-finance,ONDO,Tokenization
 susds,SUSDS,Decentralized Finance
 near,NEAR,Layer 1s
 memecore,M,Memecoins
@@ -66,7 +66,7 @@ kelp-dao-restaked-eth,RSETH,Staked or Wrapped
 gatechain-token,GT,Exchange Tokens
 fasttoken,FTN,Decentralized Finance
 jupiter-perpetuals-liquidity-provider-token,JLP,Decentralized Finance
-pudgy-penguins,PENGU,Consumer Tokens
+pudgy-penguins,PENGU,Memecoins
 kucoin-shares,KCS,Exchange Tokens
 render-token,RENDER,Decentralized Finance
 worldcoin-wld,WLD,"Data, Oracles & Storage"
@@ -111,32 +111,32 @@ immutable-x,IMX,Decentralized Finance
 raydium,RAY,Decentralized Finance
 kaia,KAIA,Decentralized Finance
 floki,FLOKI,Memecoins
-tether-gold,XAUT,RWA & Tokenization
+tether-gold,XAUT,Tokenization
 the-graph,GRT,"Data, Oracles & Storage"
 conflux-token,CFX,Layer 1s
 nexo,NEXO,Exchange Tokens
 pancakeswap-token,CAKE,Decentralized Finance
 dogwifcoin,WIF,Memecoins
-ethereum-name-service,ENS,Consumer Tokens
-theta-token,THETA,Consumer Tokens
+ethereum-name-service,ENS,Tokenization
+theta-token,THETA,Tokenization
 pendle,PENDLE,Decentralized Finance
 fartcoin,FARTCOIN,Memecoins
 tezos,XTZ,Layer 1s
 vaulta,A,Decentralized Finance
 virtual-protocol,VIRTUAL,Decentralized Finance
-the-sandbox,SAND,Consumer Tokens
-pax-gold,PAXG,RWA & Tokenization
+the-sandbox,SAND,Tokenization
+pax-gold,PAXG,Tokenization
 jasmycoin,JASMY,"Data, Oracles & Storage"
 tbtc,TBTC,Decentralized Finance
 iota,IOTA,Decentralized Finance
-zcash,ZEC,Layer 1s
+zcash,ZEC,Payments
 flow,FLOW,Decentralized Finance
 newton-project,AB,Decentralized Finance
 stader-ethx,ETHX,Decentralized Finance
-decentraland,MANA,Consumer Tokens
+decentraland,MANA,Tokenization
 bittorrent,BTT,"Data, Oracles & Storage"
 coinbase-wrapped-staked-eth,CBETH,Staked or Wrapped
-gala,GALA,Consumer Tokens
+gala,GALA,Tokenization
 syrup,SYRUP,Decentralized Finance
 build-on,B,Decentralized Finance
 sweth,SWETH,Decentralized Finance
@@ -169,7 +169,7 @@ instadapp,FLUID,Decentralized Finance
 saros-finance,SAROS,Decentralized Finance
 ether-fi-staked-eth,EETH,Staked or Wrapped
 blackrock-usd-institutional-digital-liquidity-fund,BUIDL,Stablecoins
-ousg,OUSG,RWA & Tokenization
+ousg,OUSG,Tokenization
 usdt0,USDT0,Stablecoins
 cgeth-hashkey-cloud,CGETH.HASHKEY,Decentralized Finance
 paypal-usd,PYUSD,Stablecoins

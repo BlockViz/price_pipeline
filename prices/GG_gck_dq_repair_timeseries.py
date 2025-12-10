@@ -53,7 +53,7 @@ FILL_HOURLY_FROM_API    = os.getenv("FILL_HOURLY_FROM_API", "1") == "1"
 INTERPOLATE_IF_API_MISS = os.getenv("INTERPOLATE_IF_API_MISS", "1") == "1"
 BACKFILL_DAILY_FROM_API = os.getenv("BACKFILL_DAILY_FROM_API", "1") == "1"
 FULL_DAILY_ALL          = os.getenv("FULL_DAILY_ALL", "1") == "1"  # daily agg across entire history
-FILL_HOURLY_BADSCAN     = os.getenv("FILL_HOURLY_BADSCAN", "0") == "1"  # optional & off by default
+FILL_HOURLY_BADSCAN     = os.getenv("FILL_HOURLY_BADSCAN", "1") == "1"  # optional & off by default
 
 # Aggregate recompute toggles
 FULL_MODE = os.getenv("FULL_MODE", "1") == "1"
@@ -604,20 +604,38 @@ def has_any_coverage_for_windows(coin_id: str,
 
 def bad_hours_hourly(coin_id: str, start_dt: dt.datetime, end_dt: dt.datetime):
     bad = set()
-    rows = session.execute(SEL_HOURLY_META_RANGE, [coin_id, to_utc(start_dt), to_utc(end_dt)], timeout=REQUEST_TIMEOUT)
+    rows = session.execute(
+        SEL_HOURLY_META_RANGE,
+        [coin_id, to_utc(start_dt), to_utc(end_dt)],
+        timeout=REQUEST_TIMEOUT,
+    )
     for r in rows:
         ts_raw = getattr(r, "ts", None)
         ts = floor_to_hour_utc(ts_raw) if isinstance(ts_raw, dt.datetime) else None
-        if ts is None: continue
-        mcap = r.market_cap
-        price = r.price_usd
-        csrc = getattr(r, "candle_source", None) or ""
-        needs_mcap = (mcap is None) or (isinstance(mcap, (int, float)) and mcap <= 0.0)
-        is_interpolated = (csrc in ("hourly_interp",))
-        inconsistent = (price is not None) and (mcap is None or mcap <= 0.0)
-        if needs_mcap or is_interpolated or inconsistent:
+        if ts is None:
+            continue
+
+        o = getattr(r, "open", None)
+        h = getattr(r, "high", None)
+        l = getattr(r, "low", None)
+        c = getattr(r, "close", None)
+        price = getattr(r, "price_usd", None)
+        mcap = getattr(r, "market_cap", None)
+        vol  = getattr(r, "volume_24h", None)
+        csrc = (getattr(r, "candle_source", "") or "").strip()
+
+        missing_ohlc = any(v is None for v in (o, h, l, c, price))
+        missing_mcap = (mcap is None) or (isinstance(mcap, (int, float)) and mcap <= 0.0)
+        missing_vol  = (vol is None) or (isinstance(vol, (int, float)) and vol < 0.0)
+
+        # Already-interpolated rows should be eligible for upgrade when we have better data
+        interpolated = csrc in ("hourly_interp",)
+
+        if missing_ohlc or missing_mcap or missing_vol or interpolated:
             bad.add(ts)
+
     return bad
+
 
 # ---------- Equality ----------
 def _daily_row_equal(existing, o,h,l,c,mcap,vol,source):
@@ -828,13 +846,52 @@ def fetch_hourly_from_api(coin_id: str, start_dt: dt.datetime, end_dt: dt.dateti
         return m
     return to_hour_map(prices_all), to_hour_map(mcaps_all), to_hour_map(vols_all)
 
+def fetch_hourly_from_existing(coin_id: str, start_dt: dt.datetime, end_dt: dt.datetime):
+    """Build price/mcap/volume maps from existing hourly table (no API)."""
+    start_dt = ensure_utc_dt(start_dt, "start_dt")
+    end_dt   = ensure_utc_dt(end_dt, "end_dt")
+
+    rows = session.execute(
+        SEL_HOURLY_META_RANGE,
+        [coin_id, start_dt, end_dt],
+        timeout=REQUEST_TIMEOUT,
+    )
+
+    p_map, mc_map, v_map = {}, {}, {}
+
+    for r in rows:
+        ts_raw = getattr(r, "ts", None)
+        ts = floor_to_hour_utc(ts_raw) if isinstance(ts_raw, dt.datetime) else None
+        if ts is None:
+            continue
+
+        # prefer close, fall back to price_usd
+        close = getattr(r, "close", None)
+        price = getattr(r, "price_usd", None)
+        price_val = close if close is not None else price
+
+        if price_val is not None:
+            p_map[ts] = (float(price_val), to_utc(getattr(r, "last_updated", None)) or ts)
+
+        mc = getattr(r, "market_cap", None)
+        if mc is not None:
+            mc_map[ts] = (float(mc), to_utc(getattr(r, "last_updated", None)) or ts)
+
+        vol = getattr(r, "volume_24h", None)
+        if vol is not None:
+            v_map[ts] = (float(vol), to_utc(getattr(r, "last_updated", None)) or ts)
+
+    return p_map, mc_map, v_map
+
 def repair_hourly_from_api_or_interp(coin, missing_hours: set[dt.datetime]) -> tuple[int, set[dt.datetime]]:
-    if not (FILL_HOURLY and missing_hours): 
+    if not (FILL_HOURLY and missing_hours):
         return 0, set()
+
     hours_sorted = sorted([floor_to_hour_utc(h) for h in missing_hours])
     start_dt = floor_to_hour_utc(hours_sorted[0] - dt.timedelta(hours=6))
     end_dt   = floor_to_hour_utc(hours_sorted[-1] + dt.timedelta(hours=7))
-    p_map, mc_map, v_map = {}, {}, {}
+
+    # --- choose data source ---
     if FILL_HOURLY_FROM_API:
         try:
             p_map, mc_map, v_map = fetch_hourly_from_api(coin["id"], start_dt, end_dt)
@@ -843,70 +900,117 @@ def repair_hourly_from_api_or_interp(coin, missing_hours: set[dt.datetime]) -> t
             wait_s = (getattr(e, "retry_after", None) or BACKOFF_S) + random.uniform(0.0, 0.25)
             print(f"[{_now_str()}]  · hourly API fetch rate-limited for {coin['symbol']} — sleeping {wait_s:.2f}s then deferring")
             time.sleep(wait_s)
-            if not INTERPOLATE_IF_API_MISS: 
+            if not INTERPOLATE_IF_API_MISS:
                 return 0, set()
+            # fall back to existing data for interpolation
+            p_map, mc_map, v_map = fetch_hourly_from_existing(coin["id"], start_dt, end_dt)
         except Exception as e:
             print(f"[{_now_str()}]  · hourly API fetch failed for {coin['symbol']}: {e}")
-            if not INTERPOLATE_IF_API_MISS: 
+            if not INTERPOLATE_IF_API_MISS:
                 return 0, set()
-    api_hours = sorted(p_map.keys())
+            p_map, mc_map, v_map = fetch_hourly_from_existing(coin["id"], start_dt, end_dt)
+    else:
+        # non-API mode: interpolate from existing hourly rows
+        p_map, mc_map, v_map = fetch_hourly_from_existing(coin["id"], start_dt, end_dt)
 
-    def interp_price(h):
-        if not api_hours: return (None, None)
+    # IMPORTANT: api_hours is defined *before* the inner function
+    api_hours = sorted([h for h, (v, _) in p_map.items() if v is not None])
+
+    # --- interpolation helpers ---
+
+    def interp_price(h: dt.datetime):
+        if not api_hours:
+            return (None, None)
         left = right = None
         for ah in reversed([a for a in api_hours if a < h]):
-            if p_map.get(ah,(None,None))[0] is not None: left = ah; break
+            if p_map.get(ah, (None, None))[0] is not None:
+                left = ah
+                break
         for ah in [a for a in api_hours if a > h]:
-            if p_map.get(ah,(None,None))[0] is not None: right = ah; break
-        if left is None or right is None: return (None, None)
-        pl,_ = p_map[left]; pr,_ = p_map[right]
-        if pl is None or pr is None: return (None, None)
-        span = (right-left).total_seconds(); w = (h-left).total_seconds()/span if span>0 else 0.0
-        price = pl + (pr-pl)*w; return (float(price), to_utc(right))
+            if p_map.get(ah, (None, None))[0] is not None:
+                right = ah
+                break
+        if left is None or right is None:
+            return (None, None)
+        pl, _ = p_map[left]
+        pr, _ = p_map[right]
+        if pl is None or pr is None:
+            return (None, None)
+        span = (right - left).total_seconds()
+        w = (h - left).total_seconds() / span if span > 0 else 0.0
+        price = pl + (pr - pl) * w
+        # use right-hand timestamp as last_updated for lack of better info
+        return (float(price), to_utc(p_map[right][1]))
 
-    def interp_generic(h, amap, max_gap_hours):
-        if not amap: return None
-        known_hours = sorted([k for k,(v,_) in amap.items() if v is not None])
-        if not known_hours: return None
-        if h in amap and amap[h][0] is not None: return float(amap[h][0])
+    def interp_generic(h: dt.datetime, amap: dict, max_gap_hours: int | None):
+        if not amap:
+            return None
+        known_hours = sorted([k for k, (v, _) in amap.items() if v is not None])
+        if not known_hours:
+            return None
+        if h in amap and amap[h][0] is not None:
+            return float(amap[h][0])
         left = max([k for k in known_hours if k < h], default=None)
         right = min([k for k in known_hours if k > h], default=None)
-        if left is None and right is None: return None
-        if left is None: return float(amap[right][0])
-        if right is None: return float(amap[left][0])
-        gap = int((right-left).total_seconds()//3600)
-        if (max_gap_hours is not None) and (gap>max_gap_hours): return float(amap[left][0])
-        y = _interp_linear(left.timestamp(), float(amap[left][0]), right.timestamp(), float(amap[right][0]), h.timestamp())
+        if left is None and right is None:
+            return None
+        if left is None:
+            return float(amap[right][0])
+        if right is None:
+            return float(amap[left][0])
+        gap = int((right - left).total_seconds() // 3600)
+        if (max_gap_hours is not None) and (gap > max_gap_hours):
+            # carry forward
+            return float(amap[left][0])
+        y = _interp_linear(
+            left.timestamp(), float(amap[left][0]),
+            right.timestamp(), float(amap[right][0]),
+            h.timestamp()
+        )
         return float(y)
+
+    # --- main repair loop ---
 
     prev_row = session.execute(SEL_PREV_CLOSE, [coin["id"], hours_sorted[0]], timeout=REQUEST_TIMEOUT).one()
     prev_close = float(prev_row.close) if (prev_row and prev_row.close is not None) else None
 
     cur_rank, cur_circ, cur_tot = static_meta_for_coin(coin)
 
-
     batch = BatchStatement(consistency_level=ConsistencyLevel.QUORUM)
     wrote = 0
     hours_written: set[dt.datetime] = set()
+
     for h in hours_sorted:
         h = floor_to_hour_utc(h)
-        if h in p_map and p_map[h][0] is not None:
-            price, ts_src = p_map[h][0], p_map[h][1]; source = "hourly_api"
+
+        price, ts_src = interp_price(h)
+        source = "hourly_api" if FILL_HOURLY_FROM_API and (h in p_map and p_map[h][0] is not None) else \
+                 ("hourly_interp" if price is not None else None)
+
+        if price is None:
+            continue
+
+        if prev_close is None:
+            o = hih = lo = c = float(price)
         else:
-            price, ts_src = interp_price(h); source = "hourly_interp" if price is not None else None
-        if price is None: continue
+            o = float(prev_close)
+            c = float(price)
+            hih = max(o, c)
+            lo  = min(o, c)
 
-        if prev_close is None: o=hih=lo=c=float(price)
+        if mc_map and (h in mc_map) and (mc_map[h][0] is not None):
+            mcap = float(mc_map[h][0])
+        elif INTERPOLATE_MCAP_VOL_HOURLY:
+            mcap = interp_generic(h, mc_map, INTERP_MAX_HOURS)
         else:
-            o=float(prev_close); c=float(price); hih=max(o,c); lo=min(o,c)
+            mcap = None
 
-        if mc_map and (h in mc_map) and (mc_map[h][0] is not None): mcap = float(mc_map[h][0])
-        elif INTERPOLATE_MCAP_VOL_HOURLY: mcap = interp_generic(h, mc_map, INTERP_MAX_HOURS)
-        else: mcap = None
-
-        if v_map and (h in v_map) and (v_map[h][0] is not None): vol = float(v_map[h][0])
-        elif INTERPOLATE_MCAP_VOL_HOURLY: vol = interp_generic(h, v_map, INTERP_MAX_HOURS)
-        else: vol = None
+        if v_map and (h in v_map) and (v_map[h][0] is not None):
+            vol = float(v_map[h][0])
+        elif INTERPOLATE_MCAP_VOL_HOURLY:
+            vol = interp_generic(h, v_map, INTERP_MAX_HOURS)
+        else:
+            vol = None
 
         hr_end = h + dt.timedelta(hours=1) - dt.timedelta(seconds=1)
         last_upd = ts_src or hr_end
@@ -920,13 +1024,20 @@ def repair_hourly_from_api_or_interp(coin, missing_hours: set[dt.datetime]) -> t
                 cur_rank, cur_circ, cur_tot,
                 source, last_upd
             ))
-        wrote += 1; prev_close = c
+        wrote += 1
+        prev_close = c
         hours_written.add(h)
+
         if (wrote % 128 == 0) and not DRY_RUN:
-            session.execute(batch); batch.clear()
-    if not DRY_RUN and len(batch): session.execute(batch)
+            session.execute(batch)
+            batch.clear()
+
+    if not DRY_RUN and len(batch):
+        session.execute(batch)
+
     print(f"[{_now_str()}]    [hourly] {coin['symbol']} wrote={wrote}")
     return wrote, hours_written
+
 
 # ---------- Neg cache ----------
 def load_neg_cache():
