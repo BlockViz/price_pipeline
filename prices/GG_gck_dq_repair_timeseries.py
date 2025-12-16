@@ -25,6 +25,7 @@ TABLE_LIVE      = os.getenv("TABLE_LIVE", "gecko_prices_live")
 TEN_MIN_TABLE   = os.getenv("TEN_MIN_TABLE", "gecko_prices_10m_7d")
 DAILY_TABLE     = os.getenv("DAILY_TABLE", "gecko_candles_daily_contin")
 HOURLY_TABLE    = os.getenv("HOURLY_TABLE", "gecko_candles_hourly_30d")
+MONTHLY_TABLE   = os.getenv("MONTHLY_TABLE", "gecko_candles_monthly")
 
 # Coverage tables
 COIN_DAILY_RANGES   = os.getenv("COIN_DAILY_RANGES",   "coin_daily_coverage_ranges")
@@ -58,6 +59,7 @@ FILL_HOURLY_BADSCAN     = os.getenv("FILL_HOURLY_BADSCAN", "1") == "1"  # option
 # Aggregate recompute toggles
 FULL_MODE = os.getenv("FULL_MODE", "1") == "1"
 TRUNCATE_AGGREGATES_IN_FULL = os.getenv("TRUNCATE_AGGREGATES_IN_FULL", "1") == "1"
+RECOMPUTE_MONTHLY = os.getenv("RECOMPUTE_MONTHLY", "1") == "1"
 RECOMPUTE_MCAP_10M    = os.getenv("RECOMPUTE_MCAP_10M", "1") == "1"
 RECOMPUTE_MCAP_HOURLY = os.getenv("RECOMPUTE_MCAP_HOURLY", "1") == "1"
 RECOMPUTE_MCAP_DAILY  = os.getenv("RECOMPUTE_MCAP_DAILY", "1") == "1"
@@ -173,6 +175,17 @@ def _to_pydate(x) -> dt.date:
 def day_bounds_utc(d: dt.date):
     start = dt.datetime(d.year,d.month,d.day,tzinfo=timezone.utc)
     return start, start + dt.timedelta(days=1)
+
+def ym_tag(d: dt.date) -> str:
+    return f"{d.year:04d}-{d.month:02d}"
+
+def month_start(d: dt.date) -> dt.date:
+    return dt.date(d.year, d.month, 1)
+
+def next_month_start(d: dt.date) -> dt.date:
+    if d.month == 12:
+        return dt.date(d.year + 1, 1, 1)
+    return dt.date(d.year, d.month + 1, 1)
 
 def date_seq(last_inclusive: dt.date, days: int):
     start = last_inclusive - dt.timedelta(days=days-1)
@@ -430,6 +443,31 @@ INS_HOURLY = session.prepare(f"""
      candle_source, last_updated)
   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """)
+
+SEL_DAILY_RANGE_FOR_MONTH = session.prepare(f"""
+  SELECT date, symbol, name,
+         price_usd, market_cap, volume_24h, last_updated,
+         open, high, low, close,
+         market_cap_rank, circulating_supply, total_supply
+  FROM {DAILY_TABLE}
+  WHERE id = ? AND date >= ? AND date < ?
+""")
+
+SEL_MONTHLY_ONE = session.prepare(f"""
+  SELECT open, high, low, close, volume, market_cap, market_cap_rank, candle_source
+  FROM {MONTHLY_TABLE}
+  WHERE id = ? AND year_month = ? LIMIT 1
+""")
+
+INS_MONTHLY = session.prepare(f"""
+  INSERT INTO {MONTHLY_TABLE}
+    (id, year_month, symbol, name,
+     open, high, low, close, volume,
+     market_cap, market_cap_rank, circulating_supply, total_supply,
+     candle_source, last_updated)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+""")
+
 
 # Aggregate inserts
 INS_MCAP_10M = session.prepare(f"""
@@ -1167,6 +1205,90 @@ def recompute_daily_full_all(coins, cat_for_id):
             add_point(d, cat, lu, mcap, vol)
     write_daily_aggregates_from_map(acc)
 
+def _sanitize_num(x, fallback=None):
+    try:
+        if x is None:
+            return fallback
+        return float(x)
+    except Exception:
+        return fallback
+
+def aggregate_month_from_daily_rows(rows) -> dict | None:
+    rows_sorted = sorted(rows, key=lambda r: _to_pydate(getattr(r, "date", None)))
+    if not rows_sorted:
+        return None
+
+    agg = {
+        "open": None,
+        "high": None,
+        "low": None,
+        "close": None,
+        "volume": 0.0,
+        "market_cap": None,
+        "market_cap_rank": None,
+        "circulating_supply": None,
+        "total_supply": None,
+        "last_updated": None,
+        "symbol": None,
+        "name": None,
+    }
+
+    for r in rows_sorted:
+        # Use OHLC if present; fall back to price_usd when needed
+        o = _sanitize_num(getattr(r, "open", None))
+        h = _sanitize_num(getattr(r, "high", None))
+        l = _sanitize_num(getattr(r, "low", None))
+        c = _sanitize_num(getattr(r, "close", None))
+        p = _sanitize_num(getattr(r, "price_usd", None))
+
+        price_for_open = o if o is not None else (c if c is not None else p)
+        price_for_high = h if h is not None else (c if c is not None else p)
+        price_for_low  = l if l is not None else (c if c is not None else p)
+        price_for_close= c if c is not None else p
+
+        if agg["open"] is None and price_for_open is not None:
+            agg["open"] = price_for_open
+        if price_for_high is not None:
+            agg["high"] = price_for_high if agg["high"] is None else max(agg["high"], price_for_high)
+        if price_for_low is not None:
+            agg["low"]  = price_for_low if agg["low"]  is None else min(agg["low"],  price_for_low)
+        if price_for_close is not None:
+            agg["close"] = price_for_close
+
+        agg["volume"] += _sanitize_num(getattr(r, "volume_24h", None), 0.0) or 0.0
+
+        mc = _sanitize_num(getattr(r, "market_cap", None))
+        if mc is not None:
+            agg["market_cap"] = mc
+
+        rnk = getattr(r, "market_cap_rank", None)
+        if rnk is not None:
+            try: agg["market_cap_rank"] = int(rnk)
+            except Exception: pass
+
+        circ = _sanitize_num(getattr(r, "circulating_supply", None))
+        if circ is not None:
+            agg["circulating_supply"] = circ
+
+        tot = _sanitize_num(getattr(r, "total_supply", None))
+        if tot is not None:
+            agg["total_supply"] = tot
+
+        sym = getattr(r, "symbol", None)
+        if sym and not agg["symbol"]:
+            agg["symbol"] = sym
+        nm = getattr(r, "name", None)
+        if nm and not agg["name"]:
+            agg["name"] = nm
+
+        lu = to_utc(getattr(r, "last_updated", None))
+        if lu is not None and (agg["last_updated"] is None or lu > agg["last_updated"]):
+            agg["last_updated"] = lu
+
+    if agg["open"] is None or agg["close"] is None:
+        return None
+    return agg
+
 # ---------- Main ----------
 def main():
     # Light ping to fail fast on auth/network — only if we plan to call CG
@@ -1251,6 +1373,8 @@ def main():
     affected_hours: set[dt.datetime] = set()
     affected_days:  set[dt.date]     = set()
     affected_10m_ts: set[dt.datetime] = set()
+    # NEW: per-coin affected months for monthly repair
+    affected_coin_months = defaultdict(set)  # coin_id -> set(["YYYY-MM", ...])
 
     for i, coin in enumerate(coins, 1):
         t_coin = perf_counter()
@@ -1309,6 +1433,8 @@ def main():
             if need_daily_local and FIX_DAILY_FROM_10M:
                 fixed, days_written = repair_daily_from_10m(coin, need_daily_local)
                 affected_days |= days_written
+                for d in days_written:
+                    affected_coin_months[coin["id"]].add(ym_tag(d))
                 fixedD_local += fixed
                 if fixed > 0:
                     metrics["points_daily"] += fixed
@@ -1422,6 +1548,8 @@ def main():
                     coin_fix_counts[coin["id"]] += wrote_api
                     # Conservatively mark all planned days for this coin (API writes don't return per-day set)
                     affected_days |= set(plan["need_days"])
+                    for d in plan["need_days"]:
+                        affected_coin_months[coin["id"]].add(ym_tag(d))
             except RateLimitDefer as e:
                 metrics["cg_calls_deferred"] += 1
                 wait_s = (getattr(e, "retry_after", None) or BACKOFF_S) + random.uniform(0.0, 0.25)
@@ -1640,6 +1768,87 @@ def main():
     print(f"[{_now_str()}] DONE in {tdur(t_all)} | Local fixes → daily_from_10m:{fixedD_local} "
           f"{'(10m_seeded:'+str(fixed10_seeded)+')' if SEED_10M_FROM_DAILY else ''} "
           f"| API fixes → daily:{fixedD_api} | hourly:{fixedH_total} | Universe size: {len(coins)}")
+
+    # ───────────────────── Monthly candles repair ─────────────────────
+    if RECOMPUTE_MONTHLY and affected_coin_months:
+        now2 = utcnow().date()
+        cur_month = ym_tag(now2)
+        total_jobs = sum(len(v) for v in affected_coin_months.values())
+        print(f"[{_now_str()}] [monthly] incremental recompute jobs={total_jobs} (coins={len(affected_coin_months)})")
+
+        monthly_wrote = 0
+        monthly_unchanged = 0
+        monthly_err = 0
+
+        for cid, ym_set in affected_coin_months.items():
+            # small meta lookup if available
+            symbol, name, _rank = lookup_meta_for_id(cid, live_index)
+            sym0 = symbol or cid
+            name0 = name or cid
+
+            for ym in sorted(ym_set):
+                # skip current month; your dedicated monthly updater handles partial+live
+                if ym == cur_month:
+                    continue
+
+                try:
+                    y = int(ym[:4]); m = int(ym[5:7])
+                    ms = dt.date(y, m, 1)
+                    me = next_month_start(ms)
+
+                    rows = list(session.execute(SEL_DAILY_RANGE_FOR_MONTH, [cid, ms, me], timeout=REQUEST_TIMEOUT))
+                    agg = aggregate_month_from_daily_rows(rows)
+                    if not agg:
+                        continue
+
+                    existing = session.execute(SEL_MONTHLY_ONE, [cid, ym], timeout=REQUEST_TIMEOUT).one()
+                    # basic unchanged check (cheap)
+                    def _eq(a,b,eps=1e-12):
+                        if a is None and b is None: return True
+                        if a is None or b is None:  return False
+                        try: return abs(float(a)-float(b)) <= eps
+                        except Exception: return False
+                    if existing and all([
+                        _eq(getattr(existing,"open",None),  agg["open"]),
+                        _eq(getattr(existing,"high",None),  agg["high"]),
+                        _eq(getattr(existing,"low",None),   agg["low"]),
+                        _eq(getattr(existing,"close",None), agg["close"]),
+                        _eq(getattr(existing,"volume",None), agg["volume"]),
+                        _eq(getattr(existing,"market_cap",None), agg["market_cap"]),
+                        getattr(existing,"market_cap_rank",None) == agg["market_cap_rank"],
+                        getattr(existing,"candle_source",None) == "daily_final",
+                    ]):
+                        monthly_unchanged += 1
+                        continue
+
+                    month_end_dt = dt.datetime(me.year, me.month, me.day, tzinfo=timezone.utc) - dt.timedelta(seconds=1)
+                    last_upd = agg.get("last_updated") or month_end_dt
+
+                    if not DRY_RUN:
+                        session.execute(
+                            INS_MONTHLY,
+                            [
+                                cid, ym,
+                                agg.get("symbol") or sym0,
+                                agg.get("name") or name0,
+                                agg["open"], agg["high"], agg["low"], agg["close"],
+                                float(agg.get("volume", 0.0) or 0.0),
+                                agg.get("market_cap"),
+                                agg.get("market_cap_rank"),
+                                agg.get("circulating_supply"),
+                                agg.get("total_supply"),
+                                "daily_final",
+                                last_upd,
+                            ],
+                            timeout=REQUEST_TIMEOUT,
+                        )
+                    monthly_wrote += 1
+
+                except Exception as e:
+                    monthly_err += 1
+                    print(f"[{_now_str()}] [monthly][WARN] {cid} {ym} failed: {e}")
+
+        print(f"[{_now_str()}] [monthly] done wrote={monthly_wrote} unchanged={monthly_unchanged} errors={monthly_err}")
 
     # ---------- Final Summary ----------
     coins_fixed_count = sum(1 for _id, n in coin_fix_counts.items() if n > 0)

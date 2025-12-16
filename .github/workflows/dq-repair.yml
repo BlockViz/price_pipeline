@@ -151,9 +151,10 @@ jobs:
 
           # Nightly-style window → look back further than just yesterday
           DQ_MODE: "NIGHTLY"
-          DQ_WINDOW_DAILY_DAYS: "30" # <-- fix: repair last 365 days daily
+          DQ_WINDOW_DAILY_DAYS: "30" # <-- fix: repair last 30 days daily
           DQ_WINDOW_10M_DAYS: "7"
           DQ_WINDOW_HOURLY_DAYS: "30" # still irrelevant here (no hourly repair)
+          RECOMPUTE_MONTHLY: "1"
 
           # Daily from 10m ON, no CoinGecko
           FIX_DAILY_FROM_10M: "1"
@@ -196,6 +197,7 @@ jobs:
           DQ_WINDOW_10M_DAYS: "7" # used only for FIX_DAILY_FROM_10M
           DQ_WINDOW_HOURLY_DAYS: "30" # repair last 30d hourly
           DQ_WINDOW_DAILY_DAYS: "365" # repair last 365d daily
+          RECOMPUTE_MONTHLY: "1"
 
           # Daily + hourly repair using CoinGecko
           FIX_DAILY_FROM_10M: "1" # use existing 10m to build daily when available
