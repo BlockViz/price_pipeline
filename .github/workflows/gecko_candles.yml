@@ -11,6 +11,10 @@ on:
         description: "EE_gck_create_daily_from_10m.py"
         required: false
         default: "true"
+      run_05:
+        description: "EG_gck_update_monthly_from_daily.py"
+        required: false
+        default: "true"
       TOP_N:
         description: "Override TOP_N"
         required: false
@@ -78,6 +82,7 @@ jobs:
 
       RUN_03: ${{ (github.event_name == 'schedule' && 'true') || (github.event.inputs.run_03 || 'true') }}
       RUN_04: ${{ (github.event_name == 'schedule' && 'true') || (github.event.inputs.run_04 || 'true') }}
+      RUN_05: ${{ (github.event_name == 'schedule' && 'true') || (github.event.inputs.run_05 || 'true') }}
 
       TOP_N_RESOLVED: ${{ (github.event.inputs.TOP_N != '' && github.event.inputs.TOP_N) || secrets.TOP_N || '200' }}
       VERBOSE_RESOLVED: ${{ github.event.inputs.VERBOSE_MODE || '0' }}
@@ -144,3 +149,21 @@ jobs:
           PROGRESS_EVERY: "20"
           VERBOSE_MODE: "${{ env.VERBOSE_RESOLVED }}"
         run: python prices/EE_gck_create_daily_from_10m.py
+
+      - name: 05 Update monthly from daily/live
+        if: env.RUN_05 == 'true'
+        timeout-minutes: 8
+        env:
+          COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
+          COINGECKO_API_TIER: ${{ secrets.COINGECKO_API_TIER }}
+          ASTRA_BUNDLE_PATH: secure-connect.zip
+          ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
+          ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
+
+          TOP_N: "${{ env.TOP_N_RESOLVED }}"
+          REQUEST_TIMEOUT_SEC: "40"
+          CONNECT_TIMEOUT_SEC: "15"
+          FETCH_SIZE: "500"
+          PROGRESS_EVERY: "20"
+          VERBOSE_MODE: "${{ env.VERBOSE_RESOLVED }}"
+        run: python prices/EG_gck_update_monthly_from_daily.py
