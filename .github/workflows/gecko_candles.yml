@@ -23,6 +23,10 @@ on:
         description: "Verbose (0/1)"
         required: false
         default: "0"
+      CURRENT_ONLY:
+        description: "Hourly: only prev_final + curr_partial (0/1)"
+        required: false
+        default: "0"
   schedule:
     - cron: "*/20 * * * *" # backup: every 20 minutes UTC
 
@@ -86,6 +90,7 @@ jobs:
 
       TOP_N_RESOLVED: ${{ (github.event.inputs.TOP_N != '' && github.event.inputs.TOP_N) || secrets.TOP_N || '200' }}
       VERBOSE_RESOLVED: ${{ github.event.inputs.VERBOSE_MODE || '0' }}
+      CURRENT_ONLY_RESOLVED: ${{ (github.event_name == 'schedule' && '1') || (github.event.inputs.CURRENT_ONLY || '0') }}
 
     steps:
       - uses: actions/checkout@v4
@@ -125,7 +130,7 @@ jobs:
           CONNECT_TIMEOUT_SEC: "15"
           FETCH_SIZE: "500"
           SLOT_DELAY_SEC: "120"
-          CURRENT_ONLY: "1"
+          CURRENT_ONLY: "${{ env.CURRENT_ONLY_RESOLVED }}"
           FINALIZE_PREV: "1"
           PROGRESS_EVERY: "20"
           VERBOSE_MODE: "${{ env.VERBOSE_RESOLVED }}"

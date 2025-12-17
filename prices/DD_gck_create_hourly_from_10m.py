@@ -45,9 +45,13 @@ FETCH_SIZE              = int(os.getenv("FETCH_SIZE", "500"))
 SLOT_DELAY_SEC          = int(os.getenv("SLOT_DELAY_SEC", "120"))   # guard against too-fresh 10m
 FINALIZE_PREV           = os.getenv("FINALIZE_PREV", "1") == "1"    # finalize previous hour once
 PROGRESS_EVERY          = int(os.getenv("PROGRESS_EVERY", "20"))
-VERBOSE_MODE            = os.getenv("VERBOSE_MODE", "1") == "1"
+VERBOSE_MODE            = os.getenv("VERBOSE_MODE", "0") == "1"
 MIN_10M_POINTS_FOR_FINAL= int(os.getenv("MIN_10M_POINTS_FOR_FINAL", "1"))  # allow finalize on a single 10m/carry point
-BACKFILL_HOURS          = int(os.getenv("BACKFILL_HOURS", "24"))  # 24h safety window to recover missed runs
+CURRENT_ONLY            = os.getenv("CURRENT_ONLY", "0") == "1"
+BOOTSTRAP_BACKFILL_HOURS= int(os.getenv("BOOTSTRAP_BACKFILL_HOURS", "24"))
+MAX_CATCHUP_HOURS        = int(os.getenv("MAX_CATCHUP_HOURS", "48"))
+WRITE_CONCURRENCY        = int(os.getenv("WRITE_CONCURRENCY", "32"))
+WATERMARK_SCAN_LIMIT     = 12
 
 # Table names (Gecko pipeline)
 TEN_MIN_TABLE           = os.getenv("TEN_MIN_TABLE", "gecko_prices_10m_7d")
@@ -88,6 +92,11 @@ def floor_10m(dt_utc: datetime) -> datetime:
     dt_utc = ensure_aware_utc(dt_utc)  # make aware UTC
     return dt_utc.replace(minute=(dt_utc.minute // 10) * 10, second=0, microsecond=0)
 
+def floor_hour(dt_utc: datetime) -> datetime:
+    """Floor to hour boundary (aware UTC in/out)."""
+    dt_utc = ensure_aware_utc(dt_utc)
+    return dt_utc.replace(minute=0, second=0, microsecond=0)
+
 # ───────────────────────── Misc helpers ─────────────────────────
 def sanitize_num(x, fallback=None):
     try:
@@ -116,40 +125,13 @@ session, cluster = get_session(return_cluster=True)
 print(f"[{now_str()}] Connected. keyspace='{session.keyspace}'")
 
 from cassandra.query import SimpleStatement
+from cassandra.concurrent import execute_concurrent_with_args
 
 # Live coins (use CoinGecko rank field)
 SEL_LIVE = SimpleStatement(
     f"SELECT id, symbol, name, market_cap_rank, category FROM {TABLE_LIVE}",
     fetch_size=FETCH_SIZE
 )
-
-def plan_windows() -> List[Tuple[datetime, datetime, bool, str]]:
-    """
-    Returns (startUTC, endUTC, is_final, label) windows:
-      - BACKFILL_HOURS closed hours before the current hour, as final
-      - Current hour as partial up to last safe 10m boundary
-    """
-    now_guarded = now_utc() - timedelta(seconds=SLOT_DELAY_SEC)
-    curr_start  = now_guarded.replace(minute=0, second=0, microsecond=0)
-    curr_end    = curr_start + timedelta(hours=1)
-    last_safe   = floor_10m(now_guarded)
-    curr_eff_end= min(curr_end, last_safe)
-
-    windows: List[Tuple[datetime, datetime, bool, str]] = []
-
-    # Backfill closed hours
-    if BACKFILL_HOURS > 0:
-        for i in range(BACKFILL_HOURS, 0, -1):
-            st = curr_start - timedelta(hours=i)
-            en = st + timedelta(hours=1)
-            label = f"backfill_h-{i}" if i > 1 else "prev_final"
-            windows.append((st, en, True, label))
-
-    # Current partial hour
-    if curr_eff_end > curr_start:
-        windows.append((curr_start, curr_eff_end, False, "curr_partial"))
-
-    return windows
 
 def main():
     # Prepare statements
@@ -159,7 +141,7 @@ def main():
       SELECT ts, price_usd, market_cap, volume_24h,
              market_cap_rank, circulating_supply, total_supply, last_updated
       FROM {TEN_MIN_TABLE}
-      WHERE id=? AND ts>=? AND ts<? ORDER BY ts ASC
+      WHERE id=? AND ts>=? AND ts<?
     """)
     SEL_10M_PREV = session.prepare(f"""
       SELECT ts, price_usd, market_cap, volume_24h,
@@ -171,6 +153,14 @@ def main():
       SELECT symbol, name, open, high, low, close, price_usd, market_cap, volume_24h,
              market_cap_rank, circulating_supply, total_supply, candle_source, last_updated
       FROM {HOURLY_TABLE} WHERE id=? AND ts=? LIMIT 1
+    """)
+    SEL_HOURLY_LATEST = session.prepare(f"""
+      SELECT ts, candle_source, last_updated
+      FROM {HOURLY_TABLE} WHERE id=? ORDER BY ts DESC LIMIT 1
+    """)
+    SEL_HOURLY_RECENT = session.prepare(f"""
+      SELECT ts, candle_source
+      FROM {HOURLY_TABLE} WHERE id=? ORDER BY ts DESC LIMIT {WATERMARK_SCAN_LIMIT}
     """)
     # Cassandra INSERT is an upsert; use intentionally.
     INS_UPSERT = session.prepare(f"""
@@ -187,16 +177,15 @@ def main():
     """)
     print(f"[{now_str()}] Prepared in {time.time()-t0:.2f}s")
 
-    # Plan windows
-    windows = plan_windows()
-    if not windows:
-        print(f"[{now_str()}] Nothing to do (no safe 10m yet).")
-        return
-    w_desc = ", ".join([
-        f"[{lbl}:{'final' if fin else 'partial'} {st.isoformat()}→{en.isoformat()}]"
-        for st, en, fin, lbl in windows
-    ])
-    print(f"[{now_str()}] Windows: {w_desc}")
+    # Time anchors
+    now_guarded = now_utc() - timedelta(seconds=SLOT_DELAY_SEC)
+    curr_hour_start = floor_hour(now_guarded)
+    curr_hour_end = curr_hour_start + timedelta(hours=1)
+    partial_end = min(curr_hour_end, floor_10m(now_guarded))
+    partial_needed = partial_end > curr_hour_start
+    prev_final = curr_hour_start - timedelta(hours=1)
+
+    print(f"[{now_str()}] Anchor hour={curr_hour_start.isoformat()} partial_end={(partial_end.isoformat() if partial_needed else 'none')} CURRENT_ONLY={CURRENT_ONLY}")
 
     # Load coins
     print(f"[{now_str()}] Loading top coins…")
@@ -226,220 +215,351 @@ def main():
 
     wrote = skipped = empty = errors = finalized_skips = unchanged_skips = 0
 
+    def iter_hours(start: datetime, end: datetime):
+        h = start
+        while h < end:
+            yield h
+            h += timedelta(hours=1)
+
+    def make_bucket() -> Dict[str, Any]:
+        return {
+            "price_count": 0,
+            "earliest_ts": None,
+            "latest_ts": None,
+            "open": None,
+            "close": None,
+            "high": None,
+            "low": None,
+            "last_updated": None,
+            "mcap": None, "mcap_ts": None,
+            "vol": None, "vol_ts": None,
+            "rank": None, "rank_ts": None,
+            "circ": None, "circ_ts": None,
+            "tot": None, "tot_ts": None,
+        }
+
+    def update_last_non_null(bucket: Dict[str, Any], key: str, ts_key: str, value, row_ts: datetime) -> None:
+        if value is None:
+            return
+        if bucket[ts_key] is None or row_ts >= bucket[ts_key]:
+            bucket[key] = value
+            bucket[ts_key] = row_ts
+
+    def update_bucket(bucket: Dict[str, Any], row_ts: datetime, row) -> None:
+        price = getattr(row, "price_usd", None)
+        if price is not None:
+            price = float(price)
+            bucket["price_count"] += 1
+            if bucket["earliest_ts"] is None or row_ts < bucket["earliest_ts"]:
+                bucket["earliest_ts"] = row_ts
+                bucket["open"] = price
+            if bucket["latest_ts"] is None or row_ts > bucket["latest_ts"]:
+                bucket["latest_ts"] = row_ts
+                bucket["close"] = price
+            if bucket["high"] is None or price > bucket["high"]:
+                bucket["high"] = price
+            if bucket["low"] is None or price < bucket["low"]:
+                bucket["low"] = price
+
+        lu = ensure_aware_utc(getattr(row, "last_updated", None))
+        if lu is not None and (bucket["last_updated"] is None or lu > bucket["last_updated"]):
+            bucket["last_updated"] = lu
+
+        update_last_non_null(bucket, "mcap", "mcap_ts", sanitize_num(getattr(row, "market_cap", None)), row_ts)
+        update_last_non_null(bucket, "vol",  "vol_ts",  sanitize_num(getattr(row, "volume_24h", None)), row_ts)
+        rank_val = getattr(row, "market_cap_rank", None)
+        update_last_non_null(bucket, "rank", "rank_ts", int(rank_val) if rank_val is not None else None, row_ts)
+        update_last_non_null(bucket, "circ", "circ_ts", sanitize_num(getattr(row, "circulating_supply", None)), row_ts)
+        update_last_non_null(bucket, "tot",  "tot_ts",  sanitize_num(getattr(row, "total_supply", None)), row_ts)
+
+    def get_latest_final_ts(coin_id):
+        try:
+            row = session.execute(SEL_HOURLY_LATEST.bind([coin_id]), timeout=REQUEST_TIMEOUT).one()
+            if row and getattr(row, "ts", None):
+                if getattr(row, "candle_source", None) == "10m_final":
+                    return ensure_aware_utc(row.ts)
+        except Exception as e:
+            vprint(f"[{now_str()}] [WATERMARK-ERR] {coin_id}: {e} (fallback to recent scan)")
+
+        try:
+            for r in session.execute(SEL_HOURLY_RECENT.bind([coin_id]), timeout=REQUEST_TIMEOUT):
+                if getattr(r, "candle_source", None) == "10m_final" and getattr(r, "ts", None):
+                    return ensure_aware_utc(r.ts)
+        except Exception as e:
+            vprint(f"[{now_str()}] [WATERMARK-SCAN-ERR] {coin_id}: {e}")
+        return None
+
     for ci, c in enumerate(coins, 1):
         if ci == 1 or ci % PROGRESS_EVERY == 0 or ci == len(coins):
             print(f"[{now_str()}] → Coin {ci}/{len(coins)}: {getattr(c,'symbol','?')} ({getattr(c,'id','?')}) r={getattr(c,'market_cap_rank','?')}")
 
         coin_category = (getattr(c, 'category', None) or 'Other').strip() or 'Other'
 
-        for (start, end, is_final, label) in windows:
-            # Fetch 10m points within the hour window (bind as naive UTC)
+        watermark_ts = get_latest_final_ts(c.id)
+        if watermark_ts:
+            watermark_hour = floor_hour(watermark_ts)
+            start_hour = watermark_hour + timedelta(hours=1)
+        else:
+            watermark_hour = None
+            start_hour = curr_hour_start - timedelta(hours=BOOTSTRAP_BACKFILL_HOURS)
+
+        end_final_hour_excl = curr_hour_start
+        if MAX_CATCHUP_HOURS > 0:
+            max_start = end_final_hour_excl - timedelta(hours=MAX_CATCHUP_HOURS)
+            if start_hour < max_start:
+                print(f"[{now_str()}]    {c.symbol} clamp start {start_hour.isoformat()} -> {max_start.isoformat()} (MAX_CATCHUP_HOURS={MAX_CATCHUP_HOURS})")
+                start_hour = max_start
+
+        hours: List[Tuple[datetime, datetime, bool]] = []
+        if CURRENT_ONLY:
+            hours.append((prev_final, prev_final + timedelta(hours=1), True))
+        else:
+            for h in iter_hours(start_hour, end_final_hour_excl):
+                hours.append((h, h + timedelta(hours=1), True))
+        if partial_needed:
+            hours.append((curr_hour_start, partial_end, False))
+
+        vprint(
+            f"[{now_str()}]    {c.symbol} watermark={(watermark_hour.isoformat() if watermark_hour else 'none')} "
+            f"final_range=[{start_hour.isoformat()},{end_final_hour_excl.isoformat()}) "
+            f"partial_end={(partial_end.isoformat() if partial_needed else 'none')} hours={len(hours)}"
+        )
+
+        if not hours:
+            continue
+
+        range_start = min(h[0] for h in hours)
+        range_end = max(h[1] for h in hours)
+        buckets: Dict[datetime, Dict[str, Any]] = {}
+
+        # Fetch 10m points for the whole span
+        try:
+            bstart = to_cassandra_ts(range_start)
+            bend   = to_cassandra_ts(range_end)
+            bound = SEL_10M_RANGE.bind([c.id, bstart, bend]); bound.fetch_size = FETCH_SIZE
+            t_read = time.time()
+            row_count = 0
+            for p in session.execute(bound, timeout=REQUEST_TIMEOUT):
+                row_count += 1
+                ts = ensure_aware_utc(getattr(p, "ts", None))
+                if ts is None:
+                    continue
+                hour_start = floor_hour(ts)
+                bucket = buckets.setdefault(hour_start, make_bucket())
+                update_bucket(bucket, ts, p)
+            vprint(f"[{now_str()}]    {c.symbol} {range_start.isoformat()}→{range_end.isoformat()} got {row_count} 10m pts in {time.time()-t_read:.2f}s")
+        except Exception as e:
+            errors += 1
+            print(f"[{now_str()}] [READ-ERR] {c.symbol} {range_start.isoformat()}→{range_end.isoformat()}: {e}")
+            skipped += 1
+            continue
+
+        existing_cache: Dict[datetime, Any] = {}
+        existing_last_upd_cache: Dict[datetime, datetime | None] = {}
+
+        def get_existing(hour_start: datetime):
+            if hour_start in existing_cache:
+                return existing_cache[hour_start]
             try:
-                bstart = to_cassandra_ts(start)
-                bend   = to_cassandra_ts(end)
-                bound = SEL_10M_RANGE.bind([c.id, bstart, bend]); bound.fetch_size = 64
-                t_read = time.time()
-                pts = list(session.execute(bound, timeout=REQUEST_TIMEOUT))
-                vprint(f"[{now_str()}]    {c.symbol} {start.isoformat()}→{end.isoformat()} got {len(pts)} 10m pts in {time.time()-t_read:.2f}s")
+                bound_hour = SEL_HOURLY_ONE.bind([c.id, to_cassandra_ts(hour_start)])
+                existing = session.execute(bound_hour, timeout=REQUEST_TIMEOUT).one()
+                existing_cache[hour_start] = existing
+                existing_last_upd_cache[hour_start] = ensure_aware_utc(getattr(existing, "last_updated", None)) if existing else None
+                return existing
             except Exception as e:
-                errors += 1
-                print(f"[{now_str()}] [READ-ERR] {c.symbol} {start.isoformat()}→{end.isoformat()}: {e}")
+                existing_cache[hour_start] = None
+                existing_last_upd_cache[hour_start] = None
+                vprint(f"[{now_str()}] [EXIST-ERR] {c.symbol} {hour_start.isoformat()}: {e} (treat as no row)")
+                return None
+
+        def add_prev_point_if_available(hour_start: datetime) -> bool:
+            try:
+                prev = session.execute(
+                    SEL_10M_PREV.bind([c.id, to_cassandra_ts(hour_start)]),
+                    timeout=REQUEST_TIMEOUT
+                ).one()
+            except Exception as e:
+                vprint(f"[{now_str()}] [PREV-ERR] {c.symbol} < {hour_start.isoformat()}: {e}")
+                return False
+            if prev and prev.price_usd is not None:
+                ts_prev = ensure_aware_utc(getattr(prev, "ts", None)) or hour_start
+                bucket = buckets.setdefault(hour_start, make_bucket())
+                update_bucket(bucket, ts_prev, prev)
+                return True
+            return False
+
+        hourly_upsert_args: List[Tuple[Any, ...]] = []
+        hourly_upsert_meta: List[Dict[str, Any]] = []
+
+        for start, end, is_final in hours:
+            bucket = buckets.get(start)
+            price_count = bucket["price_count"] if bucket else 0
+
+            if is_final and price_count < MIN_10M_POINTS_FOR_FINAL:
+                vprint(f"[{now_str()}]    {c.symbol} {start.isoformat()} final: insufficient 10m points ({price_count}) → aggregate existing; skip write")
+                existing = get_existing(start)
+                if existing:
+                    mcap_exist = sanitize_num(getattr(existing, "market_cap", None), 0.0)
+                    vol_exist  = sanitize_num(getattr(existing, "volume_24h", None), 0.0)
+                    last_upd   = existing_last_upd_cache.get(start) or (end - timedelta(seconds=1))
+                    bump_hour_total(start, coin_category, mcap_exist, vol_exist, last_upd)
+                    bump_hour_total(start, 'ALL',        mcap_exist, vol_exist, last_upd)
                 skipped += 1
                 continue
 
-            # Fetch any existing hourly row up-front so we can include it in aggregates even if we skip writing
-            try:
-                bound_hour = SEL_HOURLY_ONE.bind([c.id, to_cassandra_ts(start)])
-                existing = session.execute(bound_hour, timeout=REQUEST_TIMEOUT).one()
-                # Keep a local normalized timestamp instead of mutating the Row (Rows are immutable)
-                existing_last_upd = ensure_aware_utc(getattr(existing, "last_updated", None)) if existing else None
-            except Exception as e:
-                existing = None
-                existing_last_upd = None
-                vprint(f"[{now_str()}] [EXIST-ERR] {c.symbol} {start.isoformat()}: {e} (treat as no row)")
-
-            # Build aggregates from 10m
-            prices, mcaps, vols = [], [], []
-            ranks, circs, tots = [], [], []
-            last_upd_candidates: List[datetime] = []
-
-            def add_prev_point_if_available() -> bool:
-                """Carry the latest 10m point before the window start when inside-slot data is missing."""
-                try:
-                    prev = session.execute(
-                        SEL_10M_PREV.bind([c.id, to_cassandra_ts(start)]),
-                        timeout=REQUEST_TIMEOUT
-                    ).one()
-                except Exception as e:
-                    vprint(f"[{now_str()}] [PREV-ERR] {c.symbol} < {start.isoformat()}: {e}")
-                    return False
-
-                if prev and prev.price_usd is not None:
-                    prices.append(float(prev.price_usd))
-                    if prev.market_cap  is not None: mcaps.append(float(prev.market_cap))
-                    if prev.volume_24h  is not None: vols.append(float(prev.volume_24h))
-                    if getattr(prev, "market_cap_rank", None)    is not None: ranks.append(int(prev.market_cap_rank))
-                    if getattr(prev, "circulating_supply", None) is not None: circs.append(float(prev.circulating_supply))
-                    if getattr(prev, "total_supply", None)       is not None: tots.append(float(prev.total_supply))
-                    lu_prev = ensure_aware_utc(getattr(prev, "last_updated", None))
-                    if lu_prev is not None: last_upd_candidates.append(lu_prev)
-                    return True
-                return False
-
-            for p in pts:
-                # Normalize last_updated from 10m rows to aware UTC
-                lu = ensure_aware_utc(getattr(p, "last_updated", None))
-                if p.price_usd   is not None: prices.append(float(p.price_usd))
-                if p.market_cap  is not None: mcaps.append(float(p.market_cap))
-                if p.volume_24h  is not None: vols.append(float(p.volume_24h))
-                if getattr(p, "market_cap_rank", None)       is not None: ranks.append(int(p.market_cap_rank))
-                if getattr(p, "circulating_supply", None)    is not None: circs.append(float(p.circulating_supply))
-                if getattr(p, "total_supply", None)          is not None: tots.append(float(p.total_supply))
-                if lu is not None: last_upd_candidates.append(lu)
-
-            # For a closed hour, require at least MIN_10M_POINTS_FOR_FINAL points; if empty, try carry; otherwise aggregate existing and skip.
-            if is_final and len(prices) < MIN_10M_POINTS_FOR_FINAL:
-                if not prices:
-                    add_prev_point_if_available()
-                if len(prices) < MIN_10M_POINTS_FOR_FINAL:
-                    vprint(f"[{now_str()}]    {c.symbol} {start.isoformat()} final: insufficient 10m points ({len(prices)}) → aggregate existing; skip write")
+            if not is_final and price_count == 0:
+                added = add_prev_point_if_available(start)
+                if not added:
+                    existing = get_existing(start)
                     if existing:
                         mcap_exist = sanitize_num(getattr(existing, "market_cap", None), 0.0)
                         vol_exist  = sanitize_num(getattr(existing, "volume_24h", None), 0.0)
-                        last_upd   = existing_last_upd or (end - timedelta(seconds=1))
-                        bump_hour_total(start, coin_category, mcap_exist, vol_exist, last_upd)
-                        bump_hour_total(start, 'ALL',        mcap_exist, vol_exist, last_upd)
-                    skipped += 1
-                    continue
-
-            if not prices:
-                # Try to carry price (and extras) from the most recent 10m before start (only for partial hour)
-                if not is_final:
-                    added = add_prev_point_if_available()
-                    if not added:
-                        # No 10m and no prev — still include existing candle (if any) in aggregates
-                        if existing:
-                            mcap_exist = sanitize_num(getattr(existing, "market_cap", None), 0.0)
-                            vol_exist  = sanitize_num(getattr(existing, "volume_24h", None), 0.0)
-                            last_upd   = existing_last_upd or (end - timedelta(seconds=1))
-                            bump_hour_total(start, coin_category, mcap_exist, vol_exist, last_upd)
-                            bump_hour_total(start, 'ALL',        mcap_exist, vol_exist, last_upd)
-                        empty += 1
-                        vprint(f"[{now_str()}]    {c.symbol} {start.isoformat()} empty (no 10m & no prev) → aggregate existing if present; skip write")
-                        continue
-                else:
-                    # final hour with no points — aggregate existing if present; skip write
-                    if existing:
-                        mcap_exist = sanitize_num(getattr(existing, "market_cap", None), 0.0)
-                        vol_exist  = sanitize_num(getattr(existing, "volume_24h", None), 0.0)
-                        last_upd   = existing_last_upd or (end - timedelta(seconds=1))
+                        last_upd   = existing_last_upd_cache.get(start) or (end - timedelta(seconds=1))
                         bump_hour_total(start, coin_category, mcap_exist, vol_exist, last_upd)
                         bump_hour_total(start, 'ALL',        mcap_exist, vol_exist, last_upd)
                     empty += 1
-                    vprint(f"[{now_str()}]    {c.symbol} {start.isoformat()} empty (final hour) → aggregate existing if present; skip write")
+                    vprint(f"[{now_str()}]    {c.symbol} {start.isoformat()} empty (no 10m & no prev) → aggregate existing if present; skip write")
                     continue
+                bucket = buckets.get(start)
+                price_count = bucket["price_count"] if bucket else 0
 
-            # OHLC from 10m within hour (or carried prev for open)
-            o  = prices[0]
-            h  = max(prices)
-            l  = min(prices)
-            cl = prices[-1]
+            if not bucket or price_count == 0:
+                existing = get_existing(start)
+                if existing:
+                    mcap_exist = sanitize_num(getattr(existing, "market_cap", None), 0.0)
+                    vol_exist  = sanitize_num(getattr(existing, "volume_24h", None), 0.0)
+                    last_upd   = existing_last_upd_cache.get(start) or (end - timedelta(seconds=1))
+                    bump_hour_total(start, coin_category, mcap_exist, vol_exist, last_upd)
+                    bump_hour_total(start, 'ALL',        mcap_exist, vol_exist, last_upd)
+                empty += 1
+                kind = "final hour" if is_final else "partial hour"
+                vprint(f"[{now_str()}]    {c.symbol} {start.isoformat()} empty ({kind}) → aggregate existing if present; skip write")
+                continue
 
-            # Last known within hour (or carried prev) for ancillary fields
-            mcap = mcaps[-1] if mcaps else None
-            vol  = vols[-1]  if vols  else None
-            rank = ranks[-1] if ranks else None
-            circ = circs[-1] if circs else None
-            tot  = tots[-1]  if tots  else None
+            o = bucket["open"]
+            h = bucket["high"]
+            l = bucket["low"]
+            cl = bucket["close"]
 
-            # Fallback to existing row for ancillary fields (avoid nulling established values)
-            if existing:
-                if mcap is None: mcap = sanitize_num(getattr(existing, "market_cap", None))
-                if vol  is None: vol  = sanitize_num(getattr(existing, "volume_24h", None))
-                if rank is None: rank = getattr(existing, "market_cap_rank", None)
-                if circ is None: circ = sanitize_num(getattr(existing, "circulating_supply", None))
-                if tot  is None:  tot  = sanitize_num(getattr(existing, "total_supply", None))
+            mcap = bucket["mcap"]
+            vol  = bucket["vol"]
+            rank = bucket["rank"]
+            circ = bucket["circ"]
+            tot  = bucket["tot"]
 
-            # Defaults if still None
+            if mcap is None or vol is None or rank is None or circ is None or tot is None:
+                existing = get_existing(start)
+                if existing:
+                    if mcap is None: mcap = sanitize_num(getattr(existing, "market_cap", None))
+                    if vol  is None: vol  = sanitize_num(getattr(existing, "volume_24h", None))
+                    if rank is None: rank = getattr(existing, "market_cap_rank", None)
+                    if circ is None: circ = sanitize_num(getattr(existing, "circulating_supply", None))
+                    if tot  is None:  tot  = sanitize_num(getattr(existing, "total_supply", None))
+
             if mcap is None: mcap = 0.0
             if vol  is None: vol  = 0.0
 
-            # Determine candle_source label and last_updated
             candle_source = "10m_final" if is_final else "10m_partial"
-            if last_upd_candidates:
-                last_upd = max(last_upd_candidates)
+            last_upd = bucket["last_updated"] or (end - timedelta(seconds=1))
+
+            existing = None
+            if is_final:
+                existing = get_existing(start)
+                if existing and getattr(existing, "candle_source", None) == "10m_final":
+                    same = all([
+                        equalish(o, existing.open),
+                        equalish(h, existing.high),
+                        equalish(l, existing.low),
+                        equalish(cl, existing.close),
+                        equalish(cl, existing.price_usd),
+                        equalish(mcap, existing.market_cap),
+                        equalish(vol,  existing.volume_24h),
+                        (rank == getattr(existing, "market_cap_rank", None)),
+                        equalish(circ, getattr(existing, "circulating_supply", None)),
+                        equalish(tot,  getattr(existing, "total_supply", None)),
+                    ])
+                    if same:
+                        mcap_exist = sanitize_num(getattr(existing, "market_cap", None), 0.0)
+                        vol_exist  = sanitize_num(getattr(existing, "volume_24h", None), 0.0)
+                        last_upd_e = existing_last_upd_cache.get(start) or (end - timedelta(seconds=1))
+                        bump_hour_total(start, coin_category, mcap_exist, vol_exist, last_upd_e)
+                        bump_hour_total(start, 'ALL',        mcap_exist, vol_exist, last_upd_e)
+                        finalized_skips += 1
+                        vprint(f"[{now_str()}]    {c.symbol} {start.isoformat()} already final & identical → aggregate existing; skip write")
+                        continue
             else:
-                # if we carried prev or had no last_updated in 10m rows, clamp to hour end - 1s
-                last_upd = (end - timedelta(seconds=1))
+                existing = get_existing(start)
+                if existing and getattr(existing, "candle_source", None) == "10m_partial":
+                    same = all([
+                        equalish(o, existing.open),
+                        equalish(h, existing.high),
+                        equalish(l, existing.low),
+                        equalish(cl, existing.close),
+                        equalish(cl, existing.price_usd),
+                        equalish(mcap, existing.market_cap),
+                        equalish(vol,  existing.volume_24h),
+                        (rank == getattr(existing, "market_cap_rank", None)),
+                        equalish(circ, getattr(existing, "circulating_supply", None)),
+                        equalish(tot,  getattr(existing, "total_supply", None)),
+                    ])
+                    if same:
+                        mcap_exist = sanitize_num(getattr(existing, "market_cap", None), 0.0)
+                        vol_exist  = sanitize_num(getattr(existing, "volume_24h", None), 0.0)
+                        last_upd_e = existing_last_upd_cache.get(start) or (end - timedelta(seconds=1))
+                        bump_hour_total(start, coin_category, mcap_exist, vol_exist, last_upd_e)
+                        bump_hour_total(start, 'ALL',        mcap_exist, vol_exist, last_upd_e)
+                        unchanged_skips += 1
+                        vprint(f"[{now_str()}]    {c.symbol} {start.isoformat()} partial unchanged → aggregate existing; skip write")
+                        continue
 
-            # Skip write if already final & identical, BUT include existing in aggregates
-            if is_final and existing and getattr(existing, "candle_source", None) == "10m_final":
-                same = all([
-                    equalish(o, existing.open),
-                    equalish(h, existing.high),
-                    equalish(l, existing.low),
-                    equalish(cl, existing.close),
-                    equalish(cl, existing.price_usd),
-                    equalish(mcap, existing.market_cap),
-                    equalish(vol,  existing.volume_24h),
-                    (rank == getattr(existing, "market_cap_rank", None)),
-                    equalish(circ, getattr(existing, "circulating_supply", None)),
-                    equalish(tot,  getattr(existing, "total_supply", None)),
-                ])
-                if same:
-                    mcap_exist = sanitize_num(getattr(existing, "market_cap", None), 0.0)
-                    vol_exist  = sanitize_num(getattr(existing, "volume_24h", None), 0.0)
-                    last_upd_e = existing_last_upd or (end - timedelta(seconds=1))
-                    bump_hour_total(start, coin_category, mcap_exist, vol_exist, last_upd_e)
-                    bump_hour_total(start, 'ALL',        mcap_exist, vol_exist, last_upd_e)
-                    finalized_skips += 1
-                    vprint(f"[{now_str()}]    {c.symbol} {start.isoformat()} already final & identical → aggregate existing; skip write")
-                    continue
+            hourly_upsert_args.append(
+                [c.id, to_cassandra_ts(start), c.symbol, c.name,
+                 o, h, l, cl, cl,
+                 mcap, vol, rank, circ, tot,
+                 candle_source, to_cassandra_ts(last_upd)]
+            )
+            hourly_upsert_meta.append(
+                {
+                    "symbol": c.symbol,
+                    "start": start,
+                    "end": end,
+                    "category": coin_category,
+                    "mcap": mcap,
+                    "vol": vol,
+                    "rank": rank,
+                    "circ": circ,
+                    "tot": tot,
+                    "o": o,
+                    "h": h,
+                    "l": l,
+                    "cl": cl,
+                    "last_upd": last_upd,
+                    "candle_source": candle_source,
+                }
+            )
 
-            # For partials, skip writing when unchanged vs existing partial (reduces churn) BUT include existing in aggregates
-            if (not is_final) and existing and getattr(existing, "candle_source", None) == "10m_partial":
-                same = all([
-                    equalish(o, existing.open),
-                    equalish(h, existing.high),
-                    equalish(l, existing.low),
-                    equalish(cl, existing.close),
-                    equalish(cl, existing.price_usd),
-                    equalish(mcap, existing.market_cap),
-                    equalish(vol,  existing.volume_24h),
-                    (rank == getattr(existing, "market_cap_rank", None)),
-                    equalish(circ, getattr(existing, "circulating_supply", None)),
-                    equalish(tot,  getattr(existing, "total_supply", None)),
-                ])
-                if same:
-                    mcap_exist = sanitize_num(getattr(existing, "market_cap", None), 0.0)
-                    vol_exist  = sanitize_num(getattr(existing, "volume_24h", None), 0.0)
-                    last_upd_e = existing_last_upd or (end - timedelta(seconds=1))
-                    bump_hour_total(start, coin_category, mcap_exist, vol_exist, last_upd_e)
-                    bump_hour_total(start, 'ALL',        mcap_exist, vol_exist, last_upd_e)
-                    unchanged_skips += 1
-                    vprint(f"[{now_str()}]    {c.symbol} {start.isoformat()} partial unchanged → aggregate existing; skip write")
-                    continue
-
-            # UPSERT the hourly row (bind timestamps as naive UTC)
-            try:
-                session.execute(
-                    INS_UPSERT,
-                    [c.id, to_cassandra_ts(start), c.symbol, c.name,
-                     o, h, l, cl, cl,
-                     mcap, vol, rank, circ, tot,
-                     candle_source, to_cassandra_ts(last_upd)],
-                    timeout=REQUEST_TIMEOUT
-                )
-                # Include the freshly written values in aggregates
-                bump_hour_total(start, coin_category, mcap, vol, last_upd)
-                bump_hour_total(start, 'ALL',        mcap, vol, last_upd)
-                vprint(f"[{now_str()}]    UPSERT {c.symbol} {start.isoformat()} ({candle_source}) "
-                       f"O={o} H={h} L={l} C={cl} M={mcap} V={vol} R={rank} CS={circ} TS={tot} LU={last_upd.isoformat()}")
-                wrote += 1
-            except Exception as e:
-                errors += 1
-                print(f"[{now_str()}] [WRITE-ERR] {c.symbol} {start.isoformat()}: {e}")
-                skipped += 1
+        if hourly_upsert_args:
+            results = execute_concurrent_with_args(
+                session,
+                INS_UPSERT,
+                hourly_upsert_args,
+                concurrency=WRITE_CONCURRENCY,
+                raise_on_first_error=False,
+            )
+            for (success, result), meta in zip(results, hourly_upsert_meta):
+                if success:
+                    bump_hour_total(meta["start"], meta["category"], meta["mcap"], meta["vol"], meta["last_upd"])
+                    bump_hour_total(meta["start"], 'ALL',        meta["mcap"], meta["vol"], meta["last_upd"])
+                    vprint(
+                        f"[{now_str()}]    UPSERT {meta['symbol']} {meta['start'].isoformat()} ({meta['candle_source']}) "
+                        f"O={meta['o']} H={meta['h']} L={meta['l']} C={meta['cl']} M={meta['mcap']} V={meta['vol']} "
+                        f"R={meta['rank']} CS={meta['circ']} TS={meta['tot']} LU={meta['last_upd'].isoformat()}"
+                    )
+                    wrote += 1
+                else:
+                    errors += 1
+                    skipped += 1
+                    print(f"[{now_str()}] [WRITE-ERR] {meta['symbol']} {meta['start'].isoformat()}: {result}")
 
     # Write category aggregates
     
@@ -461,6 +581,8 @@ def main():
 
         # ➋ Upsert rows with computed rank
         agg_written = 0
+        agg_args: List[List[Any]] = []
+        agg_meta: List[Dict[str, Any]] = []
         for (slot_start, category), totals in sorted(
             hour_totals.items(),
             key=lambda kv: (kv[0][0], 0 if kv[0][1] == 'ALL' else 1, kv[0][1].lower())
@@ -468,27 +590,48 @@ def main():
             last_upd = totals.get('last_updated') or (slot_start + timedelta(hours=1) - timedelta(seconds=1))
             rank_value = rank_map.get((slot_start, category))  # None if unseen → leave null
 
-            try:
-                session.execute(
-                    INS_MCAP_HOURLY,
-                    [
-                        category,
-                        to_cassandra_ts(slot_start),
-                        to_cassandra_ts(last_upd),
-                        float(totals['market_cap']),
-                        rank_value,
-                        float(totals['volume_24h']),
-                    ],
-                    timeout=REQUEST_TIMEOUT,
-                )
-                vprint(
-                    f"[{now_str()}]    MCAP_AGG [{category}] {slot_start.isoformat()} "
-                    f"M={totals['market_cap']:.6f} V={totals['volume_24h']:.6f} "
-                    f"RANK={rank_value} LU={last_upd.isoformat()}"
-                )
-                agg_written += 1
-            except Exception as e:
-                print(f"[{now_str()}] [mcap-hourly] failed for category='{category}' slot={slot_start.isoformat()}: {e}")
+            agg_args.append(
+                [
+                    category,
+                    to_cassandra_ts(slot_start),
+                    to_cassandra_ts(last_upd),
+                    float(totals['market_cap']),
+                    rank_value,
+                    float(totals['volume_24h']),
+                ]
+            )
+            agg_meta.append(
+                {
+                    "category": category,
+                    "slot_start": slot_start,
+                    "last_upd": last_upd,
+                    "rank_value": rank_value,
+                    "market_cap": totals["market_cap"],
+                    "volume_24h": totals["volume_24h"],
+                }
+            )
+
+        if agg_args:
+            results = execute_concurrent_with_args(
+                session,
+                INS_MCAP_HOURLY,
+                agg_args,
+                concurrency=WRITE_CONCURRENCY,
+                raise_on_first_error=False,
+            )
+            for (success, result), meta in zip(results, agg_meta):
+                if success:
+                    vprint(
+                        f"[{now_str()}]    MCAP_AGG [{meta['category']}] {meta['slot_start'].isoformat()} "
+                        f"M={meta['market_cap']:.6f} V={meta['volume_24h']:.6f} "
+                        f"RANK={meta['rank_value']} LU={meta['last_upd'].isoformat()}"
+                    )
+                    agg_written += 1
+                else:
+                    print(
+                        f"[{now_str()}] [mcap-hourly] failed for category='{meta['category']}' "
+                        f"slot={meta['slot_start'].isoformat()}: {result}"
+                    )
         print(f"[{now_str()}] [mcap-hourly] rows_written={agg_written}")
     else:
         print(f"[{now_str()}] [mcap-hourly] no aggregates captured (coins={len(coins)})")

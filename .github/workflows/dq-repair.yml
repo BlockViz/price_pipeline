@@ -161,7 +161,7 @@ jobs:
           BACKFILL_DAILY_FROM_API: "0" # disable API
           SEED_10M_FROM_DAILY: "0" # keep synthetic 10m off unless you want it
           FILL_HOURLY: "1" # enable hourly interpolation-only in the daily pass
-          FILL_HOURLY_BADSCAN: "1"
+          FILL_HOURLY_BADSCAN: "0"
           FILL_HOURLY_FROM_API: "0" # keep API off for daily; use interp/carry from 10m
           INTERPOLATE_IF_API_MISS: "1" # allow interpolation/carry when API is disabled
 

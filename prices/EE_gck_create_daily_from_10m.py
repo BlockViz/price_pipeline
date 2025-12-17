@@ -1,37 +1,78 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # backend/prices/EE_gck_create_daily_from_10m.py
 
 import os, time
 from datetime import datetime, timedelta, timezone, date
-from typing import Dict, Tuple, Any
+from typing import Dict, Tuple, Any, List
 
-# ───────────────────────── Astra connector ─────────────────────────
+# Astra connector
 from astra_connect.connect import get_session, AstraConfig
 AstraConfig.from_env()  # loads .env if present, otherwise uses process env
 
-# ───────────────────────── Config ─────────────────────────
+# Config
 TOP_N               = int(os.getenv("TOP_N", "200"))
 REQUEST_TIMEOUT     = int(os.getenv("REQUEST_TIMEOUT_SEC", "30"))
 FETCH_SIZE          = int(os.getenv("FETCH_SIZE", "500"))
 
 # Behavior
-SLOT_DELAY_SEC      = int(os.getenv("SLOT_DELAY_SEC", "120"))     # guard against too-fresh 10m slot
-PROGRESS_EVERY      = int(os.getenv("PROGRESS_EVERY", "20"))      # coin progress interval
-VERBOSE_MODE        = os.getenv("VERBOSE_MODE", "0") == "1"       # extra per-coin logs
-MIN_10M_POINTS_FOR_FINAL = int(os.getenv("MIN_10M_POINTS_FOR_FINAL", "2"))  # require ≥2 points to finalize a closed day
+SLOT_DELAY_SEC      = int(os.getenv("SLOT_DELAY_SEC", "120"))
+PROGRESS_EVERY      = int(os.getenv("PROGRESS_EVERY", "20"))
+VERBOSE_MODE        = os.getenv("VERBOSE_MODE", "0") == "1"
+MIN_10M_POINTS_FOR_FINAL = int(os.getenv("MIN_10M_POINTS_FOR_FINAL", "2"))
+BOOTSTRAP_BACKFILL_DAYS  = int(os.getenv("BOOTSTRAP_BACKFILL_DAYS", "7"))
+MAX_CATCHUP_DAYS         = min(int(os.getenv("MAX_CATCHUP_DAYS", "7")), 7)
+WATERMARK_SCAN_LIMIT     = 12
 
 TEN_MIN_TABLE       = os.getenv("TEN_MIN_TABLE", "gecko_prices_10m_7d")
 DAILY_TABLE         = os.getenv("DAILY_TABLE", "gecko_candles_daily_contin")
 TABLE_LIVE          = os.getenv("TABLE_LIVE", "gecko_prices_live")
 TABLE_MCAP_DAILY    = os.getenv("TABLE_MCAP_DAILY", "gecko_market_cap_daily_contin")
 
-def now_str():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+UTC = timezone.utc
+
+def now_utc() -> datetime:
+    return datetime.now(UTC)
+
+def now_str() -> str:
+    return now_utc().strftime("%Y-%m-%d %H:%M:%S")
+
+def ensure_aware_utc(dt: datetime | None) -> datetime | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
+
+def to_cassandra_ts(dt: datetime) -> datetime:
+    if dt.tzinfo is not None:
+        return dt.astimezone(UTC).replace(tzinfo=None)
+    return dt
 
 def floor_10m(dt_utc: datetime) -> datetime:
-    if dt_utc.tzinfo is None:
-        dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+    dt_utc = ensure_aware_utc(dt_utc)
     return dt_utc.replace(minute=(dt_utc.minute // 10) * 10, second=0, microsecond=0)
+
+def day_bounds_utc(d: date) -> tuple[datetime, datetime]:
+    start = datetime(d.year, d.month, d.day, tzinfo=UTC)
+    end_excl = start + timedelta(days=1)
+    return start, end_excl
+
+def normalize_date(d) -> date | None:
+    if d is None:
+        return None
+    if isinstance(d, datetime):
+        return d.date()
+    if isinstance(d, date):
+        return d
+    if hasattr(d, "date"):
+        try:
+            return d.date()
+        except Exception:
+            pass
+    try:
+        return date(d.year, d.month, d.day)
+    except Exception:
+        return None
 
 def sanitize_num(x, fallback=None):
     try:
@@ -42,43 +83,34 @@ def sanitize_num(x, fallback=None):
         return fallback
 
 def equalish(a, b):
-    if a is None and b is None: return True
-    if a is None or b is None:  return False
+    if a is None and b is None:
+        return True
+    if a is None or b is None:
+        return False
     try:
         return abs(float(a) - float(b)) <= 1e-12
     except Exception:
         return False
 
-def day_bounds_utc(d: date):
-    start = datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
-    end_excl = start + timedelta(days=1)
-    return start, end_excl
-
-# ───────────────────────── Session & statements ─────────────────────────
-print(f"[{now_str()}] Connecting to Astra…")
+print(f"[{now_str()}] Connecting to Astra...")
 session, cluster = get_session(return_cluster=True)
 print(f"[{now_str()}] Connected. keyspace='{session.keyspace}'")
 
 from cassandra.query import SimpleStatement
 
-SEL_LIVE = SimpleStatement(f"""
-  SELECT id, symbol, name, market_cap_rank, price_usd, market_cap, volume_24h, last_updated, category
-  FROM {TABLE_LIVE}
-""", fetch_size=FETCH_SIZE)
+SEL_LIVE = SimpleStatement(
+    f"""
+      SELECT id, symbol, name, market_cap_rank, category
+      FROM {TABLE_LIVE}
+    """,
+    fetch_size=FETCH_SIZE,
+)
 
-# Order ASC so we can take first/last deterministically
 SEL_10M_RANGE = session.prepare(f"""
   SELECT ts, price_usd, market_cap, volume_24h,
          market_cap_rank, circulating_supply, total_supply, last_updated
   FROM {TEN_MIN_TABLE}
-  WHERE id=? AND ts>=? AND ts<? ORDER BY ts ASC
-""")
-
-SEL_10M_PREV = session.prepare(f"""
-  SELECT ts, price_usd, market_cap, volume_24h,
-         market_cap_rank, circulating_supply, total_supply, last_updated
-  FROM {TEN_MIN_TABLE}
-  WHERE id=? AND ts<? LIMIT 1
+  WHERE id=? AND ts>=? AND ts<?
 """)
 
 SEL_DAILY_ONE = session.prepare(f"""
@@ -86,6 +118,16 @@ SEL_DAILY_ONE = session.prepare(f"""
          market_cap_rank, circulating_supply, total_supply, candle_source, last_updated
   FROM {DAILY_TABLE}
   WHERE id=? AND date=? LIMIT 1
+""")
+
+SEL_DAILY_LATEST = session.prepare(f"""
+  SELECT date, candle_source, last_updated
+  FROM {DAILY_TABLE} WHERE id=? ORDER BY date DESC LIMIT 1
+""")
+
+SEL_DAILY_RECENT = session.prepare(f"""
+  SELECT date, candle_source
+  FROM {DAILY_TABLE} WHERE id=? ORDER BY date DESC LIMIT {WATERMARK_SCAN_LIMIT}
 """)
 
 INS_UPSERT = session.prepare(f"""
@@ -98,156 +140,109 @@ INS_UPSERT = session.prepare(f"""
   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """)
 
-# gecko_market_cap_daily_contin(category, date, last_updated, market_cap, market_cap_rank, volume_24h)
 INS_MCAP_DAILY = session.prepare(f"""
   INSERT INTO {TABLE_MCAP_DAILY}
     (category, date, last_updated, market_cap, market_cap_rank, volume_24h)
   VALUES (?, ?, ?, ?, ?, ?)
 """)
 
-# ───────────────────────── Helpers ─────────────────────────
-def compute_daily_from_10m(rows, allow_finalize: bool):
-    """
-    Given 10m rows (ASC), build daily aggregates and ancillary fields.
-    Returns dict or None:
-      { 'open','high','low','close','price_usd','market_cap','volume_24h',
-        'market_cap_rank','circulating_supply','total_supply','last_updated' }
-    """
-    prices, mcaps, vols = [], [], []
-    ranks, circs, tots = [], [], []
-    last_upd_candidates = []
 
-    for r in rows:
-        if r.price_usd   is not None: prices.append(float(r.price_usd))
-        if r.market_cap  is not None: mcaps.append(float(r.market_cap))
-        if r.volume_24h  is not None: vols.append(float(r.volume_24h))
-        if getattr(r, "market_cap_rank", None) is not None: ranks.append(int(r.market_cap_rank))
-        if getattr(r, "circulating_supply", None) is not None: circs.append(float(r.circulating_supply))
-        if getattr(r, "total_supply", None) is not None: tots.append(float(r.total_supply))
-        if getattr(r, "last_updated", None) is not None: last_upd_candidates.append(r.last_updated)
-
-    if not prices:
-        return None
-
-    if allow_finalize and len(prices) < MIN_10M_POINTS_FOR_FINAL:
-        # not enough data to mark a closed day final
-        return None
-
-    o = prices[0]
-    h = max(prices)
-    l = min(prices)
-    c = prices[-1]
-
-    mcap = mcaps[-1] if mcaps else None
-    vol  = vols[-1]  if vols  else None
-    rank = ranks[-1] if ranks else None
-    circ = circs[-1] if circs else None
-    tot  = tots[-1]  if tots  else None
-
-    last_upd = max(last_upd_candidates) if last_upd_candidates else None
+def make_bucket() -> Dict[str, Any]:
     return {
-        "open": o, "high": h, "low": l, "close": c, "price_usd": c,
-        "market_cap": mcap, "volume_24h": vol,
-        "market_cap_rank": rank, "circulating_supply": circ, "total_supply": tot,
-        "last_updated": last_upd,
+        "price_count": 0,
+        "earliest_ts": None,
+        "latest_ts": None,
+        "open": None,
+        "close": None,
+        "high": None,
+        "low": None,
+        "last_updated": None,
+        "mcap": None, "mcap_ts": None,
+        "vol": None, "vol_ts": None,
+        "rank": None, "rank_ts": None,
+        "circ": None, "circ_ts": None,
+        "tot": None, "tot_ts": None,
     }
 
-def write_daily_row(coin, d: date, agg: dict, candle_source: str):
-    """Upsert a single daily row; reuse existing ancillary values if agg lacks them."""
-    # read existing to avoid nulling fields and to skip unchanged
-    existing = None
+
+def update_last_non_null(bucket: Dict[str, Any], key: str, ts_key: str, value, row_ts: datetime) -> None:
+    if value is None:
+        return
+    if bucket[ts_key] is None or row_ts >= bucket[ts_key]:
+        bucket[key] = value
+        bucket[ts_key] = row_ts
+
+
+def update_bucket(bucket: Dict[str, Any], row_ts: datetime, row) -> None:
+    price = getattr(row, "price_usd", None)
+    if price is not None:
+        price = float(price)
+        bucket["price_count"] += 1
+        if bucket["earliest_ts"] is None or row_ts < bucket["earliest_ts"]:
+            bucket["earliest_ts"] = row_ts
+            bucket["open"] = price
+        if bucket["latest_ts"] is None or row_ts > bucket["latest_ts"]:
+            bucket["latest_ts"] = row_ts
+            bucket["close"] = price
+        if bucket["high"] is None or price > bucket["high"]:
+            bucket["high"] = price
+        if bucket["low"] is None or price < bucket["low"]:
+            bucket["low"] = price
+
+    lu = ensure_aware_utc(getattr(row, "last_updated", None))
+    if lu is not None and (bucket["last_updated"] is None or lu > bucket["last_updated"]):
+        bucket["last_updated"] = lu
+
+    update_last_non_null(bucket, "mcap", "mcap_ts", sanitize_num(getattr(row, "market_cap", None)), row_ts)
+    update_last_non_null(bucket, "vol",  "vol_ts",  sanitize_num(getattr(row, "volume_24h", None)), row_ts)
+    rank_val = getattr(row, "market_cap_rank", None)
+    update_last_non_null(bucket, "rank", "rank_ts", int(rank_val) if rank_val is not None else None, row_ts)
+    update_last_non_null(bucket, "circ", "circ_ts", sanitize_num(getattr(row, "circulating_supply", None)), row_ts)
+    update_last_non_null(bucket, "tot",  "tot_ts",  sanitize_num(getattr(row, "total_supply", None)), row_ts)
+
+
+def iter_days(start: date, end: date):
+    d = start
+    while d <= end:
+        yield d
+        d = d + timedelta(days=1)
+
+
+def get_latest_final_date(coin_id) -> date | None:
     try:
-        existing = session.execute(SEL_DAILY_ONE, [coin.id, d], timeout=REQUEST_TIMEOUT).one()
-    except Exception:
-        existing = None
-
-    o = agg.get("open")
-    h = agg.get("high")
-    l = agg.get("low")
-    c = agg.get("close")
-    price_usd = agg.get("price_usd", c)
-
-    mcap = agg.get("market_cap")
-    vol  = agg.get("volume_24h")
-    rnk  = agg.get("market_cap_rank")
-    circ = agg.get("circulating_supply")
-    tot  = agg.get("total_supply")
-    last_upd = agg.get("last_updated")
-
-    # fill from existing row if needed
-    if existing:
-        if mcap is None: mcap = sanitize_num(getattr(existing, "market_cap", None))
-        if vol  is None: vol  = sanitize_num(getattr(existing, "volume_24h", None))
-        if rnk  is None: rnk  = getattr(existing, "market_cap_rank", None)
-        if circ is None: circ = sanitize_num(getattr(existing, "circulating_supply", None))
-        if tot  is None: tot  = sanitize_num(getattr(existing, "total_supply", None))
-
-    # ultimately default mcap/vol to 0.0
-    if mcap is None: mcap = 0.0
-    if vol  is None: vol  = 0.0
-
-    # choose last_updated
-    if not last_upd:
-        # if none from 10m, clamp to end-of-day - 1s (UTC)
-        start, end_excl = day_bounds_utc(d)
-        last_upd = end_excl - timedelta(seconds=1)
-
-    # skip if unchanged vs existing and both sources are final or both partial
-    if existing:
-        same_vals = all([
-            equalish(getattr(existing, "open", None),  o),
-            equalish(getattr(existing, "high", None),  h),
-            equalish(getattr(existing, "low", None),   l),
-            equalish(getattr(existing, "close", None), c),
-            equalish(getattr(existing, "price_usd", None), price_usd),
-            equalish(getattr(existing, "market_cap", None), mcap),
-            equalish(getattr(existing, "volume_24h", None), vol),
-            getattr(existing, "candle_source", None) == candle_source
-        ])
-        if same_vals:
-            if VERBOSE_MODE:
-                print(f"[{now_str()}]    {coin.symbol} {d} unchanged ({candle_source}) → skip")
-            return False
-
-    # upsert
-    try:
-        session.execute(
-            INS_UPSERT,
-            [
-                coin.id, d, coin.symbol, coin.name,
-                o, h, l, c, price_usd,
-                mcap, vol,
-                rnk, circ, tot,
-                candle_source, last_upd
-            ],
-            timeout=REQUEST_TIMEOUT
-        )
-        if VERBOSE_MODE:
-            print(f"[{now_str()}]    UPSERT {coin.symbol} {d} "
-                  f"O={o} H={h} L={l} C={c} M={mcap} V={vol} R={rnk} CS={circ} TS={tot} src={candle_source}")
-        return True
+        row = session.execute(SEL_DAILY_LATEST.bind([coin_id]), timeout=REQUEST_TIMEOUT).one()
+        if row and getattr(row, "date", None):
+            if getattr(row, "candle_source", None) == "10m_final":
+                return normalize_date(row.date)
     except Exception as e:
-        print(f"[{now_str()}] [WRITE-ERR] {coin.symbol} {d}: {e}")
-        return False
+        if VERBOSE_MODE:
+            print(f"[{now_str()}] [WATERMARK-ERR] {coin_id}: {e} (fallback to recent scan)")
 
-# ───────────────────────── Main ─────────────────────────
+    try:
+        for r in session.execute(SEL_DAILY_RECENT.bind([coin_id]), timeout=REQUEST_TIMEOUT):
+            if getattr(r, "candle_source", None) == "10m_final" and getattr(r, "date", None):
+                return normalize_date(r.date)
+    except Exception as e:
+        if VERBOSE_MODE:
+            print(f"[{now_str()}] [WATERMARK-SCAN-ERR] {coin_id}: {e}")
+    return None
+
+
 def main():
-    # Determine days: finalize YESTERDAY (closed) + write TODAY (partial up to safe 10m)
-    now_utc = datetime.now(timezone.utc)
-    today = now_utc.date()
+    now_guarded = now_utc() - timedelta(seconds=SLOT_DELAY_SEC)
+    today = now_guarded.date()
     yesterday = today - timedelta(days=1)
 
     today_start, today_end_excl = day_bounds_utc(today)
-    last_safe_10m_end = floor_10m(now_utc - timedelta(seconds=SLOT_DELAY_SEC))
-    today_effective_end = min(today_end_excl, last_safe_10m_end)
-    is_today_partial = today_effective_end < today_end_excl
+    today_effective_end = min(today_end_excl, floor_10m(now_guarded))
+    partial_needed = today_effective_end > today_start
 
-    print(f"[{now_str()}] Daily windows:"
-          f" yesterday[{yesterday} 00:00Z → {yesterday} 24:00Z] (final),"
-          f" today[{today_start} → {today_effective_end}] ({'partial' if is_today_partial else 'final'})")
+    print(
+        f"[{now_str()}] Daily anchors: today={today} yesterday={yesterday} "
+        f"partial_end={(today_effective_end.isoformat() if partial_needed else 'none')}"
+    )
 
-    # Load coins
-    print(f"[{now_str()}] Loading top coins (timeout={REQUEST_TIMEOUT}s)…")
+    print(f"[{now_str()}] Loading top coins (timeout={REQUEST_TIMEOUT}s)...")
     t0 = time.time()
     coins = list(session.execute(SEL_LIVE, timeout=REQUEST_TIMEOUT))
     print(f"[{now_str()}] Loaded {len(coins)} rows from {TABLE_LIVE} in {time.time()-t0:.2f}s")
@@ -259,7 +254,7 @@ def main():
 
     day_totals: Dict[Tuple[date, str], Dict[str, Any]] = {}
 
-    def bump_day_total(day_key: date, category: str, mcap_value, vol_value, last_upd) -> None:
+    def bump_day_total(day_key: date, category: str, mcap_value, vol_value, last_upd: datetime) -> None:
         key = (day_key, category)
         entry = day_totals.setdefault(key, {"market_cap": 0.0, "volume_24h": 0.0, "last_updated": last_upd})
         entry["market_cap"] += float(mcap_value or 0.0)
@@ -267,93 +262,256 @@ def main():
         if last_upd and (entry["last_updated"] is None or last_upd > entry["last_updated"]):
             entry["last_updated"] = last_upd
 
-    wrote = errors = unchanged = 0
+    wrote = skipped = empty = errors = unchanged = 0
 
     for idx, c in enumerate(coins, 1):
         coin_category = (getattr(c, 'category', None) or 'Other').strip() or 'Other'
         if idx == 1 or idx % PROGRESS_EVERY == 0 or idx == len(coins):
-            print(f"[{now_str()}] → Coin {idx}/{len(coins)}: {getattr(c,'symbol','?')} "
-                  f"({getattr(c,'id','?')}) rank={getattr(c,'market_cap_rank','?')}")
+            print(
+                f"[{now_str()}] -> Coin {idx}/{len(coins)}: {getattr(c,'symbol','?')} "
+                f"({getattr(c,'id','?')}) rank={getattr(c,'market_cap_rank','?')}"
+            )
 
-        # 1) Finalize yesterday (require enough 10m points)
-        y0, y1 = day_bounds_utc(yesterday)
+        watermark_date = get_latest_final_date(c.id)
+        if watermark_date:
+            start_day = watermark_date + timedelta(days=1)
+        else:
+            start_day = yesterday - timedelta(days=BOOTSTRAP_BACKFILL_DAYS - 1)
+
+        if MAX_CATCHUP_DAYS > 0:
+            max_start = yesterday - timedelta(days=MAX_CATCHUP_DAYS - 1)
+            if start_day < max_start:
+                print(
+                    f"[{now_str()}]    {c.symbol} clamp start {start_day} -> {max_start} "
+                    f"(MAX_CATCHUP_DAYS={MAX_CATCHUP_DAYS})"
+                )
+                start_day = max_start
+
+        final_days: List[date] = []
+        if start_day <= yesterday:
+            final_days = list(iter_days(start_day, yesterday))
+
+        if not final_days and not partial_needed:
+            continue
+
+        range_start = today_start if not final_days else day_bounds_utc(final_days[0])[0]
+        range_end = today_effective_end if partial_needed else day_bounds_utc(yesterday)[1]
+
+        buckets: Dict[date, Dict[str, Any]] = {}
         try:
-            pts = list(session.execute(SEL_10M_RANGE, [c.id, y0, y1], timeout=REQUEST_TIMEOUT))
+            bound = SEL_10M_RANGE.bind([c.id, to_cassandra_ts(range_start), to_cassandra_ts(range_end)])
+            bound.fetch_size = FETCH_SIZE
+            t_read = time.time()
+            row_count = 0
+            for row in session.execute(bound, timeout=REQUEST_TIMEOUT):
+                row_count += 1
+                ts = ensure_aware_utc(getattr(row, "ts", None))
+                if ts is None:
+                    continue
+                day_key = ts.date()
+                bucket = buckets.setdefault(day_key, make_bucket())
+                update_bucket(bucket, ts, row)
+            if VERBOSE_MODE:
+                print(
+                    f"[{now_str()}]    {c.symbol} {range_start.isoformat()}->{range_end.isoformat()} "
+                    f"got {row_count} 10m pts in {time.time()-t_read:.2f}s"
+                )
         except Exception as e:
             errors += 1
-            print(f"[{now_str()}] [READ-ERR] {c.symbol} yesterday 10m: {e}")
-            pts = []
+            print(f"[{now_str()}] [READ-ERR] {c.symbol} 10m range: {e}")
+            continue
 
-        agg = compute_daily_from_10m(pts, allow_finalize=True)
-        if agg:
-            mcap_total = sanitize_num(agg.get("market_cap"), 0.0)
-            vol_total = sanitize_num(agg.get("volume_24h"), 0.0)
-            last_upd_val = agg.get("last_updated") or (day_bounds_utc(yesterday)[1] - timedelta(seconds=1))
-            bump_day_total(yesterday, coin_category, mcap_total, vol_total, last_upd_val)
-            bump_day_total(yesterday, 'ALL', mcap_total, vol_total, last_upd_val)
-            ok = write_daily_row(c, yesterday, agg, candle_source="10m_final")
-            wrote += int(bool(ok))
-            if not ok:
-                unchanged += 1
+        existing_cache: Dict[date, Any] = {}
+        existing_last_upd_cache: Dict[date, datetime | None] = {}
 
-        # 2) Today (partial up to safe boundary)
-        if today_effective_end > today_start:
+        def get_existing(d: date):
+            if d in existing_cache:
+                return existing_cache[d]
             try:
-                pts = list(session.execute(SEL_10M_RANGE, [c.id, today_start, today_effective_end], timeout=REQUEST_TIMEOUT))
+                existing = session.execute(SEL_DAILY_ONE, [c.id, d], timeout=REQUEST_TIMEOUT).one()
+                existing_cache[d] = existing
+                existing_last_upd_cache[d] = ensure_aware_utc(getattr(existing, "last_updated", None)) if existing else None
+                return existing
+            except Exception as e:
+                existing_cache[d] = None
+                existing_last_upd_cache[d] = None
+                if VERBOSE_MODE:
+                    print(f"[{now_str()}] [EXIST-ERR] {c.symbol} {d}: {e}")
+                return None
+
+        def aggregate_existing(d: date) -> None:
+            existing = get_existing(d)
+            if existing:
+                mcap_exist = sanitize_num(getattr(existing, "market_cap", None), 0.0)
+                vol_exist = sanitize_num(getattr(existing, "volume_24h", None), 0.0)
+                last_upd = existing_last_upd_cache.get(d) or (day_bounds_utc(d)[1] - timedelta(seconds=1))
+                bump_day_total(d, coin_category, mcap_exist, vol_exist, last_upd)
+                bump_day_total(d, 'ALL', mcap_exist, vol_exist, last_upd)
+
+        for d in final_days:
+            bucket = buckets.get(d)
+            price_count = bucket["price_count"] if bucket else 0
+            if price_count < MIN_10M_POINTS_FOR_FINAL:
+                if VERBOSE_MODE:
+                    print(
+                        f"[{now_str()}]    {c.symbol} {d} final: insufficient 10m points ({price_count}) "
+                        "-> aggregate existing; skip write"
+                    )
+                aggregate_existing(d)
+                skipped += 1
+                continue
+
+            o = bucket["open"]
+            h = bucket["high"]
+            l = bucket["low"]
+            cl = bucket["close"]
+
+            mcap = bucket["mcap"]
+            vol = bucket["vol"]
+            rank = bucket["rank"]
+            circ = bucket["circ"]
+            tot = bucket["tot"]
+
+            existing = None
+            if mcap is None or vol is None or rank is None or circ is None or tot is None:
+                existing = get_existing(d)
+                if existing:
+                    if mcap is None: mcap = sanitize_num(getattr(existing, "market_cap", None))
+                    if vol is None: vol = sanitize_num(getattr(existing, "volume_24h", None))
+                    if rank is None: rank = getattr(existing, "market_cap_rank", None)
+                    if circ is None: circ = sanitize_num(getattr(existing, "circulating_supply", None))
+                    if tot is None: tot = sanitize_num(getattr(existing, "total_supply", None))
+
+            if mcap is None: mcap = 0.0
+            if vol is None: vol = 0.0
+
+            last_upd = bucket["last_updated"] or (day_bounds_utc(d)[1] - timedelta(seconds=1))
+            candle_source = "10m_final"
+
+            existing = existing or get_existing(d)
+            if existing and getattr(existing, "candle_source", None) == "10m_final":
+                same = all([
+                    equalish(o, getattr(existing, "open", None)),
+                    equalish(h, getattr(existing, "high", None)),
+                    equalish(l, getattr(existing, "low", None)),
+                    equalish(cl, getattr(existing, "close", None)),
+                    equalish(cl, getattr(existing, "price_usd", None)),
+                    equalish(mcap, getattr(existing, "market_cap", None)),
+                    equalish(vol, getattr(existing, "volume_24h", None)),
+                    (rank == getattr(existing, "market_cap_rank", None)),
+                    equalish(circ, getattr(existing, "circulating_supply", None)),
+                    equalish(tot, getattr(existing, "total_supply", None)),
+                ])
+                if same:
+                    aggregate_existing(d)
+                    unchanged += 1
+                    if VERBOSE_MODE:
+                        print(f"[{now_str()}]    {c.symbol} {d} already final & identical -> aggregate existing; skip write")
+                    continue
+
+            try:
+                session.execute(
+                    INS_UPSERT,
+                    [
+                        c.id, d, c.symbol, c.name,
+                        o, h, l, cl, cl,
+                        mcap, vol,
+                        rank, circ, tot,
+                        candle_source, to_cassandra_ts(last_upd),
+                    ],
+                    timeout=REQUEST_TIMEOUT,
+                )
+                bump_day_total(d, coin_category, mcap, vol, last_upd)
+                bump_day_total(d, 'ALL', mcap, vol, last_upd)
+                wrote += 1
+                if VERBOSE_MODE:
+                    print(f"[{now_str()}]    UPSERT {c.symbol} {d} ({candle_source})")
             except Exception as e:
                 errors += 1
-                print(f"[{now_str()}] [READ-ERR] {c.symbol} today 10m: {e}")
-                pts = []
+                skipped += 1
+                print(f"[{now_str()}] [WRITE-ERR] {c.symbol} {d}: {e}")
 
-            agg = compute_daily_from_10m(pts, allow_finalize=False)
+        if partial_needed:
+            d = today
+            bucket = buckets.get(d)
+            price_count = bucket["price_count"] if bucket else 0
+            if price_count == 0:
+                aggregate_existing(d)
+                empty += 1
+                if VERBOSE_MODE:
+                    print(f"[{now_str()}]    {c.symbol} {d} empty (no 10m) -> aggregate existing; skip write")
+                continue
 
-            if agg:
-                mcap_total = sanitize_num(agg.get("market_cap"), 0.0)
-                vol_total = sanitize_num(agg.get("volume_24h"), 0.0)
-                last_upd_val = agg.get("last_updated") or (day_bounds_utc(today)[1] - timedelta(seconds=1))
-                bump_day_total(today, coin_category, mcap_total, vol_total, last_upd_val)
-                bump_day_total(today, 'ALL', mcap_total, vol_total, last_upd_val)
-                ok = write_daily_row(c, today, agg, candle_source="10m_partial")
-                wrote += int(bool(ok))
-                if not ok:
+            o = bucket["open"]
+            h = bucket["high"]
+            l = bucket["low"]
+            cl = bucket["close"]
+
+            mcap = bucket["mcap"]
+            vol = bucket["vol"]
+            rank = bucket["rank"]
+            circ = bucket["circ"]
+            tot = bucket["tot"]
+
+            existing = None
+            if mcap is None or vol is None or rank is None or circ is None or tot is None:
+                existing = get_existing(d)
+                if existing:
+                    if mcap is None: mcap = sanitize_num(getattr(existing, "market_cap", None))
+                    if vol is None: vol = sanitize_num(getattr(existing, "volume_24h", None))
+                    if rank is None: rank = getattr(existing, "market_cap_rank", None)
+                    if circ is None: circ = sanitize_num(getattr(existing, "circulating_supply", None))
+                    if tot is None: tot = sanitize_num(getattr(existing, "total_supply", None))
+
+            if mcap is None: mcap = 0.0
+            if vol is None: vol = 0.0
+
+            last_upd = bucket["last_updated"] or (today_end_excl - timedelta(seconds=1))
+            candle_source = "10m_partial"
+
+            existing = existing or get_existing(d)
+            if existing and getattr(existing, "candle_source", None) == "10m_partial":
+                same = all([
+                    equalish(o, getattr(existing, "open", None)),
+                    equalish(h, getattr(existing, "high", None)),
+                    equalish(l, getattr(existing, "low", None)),
+                    equalish(cl, getattr(existing, "close", None)),
+                    equalish(cl, getattr(existing, "price_usd", None)),
+                    equalish(mcap, getattr(existing, "market_cap", None)),
+                    equalish(vol, getattr(existing, "volume_24h", None)),
+                    (rank == getattr(existing, "market_cap_rank", None)),
+                    equalish(circ, getattr(existing, "circulating_supply", None)),
+                    equalish(tot, getattr(existing, "total_supply", None)),
+                ])
+                if same:
+                    aggregate_existing(d)
                     unchanged += 1
-            else:
-                # No 10m yet today: make a prev-close style stub using live price
-                prev_row = None
-                try:
-                    prev_row = session.execute(SEL_DAILY_ONE, [c.id, yesterday], timeout=REQUEST_TIMEOUT).one()
-                except Exception:
-                    prev_row = None
+                    if VERBOSE_MODE:
+                        print(f"[{now_str()}]    {c.symbol} {d} partial unchanged -> aggregate existing; skip write")
+                    continue
 
-                live_close = sanitize_num(getattr(c, "price_usd", None), 0.0)
-                if prev_row and (prev_row.close is not None or prev_row.price_usd is not None):
-                    prev_close = float(prev_row.close if prev_row.close is not None else prev_row.price_usd)
-                    o, h, l, cl = prev_close, max(prev_close, live_close), min(prev_close, live_close), live_close
-                    csrc = "prev_close"
-                else:
-                    o = h = l = cl = live_close
-                    csrc = "flat"
+            try:
+                session.execute(
+                    INS_UPSERT,
+                    [
+                        c.id, d, c.symbol, c.name,
+                        o, h, l, cl, cl,
+                        mcap, vol,
+                        rank, circ, tot,
+                        candle_source, to_cassandra_ts(last_upd),
+                    ],
+                    timeout=REQUEST_TIMEOUT,
+                )
+                bump_day_total(d, coin_category, mcap, vol, last_upd)
+                bump_day_total(d, 'ALL', mcap, vol, last_upd)
+                wrote += 1
+                if VERBOSE_MODE:
+                    print(f"[{now_str()}]    UPSERT {c.symbol} {d} ({candle_source})")
+            except Exception as e:
+                errors += 1
+                skipped += 1
+                print(f"[{now_str()}] [WRITE-ERR] {c.symbol} {d}: {e}")
 
-                stub = {
-                    "open": o, "high": h, "low": l, "close": cl, "price_usd": cl,
-                    "market_cap": sanitize_num(getattr(c, "market_cap", None), 0.0),
-                    "volume_24h": sanitize_num(getattr(c, "volume_24h", None), 0.0),
-                    "market_cap_rank": getattr(c, "market_cap_rank", None),
-                    "circulating_supply": None,
-                    "total_supply": None,
-                    "last_updated": getattr(c, "last_updated", None),
-                }
-                mcap_total = sanitize_num(stub.get("market_cap"), 0.0)
-                vol_total = sanitize_num(stub.get("volume_24h"), 0.0)
-                last_upd_val = stub.get("last_updated") or (day_bounds_utc(today)[1] - timedelta(seconds=1))
-                bump_day_total(today, coin_category, mcap_total, vol_total, last_upd_val)
-                bump_day_total(today, 'ALL', mcap_total, vol_total, last_upd_val)
-                ok = write_daily_row(c, today, stub, candle_source=csrc)
-                wrote += int(bool(ok))
-                if not ok:
-                    unchanged += 1
-
-    # Write category aggregates
     if day_totals:
         print(f"[{now_str()}] [mcap-daily] writing {len(day_totals)} aggregates into {TABLE_MCAP_DAILY}")
         agg_written = 0
@@ -366,8 +524,8 @@ def main():
             try:
                 session.execute(
                     INS_MCAP_DAILY,
-                    [category, day_key, last_upd, float(totals['market_cap']), rank_value, float(totals['volume_24h'])],
-                    timeout=REQUEST_TIMEOUT
+                    [category, day_key, to_cassandra_ts(last_upd), float(totals['market_cap']), rank_value, float(totals['volume_24h'])],
+                    timeout=REQUEST_TIMEOUT,
                 )
                 agg_written += 1
             except Exception as e:
@@ -376,14 +534,17 @@ def main():
     else:
         print(f"[{now_str()}] [mcap-daily] no aggregates captured (coins={len(coins)})")
 
-    print(f"[{now_str()}] [daily-from-10m] wrote≈{wrote} unchanged≈{unchanged} errors={errors}")
+    print(
+        f"[{now_str()}] [daily-from-10m] wrote={wrote} skipped={skipped} empty={empty} "
+        f"unchanged={unchanged} errors={errors}"
+    )
 
-# ───────────────────────── Entrypoint ─────────────────────────
+
 if __name__ == "__main__":
     try:
         main()
     finally:
-        print(f"[{now_str()}] Shutting down…")
+        print(f"[{now_str()}] Shutting down...")
         try:
             cluster.shutdown()
         except Exception as e:
