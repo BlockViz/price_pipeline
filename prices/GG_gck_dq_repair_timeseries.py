@@ -973,41 +973,44 @@ def main():
                     print(f"[{_now_str()}]    no coverage rows yet → skip (new/unseen coin)")
                     continue
 
-            # DAILY via coverage ranges
-            _res_have_daily = covered_days_from_ranges(coin["id"], start_daily_date, last_inclusive)
-            if isinstance(_res_have_daily, tuple):
-                have_daily, _ = _res_have_daily          # (set[date], bool)
-            else:
-                have_daily = _res_have_daily             # set[date]
-
-            need_daily_all = want_daily_days - have_daily
-
-            # Of missing daily, which have any 10m coverage that day?
+            # DAILY via coverage ranges (single read)
+            have_daily: set[dt.date] = set()
+            need_daily_all: set[dt.date] = set()
             need_daily_local: set[dt.date] = set()
-            need_daily_api:   set[dt.date] = set()
+            need_daily_api: set[dt.date] = set()
+            missing_10m_days_full: set[dt.date] | None = None
+
             if RUNS_ANY_DAILY:
                 have_daily, _ = covered_days_from_ranges(coin["id"], start_daily_date, last_inclusive)
                 need_daily_all = want_daily_days - have_daily
 
-                if need_daily_all:
-                    missing_10m_days = missing_days_10m_from_coverage(coin["id"], min(need_daily_all), max(need_daily_all))
-                    have_10m_on_day = need_daily_all - missing_10m_days
-                    need_daily_local = have_10m_on_day
-                    need_daily_api   = need_daily_all - need_daily_local
-            else:
-                need_daily_all = set()
+            # Read 10m coverage once for the widest needed window, then slice as needed
+            if RUNS_ANY_DAILY or SEED_10M_FROM_DAILY:
+                start_missing = start_10m_date if not RUNS_ANY_DAILY else min(start_daily_date, start_10m_date)
+                missing_10m_days_full = missing_days_10m_from_coverage(coin["id"], start_missing, last_inclusive)
+
+            # Of missing daily, which have any 10m coverage that day?
+            if RUNS_ANY_DAILY and need_daily_all:
+                missing_10m_days_daily = {
+                    d for d in (missing_10m_days_full or set())
+                    if start_daily_date <= d <= last_inclusive
+                }
+                have_10m_on_day = need_daily_all - missing_10m_days_daily
+                need_daily_local = have_10m_on_day
+                need_daily_api   = need_daily_all - need_daily_local
 
             # 10m seeding: days in 10m window with no 10m coverage
-            _need_10m = missing_days_10m_from_coverage(coin["id"], start_10m_date, last_inclusive)
-            if isinstance(_need_10m, tuple):
-                need_10m, _ = _need_10m
-            else:
-                need_10m = _need_10m
+            need_10m: set[dt.date] = set()
+            if SEED_10M_FROM_DAILY:
+                if missing_10m_days_full is None:
+                    missing_10m_days_full = missing_days_10m_from_coverage(coin["id"], start_10m_date, last_inclusive)
+                need_10m = {d for d in missing_10m_days_full if start_10m_date <= d <= last_inclusive}
 
+            need_10m_label = str(len(need_10m)) if SEED_10M_FROM_DAILY else "n/a"
             if RUNS_INTRADAY and not RUNS_ANY_DAILY:
-                print(f"[{_now_str()}]    Missing → 10m:{len(need_10m)}")
+                print(f"[{_now_str()}]    Missing → 10m:{need_10m_label}")
             else:
-                print(f"[{_now_str()}]    Missing → 10m:{len(need_10m)} "
+                print(f"[{_now_str()}]    Missing → 10m:{need_10m_label} "
                     f"daily_total:{len(need_daily_all)} (10m_eligible:{len(need_daily_local)}, api:{len(need_daily_api)})")
 
             # Local daily repair from 10m
