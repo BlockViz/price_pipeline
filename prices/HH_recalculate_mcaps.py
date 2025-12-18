@@ -2,12 +2,12 @@
 # backend/prices/onetime_and_config/rebucket_mcap_from_mapping.py
 #
 # Rebuilds market-cap aggregates from existing price/candle tables using an
-# ID→category mapping CSV. Missing IDs are mapped to "Other".
+# ID->category mapping CSV. Missing IDs are mapped to "Other".
 #
-# SOURCE → TARGET
-#   gecko_prices_10m_7d        → gecko_market_cap_10m_7d
-#   gecko_candles_hourly_30d   → gecko_market_cap_hourly_30d
-#   gecko_candles_daily_contin → gecko_market_cap_daily_contin
+# SOURCE -> TARGET
+#   gecko_prices_10m_7d        -> gecko_market_cap_10m_7d
+#   gecko_candles_hourly_30d   -> gecko_market_cap_hourly_30d
+#   gecko_candles_daily_contin -> gecko_market_cap_daily_contin
 #
 # Notes
 # - Rank per bucket: ALL=0; categories ranked 1..N by market_cap DESC.
@@ -114,9 +114,9 @@ def load_id_category_map(path: str) -> Dict[str, str]:
                         if cid:
                             m[cid] = cat or "Other"
 
-                    prev = ", ".join([f"{k}→{m[k]}" for k in list(m.keys())[:10]])
+                    prev = ", ".join([f"{k}->{m[k]}" for k in list(m.keys())[:10]])
                     print(
-                        f"[{now_str()}] [category] loaded {len(m)} id→category rows from {path}\n"
+                        f"[{now_str()}] [category] loaded {len(m)} id->category rows from {path}\n"
                         f"           preview: {prev}"
                     )
                     break
@@ -126,9 +126,9 @@ def load_id_category_map(path: str) -> Dict[str, str]:
                     f"(need id/category or symbol/category)."
                 )
     except FileNotFoundError:
-        print(f"[{now_str()}] [category] file not found: {path} — will map missing IDs to 'Other'")
+        print(f"[{now_str()}] [category] file not found: {path} -- will map missing IDs to 'Other'")
     except Exception as e:
-        print(f"[{now_str()}] [category] failed to read {path}: {e} — will map missing to 'Other'")
+        print(f"[{now_str()}] [category] failed to read {path}: {e} -- will map missing to 'Other'")
     return m
 
 ID_TO_CAT = load_id_category_map(CATEGORY_FILE)
@@ -258,11 +258,33 @@ def compute_ranks_for_bucket(entries):
         ranks["ALL"] = 0
     return ranks
 
+def ensure_all_bucket(catmap):
+    """
+    Rebuild the ALL bucket from the other categories to avoid stale/partial totals
+    (and to keep rankings consistent even if aggregation failed for ALL earlier).
+    """
+    non_all = [(cat, vals) for cat, vals in catmap.items() if cat != "ALL"]
+    if not non_all:
+        return catmap
+
+    latest_lu = None
+    total_mcap = 0.0
+    total_vol = 0.0
+    for _cat, (lu, mcap, vol) in non_all:
+        if lu is not None and (latest_lu is None or lu > latest_lu):
+            latest_lu = lu
+        total_mcap += mcap or 0.0
+        total_vol += vol or 0.0
+
+    catmap["ALL"] = (latest_lu, total_mcap, total_vol)
+    return catmap
+
 def flush_10m(session, acc_10m, INS_10M, batch_every=BATCH_FLUSH_EVERY):
     batch = BatchStatement(consistency_level=ConsistencyLevel.QUORUM)
     total = 0
     t0 = time.time()
     for i, (ts, catmap) in enumerate(sorted(acc_10m.items()), 1):
+        catmap = ensure_all_bucket(catmap)
         entries = [(cat, catmap[cat][0], catmap[cat][1], catmap[cat][2]) for cat in catmap]
         ranks = compute_ranks_for_bucket(entries)
         for cat, (lu, mcap, vol) in catmap.items():
@@ -282,6 +304,7 @@ def flush_hourly(session, acc_hourly, INS_H, batch_every=BATCH_FLUSH_EVERY):
     total = 0
     t0 = time.time()
     for i, (ts, catmap) in enumerate(sorted(acc_hourly.items()), 1):
+        catmap = ensure_all_bucket(catmap)
         entries = [(cat, catmap[cat][0], catmap[cat][1], catmap[cat][2]) for cat in catmap]
         ranks = compute_ranks_for_bucket(entries)
         for cat, (lu, mcap, vol) in catmap.items():
@@ -301,6 +324,7 @@ def flush_daily(session, acc_daily, INS_D, batch_every=BATCH_FLUSH_EVERY):
     total = 0
     t0 = time.time()
     for i, (d, catmap) in enumerate(sorted(acc_daily.items()), 1):
+        catmap = ensure_all_bucket(catmap)
         entries = [(cat, catmap[cat][0], catmap[cat][1], catmap[cat][2]) for cat in catmap]
         ranks = compute_ranks_for_bucket(entries)
         for cat, (lu, mcap, vol) in catmap.items():
@@ -317,9 +341,9 @@ def flush_daily(session, acc_daily, INS_D, batch_every=BATCH_FLUSH_EVERY):
 
 # ───────────────────────── Main ─────────────────────────
 def main():
-    print(f"[{now_str()}] Windows: 10m[{WIN_10M_START.isoformat()} → {WIN_10M_END.isoformat()}) "
-          f"hourly[{WIN_H_START.isoformat()} → {WIN_H_END.isoformat()}) "
-          f"daily[{WIN_D_START} → {WIN_D_END})")
+    print(f"[{now_str()}] Windows: 10m[{WIN_10M_START.isoformat()} -> {WIN_10M_END.isoformat()}) "
+          f"hourly[{WIN_H_START.isoformat()} -> {WIN_H_END.isoformat()}) "
+          f"daily[{WIN_D_START} -> {WIN_D_END})")
 
     ids_live = [r.id for r in session.execute(SEL_IDS_LIVE, timeout=REQUEST_TIMEOUT_SEC)]
     print(f"[{now_str()}] IDs from gecko_prices_live: {len(ids_live)}")
@@ -329,7 +353,7 @@ def main():
     print(f"[{now_str()}] Aggregation complete in {time.time()-t0:.1f}s "
           f"(10m buckets={len(acc_10m)}, hourly buckets={len(acc_hourly)}, daily buckets={len(acc_daily)})")
 
-    print(f"[{now_str()}] TRUNCATING targets …")
+    print(f"[{now_str()}] TRUNCATING targets ...")
     session.execute(TRUNC_10M)
     session.execute(TRUNC_H)
     session.execute(TRUNC_D)

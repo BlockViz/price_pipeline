@@ -119,6 +119,35 @@ def vprint(msg: str):
     if VERBOSE_MODE:
         print(msg)
 
+def rebuild_all_from_categories(hour_totals: Dict[Tuple[datetime, str], Dict[str, Any]]) -> Dict[Tuple[datetime, str], Dict[str, Any]]:
+    """
+    Ensure the ALL bucket equals the sum of category buckets for each hour.
+    last_updated = max(last_updated) across categories.
+    """
+    by_hour: dict[datetime, list[tuple[str, Dict[str, Any]]]] = {}
+    for (slot_start, category), totals in hour_totals.items():
+        by_hour.setdefault(slot_start, []).append((category, totals))
+
+    for slot_start, items in by_hour.items():
+        non_all = [(cat, vals) for cat, vals in items if cat != "ALL"]
+        if not non_all:
+            continue
+        latest_lu = None
+        total_mcap = 0.0
+        total_vol = 0.0
+        for _cat, vals in non_all:
+            lu = vals.get("last_updated")
+            if lu is not None and (latest_lu is None or lu > latest_lu):
+                latest_lu = lu
+            total_mcap += float(vals.get("market_cap") or 0.0)
+            total_vol += float(vals.get("volume_24h") or 0.0)
+        hour_totals[(slot_start, "ALL")] = {
+            "market_cap": total_mcap,
+            "volume_24h": total_vol,
+            "last_updated": latest_lu,
+        }
+    return hour_totals
+
 # ───────────────────────── Session & prepared statements ─────────────────────────
 print(f"[{now_str()}] Connecting to Astra…")
 session, cluster = get_session(return_cluster=True)
@@ -562,11 +591,13 @@ def main():
                     print(f"[{now_str()}] [WRITE-ERR] {meta['symbol']} {meta['start'].isoformat()}: {result}")
 
     # Write category aggregates
-    
     if hour_totals:
         print(f"[{now_str()}] [mcap-hourly] writing {len(hour_totals)} aggregates into {TABLE_MCAP_HOURLY}")
 
-        # ➊ Compute ranks per slot (ALL = 0; categories ranked by total mcap DESC)
+        # Rebuild ALL from category buckets to avoid stale/partial ALL.
+        hour_totals = rebuild_all_from_categories(hour_totals)
+
+        # Compute ranks per slot (ALL = 0; categories ranked by total mcap DESC)
         slot_caps = defaultdict(list)  # slot_start -> [(category, mcap_sum)]
         for (slot_start, category), totals in hour_totals.items():
             if category != 'ALL':

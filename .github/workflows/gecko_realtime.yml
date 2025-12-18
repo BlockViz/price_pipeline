@@ -155,6 +155,6 @@ jobs:
           CONNECT_TIMEOUT_SEC: "15"
           FETCH_SIZE: "500"
           SLOT_DELAY_SEC: "120"
-          SLOTS_BACKFILL: "2"
+          SLOTS_BACKFILL: "24"
           VERBOSE_MODE: "${{ env.VERBOSE_RESOLVED }}"
         run: python prices/CC_gck_append_10m_from_live.py

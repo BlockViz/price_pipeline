@@ -128,6 +128,32 @@ def compute_category_ranks(cat_totals: Dict[str, Dict[str, float]]) -> Dict[str,
     ranks["ALL"] = 0
     return ranks
 
+def ensure_all_bucket(catmap: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """
+    Rebuild ALL from the other categories to avoid persisting a stale/partial ALL.
+    last_updated = max of categories.
+    """
+    non_all = [(cat, vals) for cat, vals in catmap.items() if cat != "ALL"]
+    if not non_all:
+        return catmap
+
+    latest_lu = None
+    total_mcap = 0.0
+    total_vol = 0.0
+    for _cat, vals in non_all:
+        lu = vals.get("last_updated")
+        if lu is not None and (latest_lu is None or lu > latest_lu):
+            latest_lu = lu
+        total_mcap += float(vals.get("market_cap") or 0.0)
+        total_vol += float(vals.get("volume_24h") or 0.0)
+
+    catmap["ALL"] = {
+        "market_cap": total_mcap,
+        "volume_24h": total_vol,
+        "last_updated": latest_lu,
+    }
+    return catmap
+
 # ───────────────────────── Main logic ─────────────────────────
 def main():
     # Pick coins
@@ -236,6 +262,7 @@ def main():
         agg_written = 0
         for slot_start in sorted(slot_totals.keys()):
             catmap = slot_totals[slot_start]  # Dict[str, {market_cap, volume_24h, last_updated}]
+            catmap = ensure_all_bucket(catmap)
             # compute ranks for this slot (ALL=0; others by market_cap desc)
             ranks = compute_category_ranks(catmap)
             # write in defined order: ALL first, then alphabetical for determinism

@@ -165,6 +165,36 @@ def make_bucket() -> Dict[str, Any]:
     }
 
 
+def rebuild_all_from_categories(day_totals: Dict[Tuple[date, str], Dict[str, Any]]) -> Dict[Tuple[date, str], Dict[str, Any]]:
+    """
+    Ensure ALL equals the sum of category buckets per day.
+    last_updated is max(last_updated) across categories.
+    """
+    by_day: dict[date, list[tuple[str, Dict[str, Any]]]] = {}
+    for (d, category), totals in day_totals.items():
+        by_day.setdefault(d, []).append((category, totals))
+
+    for d, items in by_day.items():
+        non_all = [(cat, vals) for cat, vals in items if cat != "ALL"]
+        if not non_all:
+            continue
+        latest_lu = None
+        total_mcap = 0.0
+        total_vol = 0.0
+        for _cat, vals in non_all:
+            lu = vals.get("last_updated")
+            if lu is not None and (latest_lu is None or lu > latest_lu):
+                latest_lu = lu
+            total_mcap += float(vals.get("market_cap") or 0.0)
+            total_vol += float(vals.get("volume_24h") or 0.0)
+        day_totals[(d, "ALL")] = {
+            "market_cap": total_mcap,
+            "volume_24h": total_vol,
+            "last_updated": latest_lu,
+        }
+    return day_totals
+
+
 def update_last_non_null(bucket: Dict[str, Any], key: str, ts_key: str, value, row_ts: datetime) -> None:
     if value is None:
         return
@@ -514,13 +544,30 @@ def main():
 
     if day_totals:
         print(f"[{now_str()}] [mcap-daily] writing {len(day_totals)} aggregates into {TABLE_MCAP_DAILY}")
+
+        # Rebuild ALL from categories before ranking/writing.
+        day_totals = rebuild_all_from_categories(day_totals)
+
+        # Compute ranks per day (ALL=0; categories ranked by total mcap DESC)
+        day_caps: dict[date, list[tuple[str, float]]] = {}
+        for (day_key, category), totals in day_totals.items():
+            if category != 'ALL':
+                day_caps.setdefault(day_key, []).append((category, float(totals.get('market_cap') or 0.0)))
+
+        rank_map: dict[tuple[date, str], int] = {}
+        for dkey, items in day_caps.items():
+            items.sort(key=lambda t: t[1], reverse=True)
+            for i, (cat, _mc) in enumerate(items, start=1):
+                rank_map[(dkey, cat)] = i
+            rank_map[(dkey, 'ALL')] = 0
+
         agg_written = 0
         for (day_key, category), totals in sorted(
             day_totals.items(), key=lambda kv: (kv[0][0], 0 if kv[0][1] == 'ALL' else 1, kv[0][1].lower())
         ):
             day_end = day_bounds_utc(day_key)[1]
             last_upd = totals.get('last_updated') or (day_end - timedelta(seconds=1))
-            rank_value = 0 if category == 'ALL' else None
+            rank_value = rank_map.get((day_key, category))
             try:
                 session.execute(
                     INS_MCAP_DAILY,
