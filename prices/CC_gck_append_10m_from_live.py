@@ -31,8 +31,8 @@ FETCH_SIZE         = int(os.getenv("FETCH_SIZE", "500"))
 
 SLOT_MINUTES       = int(os.getenv("SLOT_MINUTES", "10"))
 SLOT_DELAY_SEC     = int(os.getenv("SLOT_DELAY_SEC", "120"))
-SLOTS_BACKFILL     = int(os.getenv("SLOTS_BACKFILL", str(6 * 60 // SLOT_MINUTES)))  # default: 6h safety window
-ALLOW_CARRY_MAX_SLOTS = int(os.getenv("ALLOW_CARRY_MAX_SLOTS", str(6 * 60 // SLOT_MINUTES)))  # allow carry across the 6h window
+SLOTS_BACKFILL     = int(os.getenv("SLOTS_BACKFILL", 4))  # default: 6h safety window
+ALLOW_CARRY_MAX_SLOTS = int(os.getenv("ALLOW_CARRY_MAX_SLOTS", 4))  # allow carry across the 6h window
 
 # Tables (defaults match your schema)
 TABLE_LATEST       = os.getenv("TABLE_LATEST", "gecko_prices_live")
