@@ -325,6 +325,12 @@ def flush_daily(session, acc_daily, INS_D, batch_every=BATCH_FLUSH_EVERY):
     t0 = time.time()
     for i, (d, catmap) in enumerate(sorted(acc_daily.items()), 1):
         catmap = ensure_all_bucket(catmap)
+        ### temp
+        if d == date(2025, 12, 17):
+            non_all_sum = sum(v[1] for k, v in catmap.items() if k != "ALL")
+            print("DEBUG", d, "ALL=", catmap.get("ALL"), "non_all_sum=", non_all_sum,
+                "cats=", sorted([k for k in catmap.keys() if k != "ALL"])[:20], "...")
+        ### temp end
         entries = [(cat, catmap[cat][0], catmap[cat][1], catmap[cat][2]) for cat in catmap]
         ranks = compute_ranks_for_bucket(entries)
         for cat, (lu, mcap, vol) in catmap.items():

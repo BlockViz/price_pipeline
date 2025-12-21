@@ -153,6 +153,7 @@ jobs:
           SLOT_DELAY_SEC: "120"
           PROGRESS_EVERY: "20"
           VERBOSE_MODE: "${{ env.VERBOSE_RESOLVED }}"
+          WRITE_MCAP_DAILY: "0"
         run: python prices/EE_gck_create_daily_from_10m.py
 
       - name: 05 Update monthly from daily/live

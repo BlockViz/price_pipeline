@@ -1,7 +1,7 @@
 name: categories
 on:
   schedule:
-    - cron: "12 3 * * *" # daily at 03:12 UTC
+    - cron: "12 5 * * *" # daily at 03:12 UTC
   push:
     paths:
       - "prices/category_mapping.csv"

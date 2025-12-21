@@ -27,6 +27,8 @@ TEN_MIN_TABLE       = os.getenv("TEN_MIN_TABLE", "gecko_prices_10m_7d")
 DAILY_TABLE         = os.getenv("DAILY_TABLE", "gecko_candles_daily_contin")
 TABLE_LIVE          = os.getenv("TABLE_LIVE", "gecko_prices_live")
 TABLE_MCAP_DAILY    = os.getenv("TABLE_MCAP_DAILY", "gecko_market_cap_daily_contin")
+WRITE_MCAP_DAILY = os.getenv("WRITE_MCAP_DAILY", "0") == "1"
+
 
 UTC = timezone.utc
 
@@ -542,7 +544,7 @@ def main():
                 skipped += 1
                 print(f"[{now_str()}] [WRITE-ERR] {c.symbol} {d}: {e}")
 
-    if day_totals:
+    if WRITE_MCAP_DAILY and day_totals:
         print(f"[{now_str()}] [mcap-daily] writing {len(day_totals)} aggregates into {TABLE_MCAP_DAILY}")
 
         # Rebuild ALL from categories before ranking/writing.
