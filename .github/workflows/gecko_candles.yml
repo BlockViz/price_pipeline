@@ -28,7 +28,7 @@ on:
         required: false
         default: "0"
   schedule:
-    - cron: "*/20 * * * *" # backup: every 20 minutes UTC
+    - cron: "*/10 * * * *" # backup: every 20 minutes UTC
 
 permissions:
   contents: read
