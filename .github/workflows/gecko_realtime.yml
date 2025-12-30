@@ -23,14 +23,17 @@ on:
         description: "Verbose (0/1)"
         required: false
         default: "0"
+
+  # Backup only (GitHub schedule is best-effort): every 20 minutes, offset away from :00
   schedule:
-    - cron: "*/6 * * * *" # backup: every 6 minutes UTC
+    - cron: "2-59/20 * * * *"
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
-  group: gecko_prices-realtime-${{ github.ref }}
+  group: gecko-prices-realtime-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -43,32 +46,48 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            // If not a schedule event, always run (CFlare/manual dispatch)
+            // Non-schedule events (Cloudflare/manual dispatch): always run.
             if (context.eventName !== 'schedule') {
               core.setOutput('should_run', 'true');
               core.info('non-schedule event -> run');
               return;
             }
-            // For schedule: skip if a non-schedule run started recently
-            const windowMinutes = 7; // adjust as you like
-            const sinceISO = new Date(Date.now() - windowMinutes * 60 * 1000).toISOString();
+
+            // Schedule backup: skip if there's any active run, or if a successful dispatch ran recently.
             const branch = context.ref.replace('refs/heads/', '');
+            const windowMinutes = 25; // 20m cron + slack
+            const sinceISO = new Date(Date.now() - windowMinutes * 60 * 1000).toISOString();
 
             const { data } = await github.rest.actions.listWorkflowRunsForRepo({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              per_page: 25,
+              per_page: 50,
               branch
             });
 
-            const recent = data.workflow_runs.find(r =>
-              r.name === context.workflow &&
-              r.event !== 'schedule' &&
+            const runs = (data.workflow_runs || []).filter(r => r.name === context.workflow);
+
+            // If anything is queued/in_progress, don't add a backup run.
+            const active = runs.find(r => r.status === 'queued' || r.status === 'in_progress');
+            if (active) {
+              core.setOutput('should_run', 'false');
+              core.info(`schedule backup -> found active run (${active.status}), skip`);
+              return;
+            }
+
+            // If a successful workflow_dispatch ran recently, skip the schedule backup.
+            // Note: GitHub's listWorkflowRunsForRepo response doesn't expose dispatch inputs,
+            // so this treats ANY successful workflow_dispatch (Cloudflare or manual) as "recent".
+            const recentSuccessfulDispatch = runs.find(r =>
+              r.event === 'workflow_dispatch' &&
+              r.status === 'completed' &&
+              r.conclusion === 'success' &&
+              r.run_started_at &&
               new Date(r.run_started_at).toISOString() >= sinceISO
             );
 
-            core.setOutput('should_run', recent ? 'false' : 'true');
-            core.info(`schedule event -> recent non-schedule since ${sinceISO}: ${recent ? 'YES (skip)' : 'NO (run)'}`);
+            core.setOutput('should_run', recentSuccessfulDispatch ? 'false' : 'true');
+            core.info(`schedule backup -> recent successful dispatch since ${sinceISO}: ${recentSuccessfulDispatch ? 'YES (skip)' : 'NO (run)'}`);
 
   run:
     needs: [recent_check]
@@ -86,7 +105,7 @@ jobs:
       RUN_02: ${{ (github.event_name == 'schedule' && 'true') || (github.event.inputs.run_02 || 'true') }}
 
       TOP_N_RESOLVED: ${{ (github.event.inputs.TOP_N != '' && github.event.inputs.TOP_N) || secrets.TOP_N || '200' }}
-      RANK_TOP_N_RESOLVED: ${{ (github.event.inputs.RANK_TOP_N != '' && github.event.inputs.RANK_TOP_N) || secrets.TOP_N || '200' }}
+      RANK_TOP_N_RESOLVED: ${{ (github.event.inputs.RANK_TOP_N != '' && github.event.inputs.RANK_TOP_N) || secrets.RANK_TOP_N || secrets.TOP_N || '200' }}
       VERBOSE_RESOLVED: ${{ github.event.inputs.VERBOSE_MODE || '0' }}
 
     steps:

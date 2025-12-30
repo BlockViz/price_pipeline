@@ -27,11 +27,14 @@ on:
         description: "Hourly: only prev_final + curr_partial (0/1)"
         required: false
         default: "0"
+
+  # Backup only: every hour, offset away from :00
   schedule:
-    - cron: "*/10 * * * *" # backup: every 20 minutes UTC
+    - cron: "20 * * * *"
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: gecko-prices-candles-${{ github.ref }}
@@ -47,31 +50,46 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            // If not a schedule event, always run
+            // Non-schedule events (Cloudflare/manual dispatch): always run.
             if (context.eventName !== 'schedule') {
               core.setOutput('should_run', 'true');
               core.info('non-schedule event -> run');
               return;
             }
-            const windowMinutes = 15; // adjust as you like
-            const sinceISO = new Date(Date.now() - windowMinutes * 60 * 1000).toISOString();
+
+            // Schedule backup: skip if there's any active run, or if a successful dispatch ran recently.
             const branch = context.ref.replace('refs/heads/', '');
+            const windowMinutes = 25; // 20m cron + slack
+            const sinceISO = new Date(Date.now() - windowMinutes * 60 * 1000).toISOString();
 
             const { data } = await github.rest.actions.listWorkflowRunsForRepo({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              per_page: 25,
+              per_page: 50,
               branch
             });
 
-            const recent = data.workflow_runs.find(r =>
-              r.name === context.workflow &&
-              r.event !== 'schedule' &&
+            const runs = (data.workflow_runs || []).filter(r => r.name === context.workflow);
+
+            // If anything is queued/in_progress, don't add a backup run.
+            const active = runs.find(r => r.status === 'queued' || r.status === 'in_progress');
+            if (active) {
+              core.setOutput('should_run', 'false');
+              core.info(`schedule backup -> found active run (${active.status}), skip`);
+              return;
+            }
+
+            // If a successful workflow_dispatch ran recently, skip the schedule backup.
+            const recentSuccessfulDispatch = runs.find(r =>
+              r.event === 'workflow_dispatch' &&
+              r.status === 'completed' &&
+              r.conclusion === 'success' &&
+              r.run_started_at &&
               new Date(r.run_started_at).toISOString() >= sinceISO
             );
 
-            core.setOutput('should_run', recent ? 'false' : 'true');
-            core.info(`schedule event -> recent non-schedule since ${sinceISO}: ${recent ? 'YES (skip)' : 'NO (run)'}`);
+            core.setOutput('should_run', recentSuccessfulDispatch ? 'false' : 'true');
+            core.info(`schedule backup -> recent successful dispatch since ${sinceISO}: ${recentSuccessfulDispatch ? 'YES (skip)' : 'NO (run)'}`);
 
   run:
     needs: [recent_check]
@@ -84,12 +102,15 @@ jobs:
       PYTHONUTF8: "1"
       PYTHONWARNINGS: default
 
+      # Normalize so schedule behaves like dispatch
       RUN_03: ${{ (github.event_name == 'schedule' && 'true') || (github.event.inputs.run_03 || 'true') }}
       RUN_04: ${{ (github.event_name == 'schedule' && 'true') || (github.event.inputs.run_04 || 'true') }}
       RUN_05: ${{ (github.event_name == 'schedule' && 'true') || (github.event.inputs.run_05 || 'true') }}
 
       TOP_N_RESOLVED: ${{ (github.event.inputs.TOP_N != '' && github.event.inputs.TOP_N) || secrets.TOP_N || '200' }}
       VERBOSE_RESOLVED: ${{ github.event.inputs.VERBOSE_MODE || '0' }}
+
+      # For backup schedule runs, use CURRENT_ONLY=1 (lightweight), otherwise respect dispatch input.
       CURRENT_ONLY_RESOLVED: ${{ (github.event_name == 'schedule' && '1') || (github.event.inputs.CURRENT_ONLY || '0') }}
 
     steps:
