@@ -129,17 +129,6 @@ def safe_iso_to_dt(s):
     except Exception:
         return None
 
-def price_ago_from_pct(now_price, pct):
-    try:
-        if now_price is None or pct is None:
-            return None
-        denom = 1.0 + (float(pct) / 100.0)
-        if denom == 0:
-            return None
-        return float(now_price) / denom
-    except Exception:
-        return None
-
 # ─────────── polite throttle + robust GET with backoff / Retry-After ───────────
 def _throttle():
     now = time.time()
@@ -213,8 +202,6 @@ LIVE_COLS = [
     "last_updated","last_fetched",
     "ath_price","ath_date",
     "circulating_supply","total_supply","max_supply",
-    "change_pct_1h","change_pct_24h","change_pct_7d","change_pct_30d","change_pct_1y",
-    "price_1h_ago","price_24h_ago","price_7d_ago","price_30d_ago","price_1y_ago",
     "vs_currency",
 ]
 ROLLING_COLS = [
@@ -225,8 +212,6 @@ ROLLING_COLS = [
     "last_fetched",
     "ath_price","ath_date",
     "circulating_supply","total_supply","max_supply",
-    "change_pct_1h","change_pct_24h","change_pct_7d","change_pct_30d","change_pct_1y",
-    "price_1h_ago","price_24h_ago","price_7d_ago","price_30d_ago","price_1y_ago",
     "vs_currency",
 ]
 
@@ -244,10 +229,8 @@ INS_PRICES_LIVE_RANKED = session.prepare(
     f"INSERT INTO {TABLE_LIVE_RANKED} ("
     f"  bucket, market_cap_rank, id, symbol, name, category, "
     f"  price_usd, market_cap, volume_24h, "
-    f"  circulating_supply, total_supply, last_updated, "
-    f"  change_pct_1h, change_pct_24h, change_pct_7d, change_pct_30d, change_pct_1y, "
-    f"  price_1h_ago, price_24h_ago, price_7d_ago, price_30d_ago, price_1y_ago"
-    f") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+    f"  circulating_supply, total_supply, last_updated"
+    f") VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"
 )
 DEL_PRICES_LIVE_RANKED_BUCKET = session.prepare(
     f"DELETE FROM {TABLE_LIVE_RANKED} WHERE bucket=?"
@@ -270,7 +253,6 @@ def fetch_top_markets(limit: int) -> list:
         "vs_currency": "usd",
         "order": "market_cap_desc",
         "per_page": per_page,
-        "price_change_percentage": "1h,24h,7d,30d,1y",
         "locale": "en",
         "precision": "full",
     }
@@ -303,12 +285,8 @@ def fetch_top_markets(limit: int) -> list:
     print(f"[{now_str()}] [fetch] total_collected={len(out)}")
     return out
 
-def pct(d: dict, key: str):
-    try:
-        v = d.get(key)
-        return float(v) if v is not None else None
-    except Exception:
-        return None
+# NOTE: We intentionally do NOT request or store price_change_percentage_* fields anymore.
+# (Those columns are being dropped from Cassandra.)
 
 # ───────────────────────── Run once ─────────────────────────
 def run_once():
@@ -366,20 +344,6 @@ def run_once():
         totl = f(c.get("total_supply"))
         maxs = f(c.get("max_supply"))
 
-        # Percent changes from CG
-        ch1h  = pct(c, "price_change_percentage_1h_in_currency")
-        ch24h = pct(c, "price_change_percentage_24h_in_currency")
-        ch7d  = pct(c, "price_change_percentage_7d_in_currency")
-        ch30d = pct(c, "price_change_percentage_30d_in_currency")
-        ch1y  = pct(c, "price_change_percentage_1y_in_currency")
-
-        # Derived baselines
-        p1h  = price_ago_from_pct(price, ch1h)
-        p24h = price_ago_from_pct(price, ch24h)
-        p7d  = price_ago_from_pct(price, ch7d)
-        p30d = price_ago_from_pct(price, ch30d)
-        p1y  = price_ago_from_pct(price, ch1y)
-
         cat = category_for(sym)
 
         mcap_total = float(mcap) if mcap is not None else 0.0
@@ -395,8 +359,6 @@ def run_once():
             lu, now_ts,
             ath_price, ath_date,
             circ, totl, maxs,
-            ch1h, ch24h, ch7d, ch30d, ch1y,
-            p1h, p24h, p7d, p30d, p1y,
             "usd",
         ])
 
@@ -409,8 +371,6 @@ def run_once():
             now_ts,
             ath_price, ath_date,
             circ, totl, maxs,
-            ch1h, ch24h, ch7d, ch30d, ch1y,
-            p1h, p24h, p7d, p30d, p1y,
             "usd",
         ]
         try:
@@ -466,8 +426,6 @@ def run_once():
              lu, _now_ts,
              _ath_price, _ath_date,
              circ, totl, _maxs,
-             ch1h, ch24h, ch7d, ch30d, ch1y,
-             p1h, p24h, p7d, p30d, p1y,
              _vs) = vals
 
             rank_for_pk = safe_rank_from_live(vals)  # guaranteed int
@@ -478,8 +436,6 @@ def run_once():
                 gid, sym, name, cat,
                 price, mcap, vol,
                 circ, totl, lu,
-                ch1h, ch24h, ch7d, ch30d, ch1y,
-                p1h, p24h, p7d, p30d, p1y
             ])
             wrote_ranked_prices += 1
             if (wrote_ranked_prices % BATCH_FLUSH_EVERY) == 0:
