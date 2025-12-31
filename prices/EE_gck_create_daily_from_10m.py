@@ -15,7 +15,7 @@ REQUEST_TIMEOUT     = int(os.getenv("REQUEST_TIMEOUT_SEC", "30"))
 FETCH_SIZE          = int(os.getenv("FETCH_SIZE", "500"))
 
 # Behavior
-SLOT_DELAY_SEC      = int(os.getenv("SLOT_DELAY_SEC", "120"))
+SLOT_DELAY_SEC      = int(os.getenv("SLOT_DELAY_SEC", "180"))
 PROGRESS_EVERY      = int(os.getenv("PROGRESS_EVERY", "20"))
 VERBOSE_MODE        = os.getenv("VERBOSE_MODE", "0") == "1"
 MIN_10M_POINTS_FOR_FINAL = int(os.getenv("MIN_10M_POINTS_FOR_FINAL", "2"))

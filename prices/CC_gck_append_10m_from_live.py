@@ -15,7 +15,7 @@
 # - “Carry” uses the latest point before the slot if the slot is empty,
 #   capped by ALLOW_CARRY_MAX_SLOTS consecutive slots.
 
-import os, sys, traceback
+import os, traceback
 from datetime import datetime, timedelta, timezone
 from typing import Tuple, List, Dict, Any
 
@@ -38,8 +38,10 @@ ALLOW_CARRY_MAX_SLOTS = int(os.getenv("ALLOW_CARRY_MAX_SLOTS", 4))  # allow carr
 # Designed for hourly/2-hourly runs (NOT every 6 minutes).
 GAPFILL_ENABLED     = os.getenv("GAPFILL_ENABLED", "0") == "1"
 GAPFILL_HOURS       = int(os.getenv("GAPFILL_HOURS", "12"))
-# If 1, attempt a once-per-hour lock row in Cassandra to avoid duplicate gapfill runs.
-GAPFILL_LOCK_ENABLED = os.getenv("GAPFILL_LOCK_ENABLED", "1") == "1"
+# If 1, attempt a once-per-N-hour lock row in Cassandra to avoid duplicate gapfill runs.
+GAPFILL_LOCK_ENABLED  = os.getenv("GAPFILL_LOCK_ENABLED", "1") == "1"
+GAPFILL_BUCKET_HOURS  = int(os.getenv("GAPFILL_BUCKET_HOURS", "2"))  # run at most once per 2h bucket
+GAPFILL_LOCK_TTL_SEC  = int(os.getenv("GAPFILL_LOCK_TTL_SEC", str(2 * 3600 + 300)))  # 2h + 5m slack
 GAPFILL_LOCK_JOB     = os.getenv("GAPFILL_LOCK_JOB", "append_10m_gapfill").strip() or "append_10m_gapfill"
 # If 0 (default), do NOT write category aggregates in gapfill mode (avoids incorrect partial totals).
 GAPFILL_WRITE_AGG    = os.getenv("GAPFILL_WRITE_AGG", "0") == "1"
@@ -91,9 +93,14 @@ def expected_slots_for_last_hours(hours: int) -> List[Tuple[datetime, datetime]]
         cur = nxt
     return slots
 
-def hour_bucket(dt_utc: datetime) -> str:
-    dt_utc = to_utc(dt_utc)
-    return dt_utc.strftime("%Y-%m-%dT%H")
+def lock_bucket_utc(bucket_hours: int) -> str:
+    """
+    Returns a UTC bucket string floored to bucket_hours.
+    Example: bucket_hours=2 and time=13:xx -> bucket=...T12
+    """
+    now = datetime.now(timezone.utc)
+    h0 = (now.hour // bucket_hours) * bucket_hours
+    return f"{now:%Y-%m-%d}T{h0:02d}"
 
 # ───────────────────────── Session & prepared statements ─────────────────────────
 print(f"[{now_str()}] Connecting to Astra…")
@@ -101,6 +108,8 @@ session, cluster = get_session(return_cluster=True)
 print(f"[{now_str()}] Connected. keyspace='{session.keyspace}'")
 
 from cassandra.query import SimpleStatement
+
+KEYSPACE = (os.getenv("ASTRA_KEYSPACE") or session.keyspace).strip() or session.keyspace
 
 SEL_COINS = SimpleStatement(
     f"SELECT id, symbol, name, market_cap_rank, category FROM {TABLE_LATEST}",
@@ -155,21 +164,17 @@ INS_MCAP_10M_UPSERT = session.prepare(
     """
 )
 
+INS_LOCK_IF_NOT_EXISTS_PS = None
 if GAPFILL_ENABLED and GAPFILL_LOCK_ENABLED:
-    # Lightweight, safe schema init (IF NOT EXISTS) for the hourly lock.
-    # If you prefer not to do schema DDL here, you can create this table once manually and remove this block.
-    session.execute(
-        f"""
-        CREATE TABLE IF NOT EXISTS job_locks (
-            job text,
-            bucket text,
-            created_at timestamp,
-            PRIMARY KEY (job, bucket)
-        )
-        """
-    )
+    # NOTE: table already exists: {KEYSPACE}.job_locks
+    # Use TTL so a crashed run doesn't permanently block future buckets.
     INS_LOCK_IF_NOT_EXISTS_PS = session.prepare(
-        "INSERT INTO job_locks (job, bucket, created_at) VALUES (?, ?, ?) IF NOT EXISTS"
+        f"""
+        INSERT INTO {KEYSPACE}.job_locks (job, bucket, created_at)
+        VALUES (?, ?, ?)
+        IF NOT EXISTS
+        USING TTL {int(GAPFILL_LOCK_TTL_SEC)}
+        """
     )
 
 def try_acquire_gapfill_lock() -> bool:
@@ -180,8 +185,11 @@ def try_acquire_gapfill_lock() -> bool:
         return False
     if not GAPFILL_LOCK_ENABLED:
         return True
-    bucket = hour_bucket(datetime.now(timezone.utc))
+    bucket = lock_bucket_utc(GAPFILL_BUCKET_HOURS)
     try:
+        if INS_LOCK_IF_NOT_EXISTS_PS is None:
+            print(f"[{now_str()}] [gapfill][WARN] lock prepared statement missing → skip gapfill for safety")
+            return False
         res = session.execute(
             INS_LOCK_IF_NOT_EXISTS_PS,
             [GAPFILL_LOCK_JOB, bucket, datetime.now(timezone.utc)],
@@ -243,7 +251,12 @@ def main():
     coins = [r for r in coins_rows if isinstance(r.market_cap_rank, int) and r.market_cap_rank > 0]
     coins.sort(key=lambda r: r.market_cap_rank)
     coins = coins[:TOP_N]
-    print(f"[{now_str()}] Mode={run_mode} | Processing top {len(coins)} coins from {TABLE_LATEST}")
+    if run_mode == "gapfill":
+        print(f"[{now_str()}] Mode=gapfill | bucket={lock_bucket_utc(GAPFILL_BUCKET_HOURS)} "
+              f"(every {GAPFILL_BUCKET_HOURS}h, ttl={GAPFILL_LOCK_TTL_SEC}s) | "
+              f"Processing top {len(coins)} coins from {TABLE_LATEST}")
+    else:
+        print(f"[{now_str()}] Mode=append | Processing top {len(coins)} coins from {TABLE_LATEST}")
 
     if run_mode == "gapfill":
         slots = expected_slots_for_last_hours(GAPFILL_HOURS)
@@ -274,7 +287,7 @@ def main():
         coin_category = (getattr(c, 'category', None) or 'Other').strip() or 'Other'
         carry_used = 0
         # In gapfill mode, discover which 10m slots already exist for this coin in the window.
-        existing_ts: set[datetime] = set()
+        existing_ts: set = set()
         if run_mode == "gapfill" and slots:
             w_start = slots[0][0]
             w_end   = slots[-1][1]
@@ -356,7 +369,7 @@ def main():
                 applied = bool(getattr(result, 'applied', True)) if result is not None else True
 
                 # accumulate aggregates only in normal append mode, OR if explicitly enabled for gapfill
-                if (run_mode != "gapfill") or GAPFILL_WRITE_AGG:
+                if ((run_mode != "gapfill") or GAPFILL_WRITE_AGG) and applied:
                     bump_slot_total(start, coin_category, mcap, vol, slot_last_upd)
                     bump_slot_total(start, 'ALL',          mcap, vol, slot_last_upd)
 

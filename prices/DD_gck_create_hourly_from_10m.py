@@ -42,7 +42,7 @@ REQUEST_TIMEOUT         = int(os.getenv("REQUEST_TIMEOUT_SEC", "30"))
 FETCH_SIZE              = int(os.getenv("FETCH_SIZE", "500"))
 
 # Behavior
-SLOT_DELAY_SEC          = int(os.getenv("SLOT_DELAY_SEC", "120"))   # guard against too-fresh 10m
+SLOT_DELAY_SEC          = int(os.getenv("SLOT_DELAY_SEC", "180"))   # guard against too-fresh 10m
 FINALIZE_PREV           = os.getenv("FINALIZE_PREV", "1") == "1"    # finalize previous hour once
 PROGRESS_EVERY          = int(os.getenv("PROGRESS_EVERY", "20"))
 VERBOSE_MODE            = os.getenv("VERBOSE_MODE", "0") == "1"

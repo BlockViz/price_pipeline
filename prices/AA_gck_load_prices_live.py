@@ -15,6 +15,7 @@ import os, time, csv, requests
 from collections import deque
 from datetime import datetime, timezone, timedelta
 from time import perf_counter
+import math
 import pathlib
 
 # ───────────────────────── Astra connector ─────────────────────────
@@ -259,20 +260,48 @@ INS_MCAP_LIVE_UPSERT = session.prepare(
 
 # ───────────────────────── Fetch ─────────────────────────
 def fetch_top_markets(limit: int) -> list:
-    per_page = min(250, max(1, limit))
-    params = {
+    per_page = 250  # MUST stay constant across pages
+    pages = math.ceil(limit / per_page)
+
+    out = []
+    seen = set()
+
+    base_params = {
         "vs_currency": "usd",
         "order": "market_cap_desc",
         "per_page": per_page,
-        "page": 1,
         "price_change_percentage": "1h,24h,7d,30d,1y",
         "locale": "en",
-        "precision": "full", 
+        "precision": "full",
     }
-    data = http_get("/coins/markets", params=params)
-    data = data[:limit]
-    print(f"[{now_str()}] [fetch] got {len(data)} markets from CoinGecko")
-    return data
+
+    for page in range(1, pages + 1):
+        params = dict(base_params)
+        params["page"] = page
+
+        data = http_get("/coins/markets", params=params) or []
+        print(f"[{now_str()}] [fetch] page={page} got={len(data)} (want_total={limit})")
+
+        if not data:
+            break
+
+        for c in data:
+            gid = c.get("id")
+            if not gid or gid in seen:
+                continue
+            seen.add(gid)
+            out.append(c)
+
+        if len(out) >= limit:
+            break
+
+        # if CG returns fewer than 250, no more pages
+        if len(data) < per_page:
+            break
+
+    out = out[:limit]
+    print(f"[{now_str()}] [fetch] total_collected={len(out)}")
+    return out
 
 def pct(d: dict, key: str):
     try:

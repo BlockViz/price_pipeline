@@ -30,7 +30,7 @@ on:
 
   # Backup only: every hour, offset away from :00
   schedule:
-    - cron: "20 * * * *"
+    - cron: "26 * * * *"
 
 permissions:
   contents: read

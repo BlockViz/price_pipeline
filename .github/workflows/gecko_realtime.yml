@@ -185,7 +185,7 @@ jobs:
         run: python prices/CC_gck_append_10m_from_live.py
 
       - name: 02b Gapfill missing 10m slots (last 12h)
-        if: env.RUN_GAPFILL == 'true'
+        if: env.RUN_GAPFILL == 'true' && env.RUN_02 == 'true'
         timeout-minutes: 12
         env:
           ASTRA_BUNDLE_PATH: secure-connect.zip
