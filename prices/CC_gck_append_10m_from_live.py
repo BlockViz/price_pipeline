@@ -24,7 +24,7 @@ from astra_connect.connect import get_session, AstraConfig
 AstraConfig.from_env()
 
 # ───────────────────────── Config ─────────────────────────
-TOP_N              = int(os.getenv("TOP_N", "200"))
+TOP_N              = int(os.getenv("TOP_N", "300"))
 
 REQUEST_TIMEOUT    = int(os.getenv("REQUEST_TIMEOUT_SEC", "30"))
 FETCH_SIZE         = int(os.getenv("FETCH_SIZE", "500"))
@@ -33,6 +33,16 @@ SLOT_MINUTES       = int(os.getenv("SLOT_MINUTES", "10"))
 SLOT_DELAY_SEC     = int(os.getenv("SLOT_DELAY_SEC", "120"))
 SLOTS_BACKFILL     = int(os.getenv("SLOTS_BACKFILL", 4))  # default: 6h safety window
 ALLOW_CARRY_MAX_SLOTS = int(os.getenv("ALLOW_CARRY_MAX_SLOTS", 4))  # allow carry across the 6h window
+
+# ───────────────────────── Optional gapfill mode ─────────────────────────
+# Designed for hourly/2-hourly runs (NOT every 6 minutes).
+GAPFILL_ENABLED     = os.getenv("GAPFILL_ENABLED", "0") == "1"
+GAPFILL_HOURS       = int(os.getenv("GAPFILL_HOURS", "12"))
+# If 1, attempt a once-per-hour lock row in Cassandra to avoid duplicate gapfill runs.
+GAPFILL_LOCK_ENABLED = os.getenv("GAPFILL_LOCK_ENABLED", "1") == "1"
+GAPFILL_LOCK_JOB     = os.getenv("GAPFILL_LOCK_JOB", "append_10m_gapfill").strip() or "append_10m_gapfill"
+# If 0 (default), do NOT write category aggregates in gapfill mode (avoids incorrect partial totals).
+GAPFILL_WRITE_AGG    = os.getenv("GAPFILL_WRITE_AGG", "0") == "1"
 
 # Tables (defaults match your schema)
 TABLE_LATEST       = os.getenv("TABLE_LATEST", "gecko_prices_live")
@@ -65,6 +75,25 @@ def last_n_slots_oldest_first(n: int) -> List[Tuple[datetime, datetime]]:
         end = start
     slots.reverse()
     return slots
+
+def expected_slots_for_last_hours(hours: int) -> List[Tuple[datetime, datetime]]:
+    """
+    Build contiguous slot windows covering the last N hours up to 'now' (delayed by SLOT_DELAY_SEC),
+    in chronological order.
+    """
+    end = slot_start_now() + timedelta(minutes=SLOT_MINUTES)
+    start = floor_slot(end - timedelta(hours=hours))
+    slots: List[Tuple[datetime, datetime]] = []
+    cur = start
+    while cur < end:
+        nxt = cur + timedelta(minutes=SLOT_MINUTES)
+        slots.append((cur, nxt))
+        cur = nxt
+    return slots
+
+def hour_bucket(dt_utc: datetime) -> str:
+    dt_utc = to_utc(dt_utc)
+    return dt_utc.strftime("%Y-%m-%dT%H")
 
 # ───────────────────────── Session & prepared statements ─────────────────────────
 print(f"[{now_str()}] Connecting to Astra…")
@@ -108,6 +137,15 @@ INS_10M_IF_NOT_EXISTS_PS = session.prepare(
     """
 )
 
+# Existing 10m slots for an id in a time window (used in gapfill mode)
+SEL_10M_EXISTING_TS_RANGE_PS = session.prepare(
+    f"""
+    SELECT ts
+    FROM {TABLE_OUT}
+    WHERE id=? AND ts>=? AND ts<?
+    """
+)
+
 # Aggregates: gecko_market_cap_10m_7d(category, ts, last_updated, market_cap, market_cap_rank, volume_24h)
 INS_MCAP_10M_UPSERT = session.prepare(
     f"""
@@ -116,6 +154,46 @@ INS_MCAP_10M_UPSERT = session.prepare(
     VALUES (?, ?, ?, ?, ?, ?)
     """
 )
+
+if GAPFILL_ENABLED and GAPFILL_LOCK_ENABLED:
+    # Lightweight, safe schema init (IF NOT EXISTS) for the hourly lock.
+    # If you prefer not to do schema DDL here, you can create this table once manually and remove this block.
+    session.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS job_locks (
+            job text,
+            bucket text,
+            created_at timestamp,
+            PRIMARY KEY (job, bucket)
+        )
+        """
+    )
+    INS_LOCK_IF_NOT_EXISTS_PS = session.prepare(
+        "INSERT INTO job_locks (job, bucket, created_at) VALUES (?, ?, ?) IF NOT EXISTS"
+    )
+
+def try_acquire_gapfill_lock() -> bool:
+    """
+    Returns True if gapfill should run now (lock acquired or lock disabled).
+    """
+    if not GAPFILL_ENABLED:
+        return False
+    if not GAPFILL_LOCK_ENABLED:
+        return True
+    bucket = hour_bucket(datetime.now(timezone.utc))
+    try:
+        res = session.execute(
+            INS_LOCK_IF_NOT_EXISTS_PS,
+            [GAPFILL_LOCK_JOB, bucket, datetime.now(timezone.utc)],
+            timeout=REQUEST_TIMEOUT
+        ).one()
+        applied = bool(getattr(res, "applied", True)) if res is not None else True
+        if not applied:
+            print(f"[{now_str()}] [gapfill] lock already held for bucket={bucket} job={GAPFILL_LOCK_JOB} → skip gapfill")
+        return applied
+    except Exception as e:
+        print(f"[{now_str()}] [gapfill][WARN] lock failed ({e}) → skip gapfill for safety")
+        return False
 
 def compute_category_ranks(cat_totals: Dict[str, Dict[str, float]]) -> Dict[str, int]:
     """
@@ -156,14 +234,21 @@ def ensure_all_bucket(catmap: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, 
 
 # ───────────────────────── Main logic ─────────────────────────
 def main():
+    # Decide run mode early (append is always allowed; gapfill is optional)
+    run_gapfill = try_acquire_gapfill_lock()
+    run_mode = "gapfill" if run_gapfill else "append"
+
     # Pick coins
     coins_rows = list(session.execute(SEL_COINS, timeout=REQUEST_TIMEOUT))
     coins = [r for r in coins_rows if isinstance(r.market_cap_rank, int) and r.market_cap_rank > 0]
     coins.sort(key=lambda r: r.market_cap_rank)
     coins = coins[:TOP_N]
-    print(f"[{now_str()}] Processing top {len(coins)} coins from {TABLE_LATEST}")
+    print(f"[{now_str()}] Mode={run_mode} | Processing top {len(coins)} coins from {TABLE_LATEST}")
 
-    slots = last_n_slots_oldest_first(SLOTS_BACKFILL)
+    if run_mode == "gapfill":
+        slots = expected_slots_for_last_hours(GAPFILL_HOURS)
+    else:
+        slots = last_n_slots_oldest_first(SLOTS_BACKFILL)
     if slots:
         print(f"[{now_str()}] Slots (oldest→newest): {slots[0][0]} .. {slots[-1][1]} (count={len(slots)})")
 
@@ -188,10 +273,37 @@ def main():
         print(f"[{now_str()}] → [{ci}/{len(coins)}] {sym} ({coin_id}) rank={mkr}")
         coin_category = (getattr(c, 'category', None) or 'Other').strip() or 'Other'
         carry_used = 0
+        # In gapfill mode, discover which 10m slots already exist for this coin in the window.
+        existing_ts: set[datetime] = set()
+        if run_mode == "gapfill" and slots:
+            w_start = slots[0][0]
+            w_end   = slots[-1][1]
+            try:
+                rs = session.execute(
+                    SEL_10M_EXISTING_TS_RANGE_PS,
+                    [coin_id, w_start, w_end],
+                    timeout=REQUEST_TIMEOUT
+                )
+                for r in rs:
+                    ts0 = getattr(r, "ts", None)
+                    if isinstance(ts0, datetime):
+                        existing_ts.add(to_utc(ts0))
+                print(f"[{now_str()}]    [gapfill] existing_10m_in_window={len(existing_ts)} "
+                      f"window={w_start}..{w_end}")
+            except Exception as e:
+                print(f"[{now_str()}]    [gapfill][WARN] failed to read existing 10m range: {e}")
+                existing_ts = set()
 
         for si, (start, end) in enumerate(slots, 1):
             # print each slot with minimal noise
             print(f"    slot {si}/{len(slots)} {start} → {end}")
+
+            # gapfill mode: skip if this slot already exists
+            if run_mode == "gapfill":
+                if start in existing_ts:
+                    print("        exists → skip")
+                    skipped += 1
+                    continue
 
             # try to read a row *inside* the slot window
             try:
@@ -207,6 +319,8 @@ def main():
                 circ  = float(in_slot.circulating_supply) if in_slot.circulating_supply is not None else None
                 totl  = float(in_slot.total_supply) if in_slot.total_supply is not None else None
                 source = "hist-in-slot"
+                # reset carry streak when we have a true in-slot point
+                carry_used = 0
             else:
                 if carry_used >= ALLOW_CARRY_MAX_SLOTS:
                     print("        carry cap reached → skip"); skipped += 1; continue
@@ -241,9 +355,10 @@ def main():
                 ).one()
                 applied = bool(getattr(result, 'applied', True)) if result is not None else True
 
-                # accumulate aggregates
-                bump_slot_total(start, coin_category, mcap, vol, slot_last_upd)
-                bump_slot_total(start, 'ALL',          mcap, vol, slot_last_upd)
+                # accumulate aggregates only in normal append mode, OR if explicitly enabled for gapfill
+                if (run_mode != "gapfill") or GAPFILL_WRITE_AGG:
+                    bump_slot_total(start, coin_category, mcap, vol, slot_last_upd)
+                    bump_slot_total(start, 'ALL',          mcap, vol, slot_last_upd)
 
                 print(f"        insert {'applied' if applied else 'skipped'} "
                       f"({source}, price={price}, mcap={mcap}, vol={vol}, rank={rank}, circ={circ}, totl={totl}, last_upd={slot_last_upd})")
@@ -257,7 +372,7 @@ def main():
                 skipped += 1
 
     # Write category aggregates (with ranks)
-    if slot_totals:
+    if slot_totals and ((run_mode != "gapfill") or GAPFILL_WRITE_AGG):
         print(f"[{now_str()}] [mcap-10m] writing aggregates for {len(slot_totals)} slots into {TABLE_MCAP_OUT}")
         agg_written = 0
         for slot_start in sorted(slot_totals.keys()):
@@ -281,7 +396,10 @@ def main():
                     print(f"        [mcap-10m] insert failed for category='{category}' slot={slot_start}: {e}")
         print(f"[{now_str()}] [mcap-10m] rows_written={agg_written}")
     else:
-        print(f"[{now_str()}] [mcap-10m] no aggregates captured (coins={len(coins)})")
+        if run_mode == "gapfill" and not GAPFILL_WRITE_AGG:
+            print(f"[{now_str()}] [mcap-10m] skipped aggregates (gapfill mode; GAPFILL_WRITE_AGG=0)")
+        else:
+            print(f"[{now_str()}] [mcap-10m] no aggregates captured (coins={len(coins)})")
 
     print(f"[{now_str()}] [10m] wrote={wrote} skipped={skipped}")
 

@@ -10,7 +10,7 @@ from astra_connect.connect import get_session, AstraConfig
 AstraConfig.from_env()  # loads .env if present, otherwise uses process env
 
 # Config
-TOP_N               = int(os.getenv("TOP_N", "200"))
+TOP_N               = int(os.getenv("TOP_N", "300"))
 REQUEST_TIMEOUT     = int(os.getenv("REQUEST_TIMEOUT_SEC", "30"))
 FETCH_SIZE          = int(os.getenv("FETCH_SIZE", "500"))
 

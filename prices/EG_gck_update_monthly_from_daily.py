@@ -10,7 +10,7 @@ from cassandra.query import SimpleStatement
 
 AstraConfig.from_env()  # load .env or process env
 
-TOP_N = int(os.getenv("TOP_N", "200"))
+TOP_N = int(os.getenv("TOP_N", "300"))
 FETCH_SIZE = int(os.getenv("FETCH_SIZE", "500"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT_SEC", "40"))
 PROGRESS_EVERY = int(os.getenv("PROGRESS_EVERY", "20"))

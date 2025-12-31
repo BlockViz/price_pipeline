@@ -24,7 +24,7 @@ from astra_connect.connect import get_session, AstraConfig
 AstraConfig.from_env()
 
 # ───────────────────────── Config ─────────────────────────
-TOP_N        = int(os.getenv("TOP_N", "200"))
+TOP_N        = int(os.getenv("TOP_N", "300"))
 RETRIES      = int(os.getenv("RETRIES", "3"))
 BACKOFF_MIN  = int(os.getenv("BACKOFF_MIN", "5"))
 MAX_BACKOFF  = int(os.getenv("MAX_BACKOFF_MIN", "30"))
@@ -267,6 +267,7 @@ def fetch_top_markets(limit: int) -> list:
         "page": 1,
         "price_change_percentage": "1h,24h,7d,30d,1y",
         "locale": "en",
+        "precision": "full", 
     }
     data = http_get("/coins/markets", params=params)
     data = data[:limit]

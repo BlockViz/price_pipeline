@@ -107,7 +107,7 @@ jobs:
       RUN_04: ${{ (github.event_name == 'schedule' && 'true') || (github.event.inputs.run_04 || 'true') }}
       RUN_05: ${{ (github.event_name == 'schedule' && 'true') || (github.event.inputs.run_05 || 'true') }}
 
-      TOP_N_RESOLVED: ${{ (github.event.inputs.TOP_N != '' && github.event.inputs.TOP_N) || secrets.TOP_N || '200' }}
+      TOP_N_RESOLVED: ${{ (github.event.inputs.TOP_N != '' && github.event.inputs.TOP_N) || secrets.TOP_N || '300' }}
       VERBOSE_RESOLVED: ${{ github.event.inputs.VERBOSE_MODE || '0' }}
 
       # For backup schedule runs, use CURRENT_ONLY=1 (lightweight), otherwise respect dispatch input.

@@ -109,6 +109,27 @@ def http_get(path, params=None):
             last = e
     raise RuntimeError(f"CoinGecko failed: {url} :: {last}")
 
+# ---------- CoinGecko param policy (centralized) ----------
+# Goal: never forget high precision on chart endpoints.
+CG_VS_CURRENCY = os.getenv("CG_VS_CURRENCY", "usd").strip().lower()
+CG_PRECISION   = (os.getenv("CG_PRECISION", "full") or "full").strip().lower()  # "full" or "0".."18"
+CG_INTERVAL_DAILY  = (os.getenv("CG_INTERVAL_DAILY", "daily")  or "").strip().lower()   # "daily" | "" (auto)
+CG_INTERVAL_HOURLY = (os.getenv("CG_INTERVAL_HOURLY", "hourly") or "").strip().lower()  # "hourly" | "" (auto)
+
+def cg_market_chart_range(coin_id: str, ts_from: int, ts_to: int, *, interval: str | None = None):
+    """
+    Wrapper around /coins/{id}/market_chart/range that enforces our precision policy.
+    """
+    params = {
+        "vs_currency": CG_VS_CURRENCY,
+        "from": int(ts_from),
+        "to": int(ts_to),
+        "precision": CG_PRECISION,  # ✅ ensure full decimals (or configured)
+    }
+    if interval:
+        params["interval"] = interval
+    return http_get(f"/coins/{coin_id}/market_chart/range", params=params)
+
 # ---------- Bucket helpers ----------
 def bucket_daily_ohlc(prices_ms_values, start_d: dt.date, end_d: dt.date):
     from collections import defaultdict as _dd
@@ -450,9 +471,11 @@ def backfill_daily_from_api_ranges(coin, need_daily: set[dt.date], dt_ranges: li
         try:
             sd = ensure_utc_dt(start_dt, "start_dt")
             ed = ensure_utc_dt(end_dt, "end_dt")
-            data = http_get(
-                f"/coins/{coin['id']}/market_chart/range",
-                params={"vs_currency":"usd","from":int(sd.timestamp()),"to":int(ed.timestamp())}
+            data = cg_market_chart_range(
+                coin["id"],
+                int(sd.timestamp()),
+                int(ed.timestamp()),
+                interval=(CG_INTERVAL_DAILY or None),   # ✅ usually "daily"
             )
         except RateLimitDefer as e:
             metrics["cg_calls_deferred"] += 1
@@ -530,9 +553,11 @@ def fetch_hourly_from_api(coin_id: str, start_dt: dt.datetime, end_dt: dt.dateti
     while cur < t1:
         nxt = min(cur + step_s, t1)
         try:
-            data = http_get(
-                f"/coins/{coin_id}/market_chart/range",
-                params={"vs_currency":"usd","from":cur,"to":nxt}
+            data = cg_market_chart_range(
+                coin_id,
+                cur,
+                nxt,
+                interval=(CG_INTERVAL_HOURLY or None),  # ✅ usually "hourly"
             )
             prices_all.extend(data.get("prices", []) or [])
             mcaps_all.extend(data.get("market_caps", []) or [])
