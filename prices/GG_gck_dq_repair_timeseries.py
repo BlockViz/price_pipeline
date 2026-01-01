@@ -51,6 +51,38 @@ class RateLimitDefer(Exception):
         self.retry_after = retry_after
         self.url = url
 
+class AuthError(Exception):
+    def __init__(self, status_code: int, url: str, body_snippet: str, *,
+                 api_tier: str, auth_method: str, key_fingerprint: str):
+        super().__init__(f"CoinGecko auth failed ({status_code}).")
+        self.status_code = status_code
+        self.url = url
+        self.body_snippet = body_snippet
+        self.api_tier = api_tier
+        self.auth_method = auth_method
+        self.key_fingerprint = key_fingerprint
+
+def _mask_key(k: str | None) -> str:
+    k = (k or "").strip()
+    if not k:
+        return "<missing>"
+    if len(k) <= 6:
+        return "<set:" + ("*" * len(k)) + ">"
+    return f"<set:len={len(k)} last4={k[-4:]}>"
+
+def _abort_auth(where: str, e: AuthError):
+    print(
+        f"[{_now_str()}] [FATAL] {where}: CoinGecko authentication/authorization failed\n"
+        f"  status={e.status_code}\n"
+        f"  tier={e.api_tier}\n"
+        f"  auth_method={e.auth_method}\n"
+        f"  key={e.key_fingerprint}\n"
+        f"  url={e.url}\n"
+        f"  body_snippet={repr((e.body_snippet or '').strip())}\n"
+        f"  hint: verify API_TIER matches your key type, BASE is correct, and the process has the right key.\n"
+    )
+    raise SystemExit(2)
+
 def _throttle():
     now = time.time()
     if REQ_TIMES and (now - REQ_TIMES[-1]) < CG_REQ_INTERVAL_S:
@@ -64,12 +96,15 @@ def _throttle():
 def http_get(path, params=None):
     url = f"{BASE}{path}"; params = dict(params or {})
     headers = {}
+    auth_method = "unknown"
     if API_TIER == "demo":
         if not API_KEY: raise RuntimeError("COINGECKO_API_KEY missing for demo tier.")
         params["x_cg_demo_api_key"] = API_KEY
+        auth_method = "query_param:x_cg_demo_api_key"
     else:
         if not API_KEY: raise RuntimeError("COINGECKO_API_KEY missing for pro tier.")
         headers["x-cg-pro-api-key"] = API_KEY
+        auth_method = "header:x-cg-pro-api-key"
 
     last = None
     for i in range(RETRIES):
@@ -81,7 +116,15 @@ def http_get(path, params=None):
             r = requests.get(url, params=params, headers=headers, timeout=REQUEST_TIMEOUT)
             if r.status_code in (401, 403):
                 metrics["cg_calls_other_http"] += 1
-                raise RuntimeError(f"CoinGecko auth failed ({r.status_code}).")
+                body = (r.text or "")
+                raise AuthError(
+                    r.status_code,
+                    r.url if hasattr(r, "url") else url,
+                    body[:400],
+                    api_tier=str(API_TIER),
+                    auth_method=auth_method,
+                    key_fingerprint=_mask_key(API_KEY),
+                )
             if r.status_code == 429:
                 metrics["cg_calls_429"] += 1
                 ra = r.headers.get("Retry-After")
@@ -98,6 +141,8 @@ def http_get(path, params=None):
             return r.json()
         except RateLimitDefer:
             raise
+        except AuthError:
+            raise
         except (requests.ConnectionError, requests.Timeout) as e:
             last = e
             wait_s = min(5.0, BACKOFF_S*(i+1))
@@ -113,8 +158,9 @@ def http_get(path, params=None):
 # Goal: never forget high precision on chart endpoints.
 CG_VS_CURRENCY = os.getenv("CG_VS_CURRENCY", "usd").strip().lower()
 CG_PRECISION   = (os.getenv("CG_PRECISION", "full") or "full").strip().lower()  # "full" or "0".."18"
-CG_INTERVAL_DAILY  = (os.getenv("CG_INTERVAL_DAILY", "daily")  or "").strip().lower()   # "daily" | "" (auto)
-CG_INTERVAL_HOURLY = (os.getenv("CG_INTERVAL_HOURLY", "hourly") or "").strip().lower()  # "hourly" | "" (auto)
+CG_INTERVAL_DAILY  = (os.getenv("CG_INTERVAL_DAILY", "")  or "").strip().lower()   # "" (auto) | "daily"
+# IMPORTANT: passing interval=hourly is restricted on many plans; prefer auto by default.
+CG_INTERVAL_HOURLY = (os.getenv("CG_INTERVAL_HOURLY", "") or "").strip().lower()  # "" (auto) | "hourly"
 
 def cg_market_chart_range(coin_id: str, ts_from: int, ts_to: int, *, interval: str | None = None):
     """
@@ -126,9 +172,67 @@ def cg_market_chart_range(coin_id: str, ts_from: int, ts_to: int, *, interval: s
         "to": int(ts_to),
         "precision": CG_PRECISION,  # ✅ ensure full decimals (or configured)
     }
+    # Guard: avoid restricted interval=hourly unless you explicitly opted into it.
+    if interval == "hourly":
+        # If you really have Enterprise and want to force it, set CG_ALLOW_INTERVAL_HOURLY=1
+        allow = (os.getenv("CG_ALLOW_INTERVAL_HOURLY", "0").strip() == "1")
+        if not allow:
+            interval = None
+    # Many plans (incl demo) restrict explicit interval parameters.
+    # Prefer auto granularity unless explicitly allowed.
+    if interval:
+        allow = (os.getenv("CG_ALLOW_INTERVAL", "0").strip() == "1")
+        if (str(API_TIER).lower() == "demo") and not allow:
+            interval = None
     if interval:
         params["interval"] = interval
     return http_get(f"/coins/{coin_id}/market_chart/range", params=params)
+
+def cg_preflight(needs_hourly: bool, needs_daily: bool):
+    """
+    Preflight the *actual* endpoints we rely on (market_chart/range),
+    using a tiny time window, and fail fast on 401/403.
+    """
+    if not (needs_hourly or needs_daily):
+        return
+
+    now = utcnow()
+    now_s = int(now.timestamp())
+
+    print(
+        f"[{_now_str()}] Preflight CoinGecko...\n"
+        f"  BASE={BASE}\n"
+        f"  API_TIER={API_TIER}\n"
+        f"  key={_mask_key(API_KEY)}\n"
+        f"  needs_hourly={needs_hourly} needs_daily={needs_daily}\n"
+        f"  vs_currency={CG_VS_CURRENCY} precision={CG_PRECISION}\n"
+        f"  interval_hourly={CG_INTERVAL_HOURLY or '<auto>'} interval_daily={CG_INTERVAL_DAILY or '<auto>'}\n"
+    )
+
+    # Use a well-known coin id for capability check.
+    # (If your environment uses a different universe only, you can swap to a stable coin in your DB.)
+    test_coin = os.getenv("CG_PREFLIGHT_COIN_ID", "bitcoin").strip().lower()
+
+    try:
+        if needs_hourly:
+            cg_market_chart_range(
+                test_coin,
+                now_s - 2 * 3600,
+                now_s,
+                interval=(CG_INTERVAL_HOURLY or None),
+            )
+        if needs_daily:
+            cg_market_chart_range(
+                test_coin,
+                now_s - 3 * 86400,
+                now_s,
+                interval=(CG_INTERVAL_DAILY or None),
+            )
+    except AuthError as e:
+        _abort_auth("preflight", e)
+    except Exception as e:
+        print(f"[{_now_str()}] [FATAL] preflight failed (non-auth): {e}")
+        raise SystemExit(2)
 
 # ---------- Bucket helpers ----------
 def bucket_daily_ohlc(prices_ms_values, start_d: dt.date, end_d: dt.date):
@@ -477,6 +581,8 @@ def backfill_daily_from_api_ranges(coin, need_daily: set[dt.date], dt_ranges: li
                 int(ed.timestamp()),
                 interval=(CG_INTERVAL_DAILY or None),   # ✅ usually "daily"
             )
+        except AuthError as e:
+            _abort_auth("backfill_daily_from_api_ranges", e)
         except RateLimitDefer as e:
             metrics["cg_calls_deferred"] += 1
             wait_s = (e.retry_after or BACKOFF_S) + random.uniform(0.0, 0.25)
@@ -567,6 +673,8 @@ def fetch_hourly_from_api(coin_id: str, start_dt: dt.datetime, end_dt: dt.dateti
             wait_s = (e.retry_after or BACKOFF_S) + random.uniform(0.0, 0.25)
             print(f"[{_now_str()}]  · hourly chunk {dt.datetime.fromtimestamp(cur, tz=timezone.utc)}→{dt.datetime.fromtimestamp(nxt, tz=timezone.utc)} 429; sleep {wait_s:.2f}s")
             time.sleep(wait_s)
+        except AuthError as e:
+            _abort_auth("fetch_hourly_from_api", e)
         except Exception as ex:
             print(f"[{_now_str()}]  · hourly chunk fetch failed: {ex}")
         time.sleep(PAUSE_S + random.uniform(0.0, 0.15))
@@ -639,6 +747,8 @@ def repair_hourly_from_api_or_interp(coin, missing_hours: set[dt.datetime]) -> t
                 return 0, set()
             # fall back to existing data for interpolation
             p_map, mc_map, v_map = fetch_hourly_from_existing(coin["id"], start_dt, end_dt)
+        except AuthError as e:
+            _abort_auth("repair_hourly_from_api_or_interp", e)
         except Exception as e:
             print(f"[{_now_str()}]  · hourly API fetch failed for {coin['symbol']}: {e}")
             if not INTERPOLATE_IF_API_MISS:
@@ -895,12 +1005,10 @@ def aggregate_month_from_daily_rows(rows) -> dict | None:
 
 # ---------- Main ----------
 def main():
-    # Light ping to fail fast on auth/network — only if we plan to call CG
-    needs_api = (FILL_HOURLY and FILL_HOURLY_FROM_API) or BACKFILL_DAILY_FROM_API
-    if needs_api:
-        # Light ping to fail fast on auth/network
-        try: http_get("/ping")
-        except Exception as e: raise SystemExit(f"[FATAL] CoinGecko preflight failed: {e}")
+    # Preflight the *actual* endpoints we need — abort on auth/capability failure.
+    needs_hourly_api = (FILL_HOURLY and FILL_HOURLY_FROM_API)
+    needs_daily_api  = bool(BACKFILL_DAILY_FROM_API)
+    cg_preflight(needs_hourly_api, needs_daily_api)
 
     now = utcnow()
     end_excl = dt.datetime(now.year,now.month,now.day,tzinfo=timezone.utc) + dt.timedelta(days=1)
